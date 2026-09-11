@@ -22,7 +22,10 @@ Qwen3.6-35B-A3B target are inherited but untested on the RTX 4090.
 >
 > The fork history described above (NInfer-3090 deriving from Neroued/ninfer) is the lineage of
 > those two parents; this repository carries the combined result of both. Full credits,
-> including cherry-picked work, are listed in [Upstream and credits](#upstream-and-credits).
+> including cherry-picked work, are listed in [Upstream and credits](#upstream-and-credits). The
+> exact upstream states merged are pinned there in
+> [Upstream versions at merge time](#upstream-versions-at-merge-time) as tags `base/sergiuszm-ninfer-4090`
+> and `base/gzenz-ninfer`.
 >
 > **Deploying this engine?** Start from
 > [README_部署说明.md](README_部署说明.md) — YaRN long-context deployment: the tested scripts and
@@ -454,6 +457,29 @@ shared lineage and cherry-picked contributions.
 - [jram4/ninfer-4090](https://github.com/jram4/ninfer-4090) - an earlier RTX 4090 port of a July
   2026 snapshot. Its Ada dispatch tuning targets a kernel organization that upstream has since
   replaced, so this fork starts from the current 3090 base instead.
+
+### Upstream versions at merge time
+
+The initial commit (2026-09-11) merged the two parents in these upstream states. Both parents
+are held as remotes of this repository (`upstream-4090`, `upstream-gzenz`) and are tagged at
+these states as `base/sergiuszm-ninfer-4090` and `base/gzenz-ninfer`, so drift against upstream
+is diffable (`git diff base/sergiuszm-ninfer-4090..HEAD`, and likewise for gzenz). A fresh clone
+can recreate the remotes with:
+
+```bash
+git remote add upstream-4090 https://github.com/sergiuszm/ninfer-4090.git
+git remote add upstream-gzenz https://github.com/gzenz/ninfer.git
+git fetch upstream-4090 && git fetch upstream-gzenz
+```
+
+| Merge parent | Branch | Upstream state at the merge | Notes |
+|---|---|---|---|
+| sergiuszm/ninfer-4090 | `rtx4090-port` | commit `6f327f4` (2026-09-05) = the branch's single commit, VERSION `0.6.1-rtx3090` | Pinned exactly: 98.6% of the paths shared with the merge tree are blob-identical to this commit; the remainder is the gzenz-side adaptation of shared files. |
+| gzenz/ninfer | `master` | no later than `d00e5f0b` (2026-09-05), no earlier than `0bd968d2` (2026-08-29) | The merge adapted the gzenz sources (defect record: [YaRN port provenance](docs/maintainer/yarn-port-provenance.md)), so a per-file fingerprint pins a window, not one commit. The tag marks the window's upper bound, the latest master commit whose gzenz-side files still match the merged tree. |
+
+The ~1.4% of the merge tree that neither parent explains is the cherry-picked work listed above
+(UDPSendToFailed and the rest), which arrived with authorship preserved rather than with a parent
+version.
 
 ## Support
 
