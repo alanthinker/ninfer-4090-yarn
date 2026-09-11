@@ -330,7 +330,14 @@ public:
         // machine also assesses targets far more slowly than the one the 5 ms was calibrated on.
         const std::uint64_t search_budget_ns =
             std::min<std::uint64_t>(50'000'000ULL, incumbent.cost.total_ns / 20U);
-        const std::uint64_t guided_watchdog_ns = search_budget_ns;
+        // The directed pass that walks each candidate's own guidance to its retention closure keeps
+        // the original small window: it is the cheap part of planning, and letting it run for the
+        // whole search budget turned it into a breadth-first walk of every alternative on the way
+        // (a 7-owner pressure case then assessed more than twice the targets its closure needs).
+        // The larger budget above is for the best-first phase, which is what the 579k-token
+        // production case was starving on.
+        const std::uint64_t guided_watchdog_ns =
+            std::min<std::uint64_t>(5'000'000ULL, search_budget_ns);
         std::uint64_t maximum_step_ns          = 0;
         std::uint32_t optional_targets         = 0;
         std::uint32_t guided_assessments       = 0;
