@@ -10,15 +10,23 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <charconv>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
+#include <vector>
 
 namespace ninfer::serve {
 namespace {
@@ -27,6 +35,126 @@ std::string format_seconds(double seconds) {
     char text[32];
     std::snprintf(text, sizeof(text), "%.2f", seconds);
     return text;
+}
+
+// Diagnostic-only raw request dump, enabled by NINFER_DUMP_REQUESTS=<dir> (unset by default).
+//
+// Exists because prefix-reuse debugging needs the exact rendered payload: the engine reports how
+// many tokens were reused but never the tokens themselves, so a client whose sessions fail to
+// share a prefix cannot be diagnosed from the server side at all. Each accepted body is written as
+// its own file so two requests can be diffed byte for byte.
+//
+// Retention is bounded so that a forgotten switch cannot fill the disk or leave conversation
+// content lying around indefinitely. Both bounds are read once, on first use:
+//   NINFER_DUMP_REQUESTS_LIMIT           keep at most this many bodies (default 100; 0 = no count limit)
+//   NINFER_DUMP_REQUESTS_MAX_AGE_HOURS   delete bodies older than this (default 24; 0 = no age limit)
+// The directory is pruned on every write, which costs one readdir of a <=limit-entry directory and
+// guarantees the count bound holds at all times.
+//
+// Serving must never be affected: every failure path is swallowed and the directory is resolved
+// once, on first use.
+constexpr std::size_t kDefaultDumpLimit          = 100;
+constexpr std::int64_t kDefaultDumpMaxAgeHours   = 24;
+
+std::uint64_t read_count_option(const char* name, std::uint64_t fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') { return fallback; }
+    std::uint64_t parsed = 0;
+    const char* cursor  = value;
+    const char* end     = value + std::strlen(value);
+    const auto result   = std::from_chars(cursor, end, parsed);
+    if (result.ec != std::errc() || result.ptr != end) { return fallback; }
+    return parsed;
+}
+
+// A dump file is named req-<unix_ms>-<sequence>-<route>.json. Anything else in the directory is
+// left alone: the directory belongs to the operator, not to this diagnostic.
+struct DumpFile {
+    std::int64_t stamp = 0;
+    std::uint64_t sequence = 0;
+    std::filesystem::path path;
+};
+
+bool parse_dump_file_name(const std::string& name, DumpFile& out) {
+    constexpr std::string_view prefix = "req-";
+    constexpr std::string_view suffix = ".json";
+    if (!name.starts_with(prefix) || !name.ends_with(suffix)) { return false; }
+    const char* cursor = name.data() + prefix.size();
+    const char* end    = name.data() + name.size() - suffix.size();
+    std::int64_t stamp = 0;
+    std::uint64_t sequence = 0;
+    auto result = std::from_chars(cursor, end, stamp);
+    if (result.ec != std::errc() || result.ptr == end || *result.ptr != '-') { return false; }
+    cursor = result.ptr + 1;
+    result = std::from_chars(cursor, end, sequence);
+    if (result.ec != std::errc() || result.ptr == end || *result.ptr != '-') { return false; }
+    out.stamp    = stamp;
+    out.sequence = sequence;
+    return true;
+}
+
+void prune_dump_directory(const std::string& directory, std::int64_t now_ms) {
+    static const std::size_t limit = static_cast<std::size_t>(
+        read_count_option("NINFER_DUMP_REQUESTS_LIMIT", kDefaultDumpLimit));
+    static const std::int64_t max_age_ms =
+        static_cast<std::int64_t>(read_count_option("NINFER_DUMP_REQUESTS_MAX_AGE_HOURS",
+                                                   kDefaultDumpMaxAgeHours)) *
+        3600 * 1000;
+
+    std::error_code error;
+    std::vector<DumpFile> files;
+    for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
+        if (error) { break; }
+        if (!entry.is_regular_file(error)) { continue; }
+        DumpFile file;
+        file.path = entry.path();
+        if (parse_dump_file_name(file.path.filename().string(), file)) {
+            files.push_back(std::move(file));
+        }
+    }
+    std::sort(files.begin(), files.end(), [](const DumpFile& left, const DumpFile& right) {
+        return left.stamp != right.stamp ? left.stamp < right.stamp
+                                         : left.sequence < right.sequence;
+    });
+
+    std::size_t keep_from = 0;
+    if (max_age_ms > 0) {
+        while (keep_from < files.size() && now_ms - files[keep_from].stamp > max_age_ms) {
+            ++keep_from;
+        }
+    }
+    if (limit > 0 && files.size() - keep_from > limit) {
+        keep_from = files.size() - limit;
+    }
+    for (std::size_t index = 0; index < keep_from; ++index) {
+        std::error_code remove_error;
+        std::filesystem::remove(files[index].path, remove_error);
+    }
+}
+
+void dump_request_body(const httplib::Request& request, const char* route) {
+    static const std::string directory = [] {
+        const char* value = std::getenv("NINFER_DUMP_REQUESTS");
+        return value == nullptr ? std::string() : std::string(value);
+    }();
+    if (directory.empty()) { return; }
+    try {
+        static std::mutex mutex;
+        static std::uint64_t sequence = 0;
+        std::lock_guard lock(mutex);
+        const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+        const std::string path = directory + "/req-" + std::to_string(stamp) + "-" +
+                                 std::to_string(sequence++) + "-" + route + ".json";
+        std::FILE* file = std::fopen(path.c_str(), "wb");
+        if (file == nullptr) { return; }
+        (void)std::fwrite(request.body.data(), 1, request.body.size(), file);
+        (void)std::fclose(file);
+        prune_dump_directory(directory, stamp);
+    } catch (...) {
+        // A diagnostic failure must never affect serving.
+    }
 }
 void write_exception(httplib::Response& res, const std::exception& ex) {
     ApiError error;
@@ -510,9 +638,11 @@ void HttpServer::register_routes() {
     });
     server_.Post("/v1/chat/completions",
                  [this](const httplib::Request& req, httplib::Response& res) {
+                     dump_request_body(req, "chat");
                      handle_chat_completions(req, res);
                  });
     server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
+        dump_request_body(req, "responses");
         handle_responses(req, res);
     });
     server_.Post("/v1/responses/input_tokens",
@@ -544,6 +674,7 @@ void HttpServer::register_routes() {
                      handle_count_tokens(req, res);
                  });
     server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
+        dump_request_body(req, "messages");
         handle_messages(req, res);
     });
 }
