@@ -247,6 +247,27 @@ this process default.
 Add `--default-thinking-budget 512` to the startup command to cap model-origin thinking at 512
 tokens for every thinking-enabled request.
 
+`--default-reasoning-effort low|medium|xhigh` pins the level a request receives when it omits
+`reasoning_effort`. Unset (the default) keeps the loaded chat template's own default, which the
+registered templates declare as `xhigh`. A configured level the loaded template cannot express is
+rejected before prompt preparation with code `reasoning_effort_not_supported`.
+
+The resolved level is rendered INTO the prompt rather than carried beside it: the leading block
+carries a level-specific reasoning directive (`medium` renders none, `xhigh` renders 38 tokens of
+guidance), and that block precedes every message. A request resolving to a different level than an
+earlier request therefore shifts every later position and reuses no cached token - correctly, since
+those tokens' key/value state was computed against a different prefix. That is what makes this
+option operationally important for a client that sends an explicit level on its ordinary turns but
+omits the field on an auxiliary call, such as a summarization request: without the option that call
+renders the template default and pays a full cold prefill. Measured on this deployment, a
+277,038-token summarization prompt that shared its first 277,610 tokens with the preceding turn
+reused 0 tokens and spent five minutes prefilling; in a controlled pair, an 8,839-token prompt at
+the session's own level reused 8,444 tokens (95.5%) while the same prompt with the omitted level
+reused 0.
+
+Set `--default-reasoning-effort medium` when this server's clients send `medium` on their ordinary
+turns.
+
 At the cap boundary, Engine first honors a natural `</think>`, stop condition, cancellation, or
 total output/context limit. If thinking remains open, it commits Qwen's canonical early-close
 guidance and close marker to the same model sequence without sampling, streams the guidance as a
@@ -846,6 +867,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
+| `--default-reasoning-effort low\|medium\|xhigh` | level a request resolves to when it omits `reasoning_effort`; unset keeps the template default, and the level is rendered into the prompt | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
@@ -856,6 +878,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
 | `--auto-long-anchors N` | propose a private long anchor at each of the last N message boundaries of every prompt; clamped to the anchor limit, `0` disables | anchor limit |
+| `--auto-anchor-spacing N` | also propose a private long anchor at the first message boundary at or after every N tokens of the prompt, so a divergence in the middle of a long history resumes nearby instead of from token zero; `0` disables | `0` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
@@ -869,6 +892,15 @@ keep warm at once:
 Host StateImage slots >= retained sessions x (2 + --max-long-anchors-per-continuation)
 Device StateImage slots = --max-concurrency + --device-state-slots   (active lanes are separate)
 ```
+
+Size both anchor sets into that budget: `--auto-long-anchors` covers the last N message boundaries
+(recent edits), while `--auto-anchor-spacing` spreads further anchors across the whole prompt. The
+spread set is what makes a mid-history divergence cheap: session compaction is the common case,
+because it keeps a verbatim tail, drops the middle, and appends its summarization instruction at
+that cut - every checkpoint of the conversation that follows it (its endpoint and its tail anchors)
+then sits deeper than the cut and cannot serve the auxiliary call, which would otherwise re-prefill
+the whole prompt. `--max-long-anchors-per-continuation` must cover both sets, since a full anchor
+set evicts its shallowest member first.
 
 A deficit does not fail; the planner simply drops checkpoints it cannot place, and the visible
 symptom is a deep session whose `cache` hit keeps collapsing to a shallower prefix and re-prefilling

@@ -45,6 +45,10 @@ struct ServeOptions {
     // (--max-long-anchors-per-continuation) once the Engine has normalized it; 0 disables.
     // See resolve_automatic_private_anchors.
     std::optional<std::uint32_t> auto_long_anchors;
+    // --auto-anchor-spacing N: also propose a private long anchor at the first message boundary at
+    // or after every N tokens of every prompt, so a mid-history divergence resumes nearby instead
+    // of from token zero. Unset or 0 disables; see ContextCacheHints::automatic_anchor_spacing.
+    std::optional<std::uint32_t> auto_anchor_spacing;
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
@@ -67,6 +71,21 @@ struct ServeOptions {
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;
     std::optional<std::uint32_t> default_thinking_budget;
+    // The effort a request receives when it omits `reasoning_effort`
+    // (--default-reasoning-effort). Unset keeps the loaded chat template's own default.
+    //
+    // The resolved effort is rendered INTO THE PROMPT: the leading block carries a reasoning
+    // directive whose length depends on the level (medium renders nothing, xhigh renders the 38
+    // tokens of kXHighReasoningInstructions). That block precedes every message, so a level that
+    // differs from the one an earlier request used shifts every later position and the request
+    // cannot reuse one cached token - correctly, because those tokens' KV was computed against a
+    // different prefix. A client that sends an explicit effort on its ordinary turns but omits
+    // the field on an auxiliary call therefore loses prefix reuse for exactly that call: measured
+    // 2026-09-11, an 18,279-token summarization prompt sharing its first 17,851 tokens with the
+    // preceding turn reused 0 and paid a full cold prefill, while the same prompt at the
+    // session's own level reused 95.5% (8,444 of 8,839). Pinning the omitted case to the level
+    // such a client does send keeps both prompts byte-identical.
+    std::optional<ninfer::ReasoningEffort> default_reasoning_effort;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     // Process-level explicit overrides layered between registered model/mode defaults and request
@@ -87,6 +106,9 @@ ServeOptions parse_serve_options(int argc, char** argv);
 // that cap (extra proposals would only churn replacements within one prefill). Zero when the
 // context cache is disabled. `resolved` must be the Engine's normalized options, not the parsed
 // ServeOptions::context_cache, whose optionals are still unset.
+// The per-request ContextCacheHints::automatic_anchor_spacing value for this server.
+std::uint32_t resolve_automatic_anchor_spacing(const ServeOptions& options,
+                                              const ContextCacheOptions& resolved);
 std::uint32_t resolve_automatic_private_anchors(const ServeOptions& options,
                                                 const ContextCacheOptions& resolved);
 std::string resolve_public_model_id(const ServeOptions& options,

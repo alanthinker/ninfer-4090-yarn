@@ -128,6 +128,18 @@ int main() {
                       "model id override is unexpectedly configured by default");
     failures += check(!defaults.default_thinking_budget,
                       "thinking budget is unexpectedly limited by default");
+    failures += check(!defaults.default_reasoning_effort,
+                      "an omitted reasoning effort is unexpectedly pinned by default");
+    const ServeOptions pinned_effort =
+        parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort", "medium"});
+    failures += check(pinned_effort.default_reasoning_effort == ninfer::ReasoningEffort::Medium,
+                      "--default-reasoning-effort did not pin the omitted effort level");
+    bool bad_default_effort_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort", "high"});
+    } catch (const std::invalid_argument&) { bad_default_effort_rejected = true; }
+    failures += check(bad_default_effort_rejected,
+                      "server accepted a reasoning effort level the templates cannot express");
     failures += check(
         !defaults.sampling_overrides.temperature && !defaults.sampling_overrides.top_p &&
             !defaults.sampling_overrides.top_k && !defaults.sampling_overrides.presence_penalty &&
@@ -327,6 +339,46 @@ int main() {
     failures += check(!semantics.reasoning_effort &&
                           semantics.effective_reasoning_effort == ninfer::ReasoningEffort::XHigh,
                       "omitted reasoning effort did not resolve to the template default");
+    // --default-reasoning-effort exists because the level is rendered into the prompt's leading
+    // block: a client that sends one level on its ordinary turns and omits the field on an
+    // auxiliary call renders a different prompt for that call and reuses nothing. Pinning the
+    // omitted case must give both shapes the same effective level.
+    prompt_capabilities.reasoning_effort.medium = true;
+    ServeOptions pinned = defaults;
+    pinned.default_reasoning_effort = ninfer::ReasoningEffort::Medium;
+    const auto omitted_level = resolve_prompt_semantics(request, pinned, prompt_capabilities);
+    request.reasoning_effort = std::nullopt;
+    failures += check(!omitted_level.reasoning_effort &&
+                          omitted_level.effective_reasoning_effort == ninfer::ReasoningEffort::Medium,
+                      "configured default reasoning effort did not resolve an omitted level");
+    request.reasoning_effort = RequestedReasoningEffort::Medium;
+    const auto sent_level = resolve_prompt_semantics(request, defaults, prompt_capabilities);
+    request.reasoning_effort.reset();
+    failures += check(sent_level.effective_reasoning_effort ==
+                          omitted_level.effective_reasoning_effort,
+                      "omitted and explicitly sent effort levels resolved differently");
+    // The prompt renders the effective level: an omitted level that resolved to the configured
+    // default must reach the template, or the two shapes above would still render different
+    // leading blocks and reuse nothing.
+    const ninfer::PromptInput pinned_prompt = to_prompt_input(request, omitted_level, {});
+    failures += check(pinned_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Medium,
+                      "the pinned default effort did not reach the rendered prompt");
+    request.reasoning_effort = RequestedReasoningEffort::Medium;
+    const ninfer::PromptInput sent_prompt = to_prompt_input(request, sent_level, {});
+    request.reasoning_effort.reset();
+    failures += check(sent_prompt.options.reasoning_effort ==
+                          pinned_prompt.options.reasoning_effort,
+                      "sent and pinned effort levels rendered different prompts");
+    ServeOptions unsupported = defaults;
+    unsupported.default_reasoning_effort = ninfer::ReasoningEffort::XHigh;
+    prompt_capabilities.reasoning_effort.xhigh = false;
+    bool unsupported_default_effort_rejected = false;
+    try {
+        (void)resolve_prompt_semantics(request, unsupported, prompt_capabilities);
+    } catch (const ApiException&) { unsupported_default_effort_rejected = true; }
+    failures += check(unsupported_default_effort_rejected,
+                      "configured default reasoning effort ignored the template capabilities");
+    prompt_capabilities.reasoning_effort.xhigh = true;
     failures +=
         check(to_request_options(request, defaults, semantics, true).execution.allow_prefix_reuse,
               "resolved read-write cache policy did not reach Engine options");

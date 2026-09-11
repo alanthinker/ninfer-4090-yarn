@@ -45,6 +45,14 @@ YARN_FACTOR="${NINFER_YARN_FACTOR:-2.51}"
 YARN_ORIG="${NINFER_YARN_ORIG:-262144}"
 CONCURRENCY="${NINFER_CONCURRENCY:-4}"
 KV_DTYPE="${NINFER_KV_DTYPE:-rk4v4-e8}"
+# 缺省推理档位 (--default-reasoning-effort)。引擎把档位**渲染进 prompt 开头**的一段指导语
+# (medium 不渲染, xhigh 渲染 38 个 token 的 "Reasoning effort is set to xhigh..."), 而这段
+# 前缀在消息之前 —— 档位一变, 后面所有 token 的位置整体平移, 前缀缓存从头失效。客户端(DSH)
+# 的普通对话显式发 reasoning_effort=medium, 而它的压缩摘要请求不带这个字段, 于是引擎落到
+# xhigh 缺省 → 摘要请求每次都是整段冷 prefill (实测 18,279 token 全冷; 277k 会话那次 278,038
+# token 全冷、撞 5 分钟流超时)。把缺省钉在客户端实际发送的档位上, 两边 prompt 就逐字节一致。
+# 根治在客户端 (compaction-basic 应当把会话档位带上), 这里是不改客户端的服务端兜底。
+DEFAULT_EFFORT="${NINFER_DEFAULT_EFFORT:-medium}"
 # 跨会话前缀缓存的关键: 自动长锚点窗口 + 保留上限。
 # 引擎在每个 prompt 的「最后 N 个消息边界」上放置私有长锚点 (N=--auto-long-anchors),
 # 而每条 continuation 最多保留 --max-long-anchors-per-continuation 个, 满了就替换最浅的那个。
@@ -55,7 +63,7 @@ KV_DTYPE="${NINFER_KV_DTYPE:-rk4v4-e8}"
 # (87-90%, TTFT 1.4-2.6s)。显存/内存占用与 N 无关 (锚点复用已预留的 snapshot arena, 实测
 # RSS 36.57 GiB、显存 30,966 MiB 在 N=4/8/32/64 下完全相同), 所以默认给足 32。
 AUTO_ANCHORS="${NINFER_AUTO_LONG_ANCHORS:-32}"
-MAX_ANCHORS="${NINFER_MAX_LONG_ANCHORS:-32}"
+MAX_ANCHORS="${NINFER_MAX_LONG_ANCHORS:-64}"
 # 共享前缀目录容量。引擎自己对每个 prompt 提出三个候选: 「全部 tools 之后」「连续 leading
 # System/Developer 之后」「full prompt」——第二个就是所有会话都相同的系统提示词末尾。
 # 但这些是 EngineStructural 证据, 按设计 (docs/maintainer/resource-scheduling-and-context-cache.md
@@ -71,6 +79,16 @@ SHARED_PREFIXES="${NINFER_MAX_SHARED_PREFIXES:-4}"
 # 注意 device_state_slots 只有 4(加 4 个活跃 lane);深度端点绝大多数时候待在 host 槽里,
 # 所以这个数字才是长会话能不能"睡下去再醒来"的关键。
 HOST_STATE_SLOTS="${NINFER_HOST_STATE_SLOTS:-160}"
+# 自动长锚点的"铺开"间隔(token)。除了上面"最后 N 个消息边界"的窗口(服务于最近编辑),
+# 再在整个 prompt 上每隔 N 个 token 放一个锚点,对齐到其后的第一个消息边界。
+# 为什么需要:会话压缩(compaction)会保留末尾一小段逐字内容、丢掉中间,并把摘要指令接在切割点
+# 上 —— 于是上一次会话的所有检查点(端点、尾部锚点)都在切割点**之后**,一个都用不上,压缩只能
+# 从 token 0 重新 prefill(~55 万 token,8-10 分钟,容易被客户端超时打断)。铺开后,切割点下方
+# 最近的锚点就能被复用,压缩只需 prefill ≤ N 个 token。
+#   0 = 关闭(只保留尾部窗口;上游行为)
+#   32768 时,658k 上下文约产生 20 个铺开锚点 + 32 个尾部锚点 = 52 张状态镜像 ≈ 7.6 GiB/会话,
+#   所以 --host-state-slots 要按 会话数 x (2 + 尾部锚点 + 铺开锚点) 配足(160 够 3 个会话)。
+ANCHOR_SPACING="${NINFER_ANCHOR_SPACING:-32768}"
 
 echo "== 前置检查 =="
 [ -x "$BIN" ] || { echo "错误: 二进制不存在: $BIN"; echo "  先编译: cd $NINFER_DIR && cmake --build build -j"; exit 1; }
@@ -157,6 +175,8 @@ setsid nohup "$BIN" "$MODEL" \
   --max-shared-prefixes "$SHARED_PREFIXES" \
   --max-long-anchors-per-continuation "$MAX_ANCHORS" \
   --auto-long-anchors "$AUTO_ANCHORS" \
+  --auto-anchor-spacing "$ANCHOR_SPACING" \
+  --default-reasoning-effort "$DEFAULT_EFFORT" \
   --preserve-thinking >>"$LOG" 2>&1 &
 echo $! > "$PIDF"
 echo "pid=$(cat "$PIDF")  日志: $LOG"

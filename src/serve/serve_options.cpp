@@ -83,11 +83,13 @@ std::string serve_usage_text(const char* argv0) {
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] [--auto-long-anchors N] "
+           "[--auto-anchor-spacing N] "
            "[--request-log-jsonl FILE] [--slot-save-path DIR] [--auto-save-evicted] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] "
            "[--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
+           "[--default-reasoning-effort low|medium|xhigh] "
            "[--vision] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -137,6 +139,9 @@ std::string serve_usage_text(const char* argv0) {
            "--host-kv-mib uses MiB\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
+           "       --default-reasoning-effort low|medium|xhigh is the level a request gets when it "
+           "omits reasoning_effort; the level is rendered into the prompt, so omitting it while "
+           "ordinary turns send another level costs the whole prefix cache\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
@@ -284,6 +289,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--auto-long-anchors") {
             options.auto_long_anchors = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--auto-long-anchors"), "auto-long-anchors"));
+        } else if (arg == "--auto-anchor-spacing") {
+            options.auto_anchor_spacing = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--auto-anchor-spacing"), "auto-anchor-spacing"));
         } else if (arg == "--request-log-jsonl") {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {
@@ -329,6 +337,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--default-thinking-budget is out of range");
             }
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
+        } else if (arg == "--default-reasoning-effort") {
+            const std::string_view level = require_value("--default-reasoning-effort");
+            if (level == "low") {
+                options.default_reasoning_effort = ninfer::ReasoningEffort::Low;
+            } else if (level == "medium") {
+                options.default_reasoning_effort = ninfer::ReasoningEffort::Medium;
+            } else if (level == "xhigh") {
+                options.default_reasoning_effort = ninfer::ReasoningEffort::XHigh;
+            } else {
+                throw std::invalid_argument(
+                    "--default-reasoning-effort must be low, medium, or xhigh");
+            }
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--vision-max-tokens" || arg == "--vision-limit") {
@@ -442,6 +462,13 @@ std::string resolve_public_model_id(const ServeOptions& options,
         throw std::logic_error("loaded artifact model_id must not be empty");
     }
     return std::string(artifact_model_id);
+}
+
+std::uint32_t resolve_automatic_anchor_spacing(const ServeOptions& options,
+                                              const ContextCacheOptions& resolved) {
+    if (!resolved.enabled || !options.allow_prefix_reuse) { return 0; }
+    if (resolved.max_long_anchors_per_continuation.value_or(0U) == 0) { return 0; }
+    return options.auto_anchor_spacing.value_or(0U);
 }
 
 std::uint32_t resolve_automatic_private_anchors(const ServeOptions& options,

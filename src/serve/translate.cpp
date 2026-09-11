@@ -35,6 +35,16 @@ std::uint64_t random_seed() {
     throw ApiException(std::move(error));
 }
 
+// Name one resolved reasoning level for a --default-reasoning-effort diagnostic.
+const char* resolved_effort_name(ninfer::ReasoningEffort effort) noexcept {
+    switch (effort) {
+    case ninfer::ReasoningEffort::Low: return "low";
+    case ninfer::ReasoningEffort::Medium: return "medium";
+    case ninfer::ReasoningEffort::XHigh: return "xhigh";
+    }
+    return "unknown";
+}
+
 ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& request,
                                                      const ServeOptions& server) {
     ninfer::SamplingOverrides sampling = server.sampling_overrides;
@@ -117,6 +127,23 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         .effective_reasoning_effort = std::nullopt,
         .preserve_thinking          = request.preserve_thinking.value_or(server.preserve_thinking),
     };
+    // The level an omitted request level resolves to: the server's explicit
+    // --default-reasoning-effort when set, else the loaded template's own default. The level is
+    // rendered into the prompt's leading block, so a level the template cannot express is a
+    // deployment error rather than a per-request surprise.
+    const auto default_effort = [&]() -> std::optional<ninfer::ReasoningEffort> {
+        if (!server.default_reasoning_effort.has_value()) {
+            return capabilities.reasoning_effort.default_effort;
+        }
+        if (!capabilities.reasoning_effort.supports(*server.default_reasoning_effort)) {
+            invalid_prompt_option(
+                "--default-reasoning-effort '" +
+                    std::string(resolved_effort_name(*server.default_reasoning_effort)) +
+                    "' is not supported by the loaded chat template",
+                "reasoning_effort", "reasoning_effort_not_supported");
+        }
+        return server.default_reasoning_effort;
+    };
     const auto complete = [&]() {
         if (request.continuation == ninfer::PromptContinuationMode::ContinueFinalAssistant &&
             result.enable_thinking) {
@@ -124,9 +151,8 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
                                   "messages", "assistant_prefill_not_supported");
         }
         if (result.enable_thinking) {
-            result.effective_reasoning_effort = result.reasoning_effort
-                                                    ? result.reasoning_effort
-                                                    : capabilities.reasoning_effort.default_effort;
+            result.effective_reasoning_effort =
+                result.reasoning_effort ? result.reasoning_effort : default_effort();
         }
         return result;
     };
@@ -270,7 +296,13 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
 
     input.options.continuation                     = request.continuation;
     input.options.enable_thinking                  = semantics.enable_thinking;
-    input.options.reasoning_effort                 = semantics.reasoning_effort;
+    // The prompt renders the EFFECTIVE level, not the requested one. The distinction only exists
+    // when a request omits reasoning_effort and the server pins it (--default-reasoning-effort):
+    // rendering the raw request field would fall back to the template's own default inside
+    // resolve_reasoning_instructions, which is what silently gave an auxiliary call a different
+    // leading directive than the session's own turns. A disabled-thinking request carries an
+    // empty effective level, so it still renders no directive.
+    input.options.reasoning_effort                 = semantics.effective_reasoning_effort;
     input.options.preserve_thinking                = semantics.preserve_thinking;
     input.options.add_vision_id                    = false;
     const std::vector<const ToolDefinition*> tools = effective_tools(request);
