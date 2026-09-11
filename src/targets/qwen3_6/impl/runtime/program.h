@@ -627,6 +627,12 @@ public:
     // that retries the same prompt resumes from that frontier instead of prefilling from zero.
     // Declines (Released) when the prefix cannot be resumed; `abandon_outcome` names the case.
     [[nodiscard]] FinishResult abandon_prefill(SequenceHandle sequence) noexcept;
+    // Publishes a cancelled request's executed prefix as the continuation endpoint. A client that
+    // aborts a turn and then acts on that turn - a summarization whose replay deliberately drops
+    // the answer - has no other checkpoint to resume from, so discarding the lane forces a full
+    // re-prefill of the whole conversation. Declines (Released) when the lane holds no publishable
+    // round, and the caller then aborts exactly as before.
+    [[nodiscard]] FinishResult publish_cancelled(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
@@ -1206,7 +1212,8 @@ private:
     // abandoned form additionally closes the ledger at that frontier before publishing.
     [[nodiscard]] FinishResult
     publish_continuation(SequenceHandle sequence,
-                         std::optional<std::uint32_t> abandoned_frontier) noexcept;
+                         std::optional<std::uint32_t> abandoned_frontier,
+                         bool cancelled_active) noexcept;
     void ordered_reset(SequenceState& sequence);
     [[nodiscard]] StateImageSelectors state_selectors(const SequenceState& sequence) const;
     [[nodiscard]] detail::PhysicalResources

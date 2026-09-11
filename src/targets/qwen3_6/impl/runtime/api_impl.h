@@ -540,6 +540,12 @@ Program<Variant>::abandon_prefill(SequenceHandle<Variant> sequence) noexcept {
 }
 
 template <>
+FinishResult<Variant>
+Program<Variant>::publish_cancelled(SequenceHandle<Variant> sequence) noexcept {
+    return impl_->publish_cancelled(sequence);
+}
+
+template <>
 AbortResult<Variant> Program<Variant>::abort(SequenceHandle<Variant> sequence) noexcept {
     return impl_->abort(sequence);
 }

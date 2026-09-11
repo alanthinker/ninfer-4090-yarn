@@ -403,6 +403,22 @@ rendered-token frontier is ignored without changing prompt content. `prompt_cach
 Engine session key or prefix identity. Valid TTL/retention values are accepted, but NInfer does not
 promise their wall-clock residency; physical retention follows the resource scheduler.
 
+A cancelled request keeps the prefix it already executed. Both a cancelled prefill and a request
+cancelled after its prefill completed publish their checkpoint before the lane is released, so the
+next request that shares that prefix reuses it instead of prefilling from token zero. The request
+still terminates as cancelled and emits no output. This matters for a client that aborts a turn and
+then summarizes the conversation: a summarization replay deliberately drops the last assistant
+message, so the aborted turn's own prefix is the only checkpoint such a request can resume from.
+Measured on this deployment, the summarization that follows an aborted turn reuses 97.7% of its
+17,434-token prompt (TTFT 0.55 s) instead of 0% (TTFT 15.6 s).
+
+Prefix reuse fails silently by design - a prompt that shares no digest with any resident checkpoint
+simply plans from root - so the structured record's `cache N (x%, source)` field is the only summary
+of what happened. `NINFER_REUSE_DIAG=1` additionally writes one line per request naming every
+indexed checkpoint, its kind (endpoint, rewrite, anchor, shared), its frontier, and the gate that
+rejected it (`index-invalid`, `frontier-beyond-prompt`, `digest-mismatch`, or `CANDIDATE`). It is a
+diagnostic on stderr only - planning never reads it - and unset costs one comparison per request.
+
 ## OpenAI Responses Core
 
 NInfer implements the typed-Item and semantic-event core of the OpenAI

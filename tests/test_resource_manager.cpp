@@ -313,6 +313,16 @@ struct FakeAdmissionCandidate {
     identity_assessment() const noexcept {
         return identity;
     }
+
+    // The planner reports the best-reuse candidate's own identity verdict in its diagnostics, so a
+    // package admitted to that interface must be able to name the verdict and its detail.
+    [[nodiscard]] ninfer::runtime::MaterializationRejection identity_rejection() const noexcept {
+        return rejection;
+    }
+
+    [[nodiscard]] const std::string& identity_rejection_detail() const noexcept {
+        return rejection_detail;
+    }
 };
 
 struct FakeTargetDecision {
@@ -1095,6 +1105,27 @@ public:
                                .speculative = FakeSpeculativeStats{.value = 9}};
     }
 
+    // Cancelled-request publication: the manager calls abandon_prefill for a cancelled prefill and
+    // publish_cancelled for a cancellation after the prefill completed. The fake models both on the
+    // same outcome knob, since the manager only distinguishes them by which call it makes.
+    [[nodiscard]] FakeFinishResult abandon_prefill(FakeSequenceHandle sequence) noexcept {
+        ++abandon_prefill_calls;
+        FakeFinishResult result = finish(sequence);
+        result.abandon_outcome  = result.disposition == FinishDisposition::Catalogued
+                                      ? ninfer::runtime::AbandonedPrefixOutcome::Retained
+                                      : ninfer::runtime::AbandonedPrefixOutcome::PublicationDeclined;
+        return result;
+    }
+
+    [[nodiscard]] FakeFinishResult publish_cancelled(FakeSequenceHandle sequence) noexcept {
+        ++publish_cancelled_calls;
+        FakeFinishResult result = finish(sequence);
+        result.abandon_outcome  = result.disposition == FinishDisposition::Catalogued
+                                      ? ninfer::runtime::AbandonedPrefixOutcome::Retained
+                                      : ninfer::runtime::AbandonedPrefixOutcome::PublicationDeclined;
+        return result;
+    }
+
     [[nodiscard]] FakeReleaseResult
     release_continuation(FakeContinuationHandle&& continuation) noexcept {
         released_continuations.push_back(continuation.id);
@@ -1145,6 +1176,8 @@ public:
     std::uint64_t pressure_target_assessments = 0;
     std::uint64_t start_calls                 = 0;
     std::uint64_t finish_calls                = 0;
+    std::uint64_t abandon_prefill_calls       = 0;
+    std::uint64_t publish_cancelled_calls     = 0;
     std::uint64_t abort_calls                 = 0;
     std::uint64_t skipped_captures            = 0;
     std::size_t pressure_target_count_peak    = 0;

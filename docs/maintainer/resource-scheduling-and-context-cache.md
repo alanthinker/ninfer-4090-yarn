@@ -465,6 +465,14 @@ endpoint，使同一 prompt 的重试从该 frontier 续算。凡 frontier 无�
 的情形——尚未提交任何 chunk、没有 boundary hidden、context cache disabled、没有 publication slot——
 一律退回 Discard，并把这个结果报告给请求诊断。
 
+prefill 已经完成、在 decode 阶段被取消的 request 走同一条 Finish：它最后一次提交的 round 已经把 KV、
+prefix identity 与 GDN 状态闭合在自己的 `execution_frontier` 上，而 endpoint 正是由该 frontier 与当前
+active StateImage 构成——这与自然 finish 发布的 checkpoint 完全相同，decode 越过 prompt 并不会让它变陈。
+唯一被拒绝的情形是仍有 pending round（那会发布未提交状态），此时仍退回 Discard。这条保证对客户端行为
+敏感：客户端 mid-turn 取消、随后对同一段对话做 summarization 时，摘要 replay 按设计丢掉最后一条回答，
+因此被取消那一轮自己的 prefix 是它唯一可续算的 checkpoint；只保留 prefill 中途取消的发布，会让这种
+summarization 每次都从 token zero 重算整段对话（实测 17,434 token 全冷，长会话 278,038 token 全冷）。
+
 ### 6.3 Persistent backfill proof
 
 Scheduler 是否允许 backfill 由 [Engine 架构](engine-architecture.md#52-admission-顺序)决定。Program

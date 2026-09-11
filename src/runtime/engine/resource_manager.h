@@ -12,11 +12,14 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -293,6 +296,7 @@ public:
 
         const typename Planner::Clock::time_point planning_started = Planner::Clock::now();
         rebuild_prefix_index();
+        log_reuse_diagnostics(base);
         PrefixDemandRecord provisional_demand;
         provisional_demand.domain =
             reuse_domain(base.context_cache().session_key, publication_order);
@@ -931,7 +935,7 @@ public:
 
     [[nodiscard]] FinishResult finish(Program& program, LaneId lane, SequenceHandle sequence) {
         require_lane(lane, LogicalLaneState::TerminalPending);
-        return publish_terminal(program, lane, sequence, false);
+        return publish_terminal(program, lane, sequence, PublicationCause::Finish);
     }
 
     // A request whose client abandoned it mid-prefill keeps the prefix it already computed: the
@@ -941,7 +945,19 @@ public:
     [[nodiscard]] FinishResult
     abandon_prefill(Program& program, LaneId lane, SequenceHandle sequence) {
         require_lane(lane, LogicalLaneState::Active);
-        return publish_terminal(program, lane, sequence, true);
+        return publish_terminal(program, lane, sequence, PublicationCause::AbandonedPrefill);
+    }
+
+    // A request whose client cancelled it after its prefill completed keeps the prefix it already
+    // executed, the same guarantee abandon_prefill gives a cancelled prefill. The lane's last
+    // committed round closed the KV, prefix identity and GDN state at its execution frontier, so
+    // the Program publishes the endpoint a natural finish would and the client's next request (a
+    // retry, or the summarization that replays the turn it just cancelled) resumes from there. A
+    // lane with no publishable round is discarded exactly like an aborted request.
+    [[nodiscard]] FinishResult
+    publish_cancelled(Program& program, LaneId lane, SequenceHandle sequence) {
+        require_lane(lane, LogicalLaneState::Active);
+        return publish_terminal(program, lane, sequence, PublicationCause::CancelledActive);
     }
 
     [[nodiscard]] AbortResult abort(Program& program, LaneId lane, SequenceHandle sequence) {
@@ -1188,18 +1204,28 @@ private:
     // Shared terminal publication for a finished request (`abandoned == false`) and an abandoned
     // prefill (`abandoned == true`). Both hand a continuation to the catalog through the active
     // lane's pre-reserved publication slot, and both release the lane when the Program declines to
+    // How a terminal request's prefix is published: a natural finish, an abandoned prefill (the
+    // endpoint at its last closed chunk frontier), or a cancelled request whose prefill already
+    // completed (the endpoint a finish would have published).
+    enum class PublicationCause : std::uint8_t { Finish, AbandonedPrefill, CancelledActive };
+
     // retain anything.
     [[nodiscard]] FinishResult
-    publish_terminal(Program& program, LaneId lane, SequenceHandle sequence, bool abandoned) {
+    publish_terminal(Program& program, LaneId lane, SequenceHandle sequence,
+                     PublicationCause cause) {
         if (!std::holds_alternative<std::monostate>(transaction_) ||
             program.has_context_transaction()) {
-            throw std::logic_error(abandoned
-                                       ? "prefill abandon overlaps an open resource transaction"
-                                       : "terminal finish overlaps an open resource transaction");
+            throw std::logic_error(
+                cause == PublicationCause::Finish
+                    ? "terminal finish overlaps an open resource transaction"
+                    : "cancelled request publication overlaps an open resource transaction");
         }
         ActiveEntry& active = active_[lane.value];
-        FinishResult result =
-            abandoned ? program.abandon_prefill(sequence) : program.finish(sequence);
+        FinishResult result = cause == PublicationCause::AbandonedPrefill
+                                  ? program.abandon_prefill(sequence)
+                                  : (cause == PublicationCause::CancelledActive
+                                         ? program.publish_cancelled(sequence)
+                                         : program.finish(sequence));
         if (result.status != ConsumeStatus::Consumed) {
             AbortResult discarded = program.abort(sequence);
             if (discarded.status != ConsumeStatus::Consumed) {
@@ -1759,6 +1785,72 @@ private:
         const SharedCatalogEntry& entry = shared_catalog_[index.slot];
         return entry.state == SharedCatalogState::Catalogued && entry.handle &&
                entry.id == index.owner_id && entry.revision == index.revision;
+    }
+
+    // NINFER_REUSE_DIAG=1: name every indexed checkpoint and the gate that rejects it for THIS
+    // prompt. Prefix reuse fails silently by design - a prompt sharing no digest with any
+    // checkpoint simply plans from root - so the done line's "reuse offered none" cannot tell an
+    // absent artifact from a stale, actively-held, or content-mismatched one, and a deep
+    // continuation that a cancelled request consumed is invisible in every other log. Read-only:
+    // it evaluates the same predicates the candidate loop evaluates and mutates no planning state.
+    [[nodiscard]] static bool reuse_diagnostics_enabled() noexcept {
+        const char* value = std::getenv("NINFER_REUSE_DIAG");
+        return value != nullptr && *value != '\0' && *value != '0';
+    }
+
+    template <class BasePlan>
+    void log_reuse_diagnostics(const BasePlan& base) const {
+        if (!reuse_diagnostics_enabled()) { return; }
+        int accepted = 0;
+        int rejected = 0;
+        std::fprintf(stderr, "reuse-diag: prompt=%u index=%zu catalog=%zu shared=%zu\n",
+                     base.summary().prompt_tokens, prefix_index_.size(), catalog_count_,
+                     shared_catalog_count_);
+        for (const PrefixIndexEntry& index : prefix_index_) {
+            if (!index.occupied) { continue; }
+            const char* kind = "unknown";
+            std::string detail;
+            if (index.shared) {
+                kind = "shared";
+            } else if (index.slot < catalog_count_) {
+                const CatalogEntry& entry = catalog_[index.slot];
+                if (entry.summary.endpoint && entry.summary.endpoint->ref == index.checkpoint) {
+                    kind = "endpoint";
+                } else if (entry.summary.rewrite &&
+                           entry.summary.rewrite->ref == index.checkpoint) {
+                    kind = "rewrite";
+                } else {
+                    for (const auto& anchor : entry.summary.long_anchors) {
+                        if (anchor.ref == index.checkpoint) {
+                            kind = "anchor";
+                            break;
+                        }
+                    }
+                }
+                detail = " state=" + std::to_string(static_cast<int>(entry.state)) +
+                         " edge=" + std::to_string(private_has_active_edge(index.slot) ? 1 : 0) +
+                         " anchors=" + std::to_string(entry.summary.long_anchors.size());
+            }
+            const std::optional<PrefixShortlistKey> incoming =
+                base.prefix_shortlist_key(index.key.frontier);
+            std::string verdict;
+            if (!valid_prefix_index_entry(index)) {
+                verdict = "REJECT index-invalid";
+            } else if (!incoming) {
+                verdict = "REJECT frontier-beyond-prompt";
+            } else if (*incoming != index.key) {
+                verdict = "REJECT digest-mismatch";
+            } else {
+                verdict = "CANDIDATE";
+                ++accepted;
+            }
+            if (!verdict.starts_with("CANDIDATE")) { ++rejected; }
+            std::fprintf(stderr, "reuse-diag:   %-8s frontier=%-7u shared=%d%s %s\n", kind,
+                         index.key.frontier, index.shared ? 1 : 0, detail.c_str(),
+                         verdict.c_str());
+        }
+        std::fprintf(stderr, "reuse-diag: candidates=%d rejected=%d\n", accepted, rejected);
+        std::fflush(stderr);
     }
 
     [[nodiscard]] std::uint64_t newest_hit_epoch(const CatalogEntry& entry) const noexcept {

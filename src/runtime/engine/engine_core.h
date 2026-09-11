@@ -1306,10 +1306,28 @@ private:
                 request->generation_timings = abandoned.timings;
                 request->speculative_stats  = std::move(abandoned.speculative);
             } else {
-                auto aborted =
-                    resources_.abort(*instance_.program, *request->lane, *request->sequence);
-                request->generation_timings = aborted.timings;
-                request->speculative_stats  = std::move(aborted.speculative);
+                // A cancelled request whose prefill already completed keeps the prefix it executed,
+                // the same guarantee abandon_prefill gives a cancelled prefill. That prefix is not
+                // optional bookkeeping: a client that aborts a turn and then summarizes it sends a
+                // replay that deliberately drops the answer, so the cancelled turn's own prefix is
+                // the only checkpoint such a request can resume from. Discarding the lane instead
+                // made every summarization that followed a cancelled turn prefill the whole
+                // conversation from token zero (measured 17,434 tokens cold, and 278,038 on a long
+                // session). The request still completes as cancelled and emits no output.
+                auto retained =
+                    resources_.publish_cancelled(*instance_.program, *request->lane, *request->sequence);
+                if (retained.disposition == FinishDisposition::Catalogued) {
+                    request->abandoned_prefix_outcome = AbandonedPrefixOutcome::Retained;
+                    request->abandoned_endpoint_tokens =
+                        retained.summary.endpoint ? retained.summary.endpoint->ref.frontier : 0U;
+                    request->generation_timings = retained.timings;
+                    request->speculative_stats  = std::move(retained.speculative);
+                } else {
+                    auto aborted =
+                        resources_.abort(*instance_.program, *request->lane, *request->sequence);
+                    request->generation_timings = aborted.timings;
+                    request->speculative_stats  = std::move(aborted.speculative);
+                }
             }
             if (scheduler_.prefill_lane() == lane) { scheduler_.clear_prefill_lane(lane); }
             append_output(request, request->output.commit_preview());

@@ -9253,7 +9253,11 @@ DiscardResult ProgramImplCore::abort_pending(PendingBatch&& pending) noexcept {
 }
 
 FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
-    return publish_continuation(sequence, std::nullopt);
+    return publish_continuation(sequence, std::nullopt, false);
+}
+
+FinishResult ProgramImplCore::publish_cancelled(SequenceHandle sequence) noexcept {
+    return publish_continuation(sequence, std::nullopt, true);
 }
 
 FinishResult ProgramImplCore::abandon_prefill(SequenceHandle sequence) noexcept {
@@ -9358,7 +9362,7 @@ FinishResult ProgramImplCore::abandon_prefill(SequenceHandle sequence) noexcept 
         return out;
     }
     state.tail_hidden_valid = true;
-    FinishResult published  = publish_continuation(sequence, frontier);
+    FinishResult published  = publish_continuation(sequence, frontier, false);
     published.abandon_outcome = published.disposition == runtime::FinishDisposition::Catalogued
                                     ? runtime::AbandonedPrefixOutcome::Retained
                                     : runtime::AbandonedPrefixOutcome::PublicationDeclined;
@@ -9366,7 +9370,8 @@ FinishResult ProgramImplCore::abandon_prefill(SequenceHandle sequence) noexcept 
 }
 
 FinishResult ProgramImplCore::publish_continuation(
-    SequenceHandle sequence, std::optional<std::uint32_t> abandoned_frontier) noexcept {
+    SequenceHandle sequence, std::optional<std::uint32_t> abandoned_frontier,
+    bool cancelled_active) noexcept {
     FinishResult out;
     if (has_context_transaction() || pending_transaction_ || !valid_sequence(sequence)) {
         return out;
@@ -9380,9 +9385,17 @@ FinishResult ProgramImplCore::publish_continuation(
             state.execution_frontier != *abandoned_frontier) {
             return out;
         }
-    } else if (request.lifecycle != Lifecycle::Finishable) {
+    } else if (request.lifecycle != Lifecycle::Finishable &&
+               !(cancelled_active && request.lifecycle == Lifecycle::Active)) {
+        // A cancelled ACTIVE request publishes exactly as a naturally finished one: its last
+        // committed round closed the KV, prefix identity and GDN state at
+        // state.execution_frontier, which is the same checkpoint the finish path records (the
+        // endpoint is built from that frontier and the active state image, so decoding past the
+        // prompt does not make it stale). A round still pending would publish uncommitted state,
+        // so that case keeps falling back to a plain abort.
         return out;
     }
+    if (cancelled_active && request.pending.kind != PendingKind::None) { return out; }
     if (!request.publish_continuation) {
         if (!clear_lane_strict(state, request)) { return out; }
         out.disposition = runtime::FinishDisposition::Released;
