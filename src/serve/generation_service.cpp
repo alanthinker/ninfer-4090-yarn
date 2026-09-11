@@ -281,6 +281,8 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     prompt_capabilities_ = engine_->prompt_capabilities();
     automatic_private_anchors_ =
         resolve_automatic_private_anchors(options_, engine_->options().context_cache);
+    automatic_anchor_spacing_ =
+        resolve_automatic_anchor_spacing(options_, engine_->options().context_cache);
     request_capacity_    = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
 }
@@ -367,6 +369,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         // clears allow_prefix_reuse, so the Frontend ignores the hint either way).
         input.context_cache.automatic_private_anchors =
             cache_participation == CacheParticipation::ReadWrite ? automatic_private_anchors_ : 0U;
+        input.context_cache.automatic_anchor_spacing =
+            cache_participation == CacheParticipation::ReadWrite ? automatic_anchor_spacing_ : 0U;
         prepared.acquisition_seconds =
             std::chrono::duration<double>(Clock::now() - acquisition_started).count();
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);

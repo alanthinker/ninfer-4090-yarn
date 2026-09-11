@@ -124,6 +124,12 @@ public:
         return automatic_private_anchors_;
     }
 
+    // Engine-automatic spread anchors: one at the first message boundary at or after every N
+    // tokens of the prompt; see ContextCacheHints::automatic_anchor_spacing. 0 disables.
+    [[nodiscard]] std::uint32_t automatic_anchor_spacing() const noexcept {
+        return automatic_anchor_spacing_;
+    }
+
     [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
 
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
@@ -204,6 +210,7 @@ private:
     std::shared_ptr<spdlog::logger> logger_;
     std::unique_ptr<ninfer::Engine> engine_;
     std::uint32_t automatic_private_anchors_ = 0;
+    std::uint32_t automatic_anchor_spacing_  = 0;
     ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
 };

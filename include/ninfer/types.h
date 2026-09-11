@@ -523,6 +523,16 @@ struct ContextCacheHints {
     // boundaries. Automatic anchors are opportunities, not markers, so they do not count
     // against the explicit marker limit and merge with an explicit anchor at the same frontier.
     std::uint32_t automatic_private_anchors = 0;
+    // Engine-automatic private long anchors, spread coverage: in addition to the last-N window
+    // above, propose an anchor at the first message boundary at or after every N tokens of the
+    // prompt. A prompt that diverges in the middle of its history then resumes from the nearest
+    // anchor below the divergence instead of from token zero. Session compaction is the case that
+    // motivates it: it keeps a verbatim tail, drops the rest, and appends its summarization
+    // instruction at that cut, so every checkpoint of the previous conversation (endpoint, tail
+    // anchors) sits deeper than the cut and none of them can serve the auxiliary call at all.
+    // 0 (the default) proposes none, so only the last-N window applies. Retention stays bounded by
+    // ContextCacheOptions::max_long_anchors_per_continuation, which must be sized for both sets.
+    std::uint32_t automatic_anchor_spacing = 0;
 };
 
 struct PromptInput {

@@ -820,7 +820,7 @@ PreparedContextCache prepare_context_cache(
         }
     }
 
-    out.opportunities.reserve(7U + hints.automatic_private_anchors);
+    out.opportunities.reserve(7U + hints.automatic_private_anchors + 32U);
     const auto add_opportunity = [&](PromptCacheMarkerKind kind, SharedCandidateEvidence evidence,
                                      std::uint32_t frontier, std::uint32_t input_order) {
         if (frontier == 0 || !exact_vision_frontier(frontier, vision_items)) { return; }
@@ -869,6 +869,25 @@ PreparedContextCache prepare_context_cache(
             }
             add_opportunity(PromptCacheMarkerKind::PrivateLongAnchor, SharedCandidateEvidence::None,
                             *message_boundaries[after], engine_order++);
+        }
+    }
+    // Engine-automatic spread anchors: the first boundary at or after every
+    // `automatic_anchor_spacing` tokens, oldest first. Together with the last-N window above they
+    // give a divergence in the middle of a long prompt a nearby anchor to resume from; see
+    // ContextCacheHints::automatic_anchor_spacing for the compaction case that motivates it.
+    if (hints.automatic_private_anchors != 0 && hints.automatic_anchor_spacing != 0 &&
+        message_count > 1) {
+        std::uint32_t next_frontier = hints.automatic_anchor_spacing;
+        for (std::size_t after = 1; after < message_boundaries.size(); ++after) {
+            if (!message_boundaries[after] || *message_boundaries[after] >= full_prompt_frontier) {
+                continue;
+            }
+            const std::uint32_t frontier = *message_boundaries[after];
+            if (frontier < next_frontier) { continue; }
+            add_opportunity(PromptCacheMarkerKind::PrivateLongAnchor, SharedCandidateEvidence::None,
+                            frontier, engine_order++);
+            next_frontier = frontier + hints.automatic_anchor_spacing;
+            if (next_frontier < frontier) { break; }
         }
     }
     if (hints.allow_engine_automatic_shared_prefixes) {
