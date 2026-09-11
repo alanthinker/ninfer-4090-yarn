@@ -11,6 +11,23 @@ This fork targets `sm_89` and Linux. Blackwell-only NVFP4/W4A4 execution is unav
 engine uses the same groupwise-int path as the 3090 base. The Windows path and the
 Qwen3.6-35B-A3B target are inherited but untested on the RTX 4090.
 
+> ## Provenance — read this first
+>
+> **This repository is a merge of two public repositories:**
+>
+> - [sergiuszm/ninfer-4090](https://github.com/sergiuszm/ninfer-4090) — the RTX 4090 `sm_89`
+>   port line: E8 4-bit KV full-262K native context, retuned attention prefill, vision, and
+>   llama.cpp-compatible `/metrics` + `/slots` endpoints;
+> - [gzenz/ninfer](https://github.com/gzenz/ninfer) — the upstream engine line.
+>
+> The fork history described above (NInfer-3090 deriving from Neroued/ninfer) is the lineage of
+> those two parents; this repository carries the combined result of both. Full credits,
+> including cherry-picked work, are listed in [Upstream and credits](#upstream-and-credits).
+>
+> **Deploying this engine?** Start from
+> [README_部署说明.md](README_部署说明.md) — deployment scripts, KV-cache memory budgeting, and
+> measured startup and benchmark numbers on an RTX 4080S.
+
 ## Measured results on the RTX 4090
 
 Conditions: single request, greedy decoding, CUDA Graphs on, INT8 KV, `--prefill-chunk 1024`,
@@ -414,6 +431,14 @@ JSONL request logs. See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli
 
 ## Upstream and credits
 
+This repository is a merge of the two public repositories below; the rest of the list is their
+shared lineage and cherry-picked contributions.
+
+- [sergiuszm/ninfer-4090](https://github.com/sergiuszm/ninfer-4090) - merge parent: the public
+  `sm_89` RTX 4090 line (E8 4-bit KV full-262K context, retuned attention prefill, vision,
+  llama.cpp-compatible endpoints), forked from NInfer-3090.
+- [gzenz/ninfer](https://github.com/gzenz/ninfer) - merge parent: the upstream engine line,
+  forked from Neroued/ninfer.
 - [Neroued/ninfer](https://github.com/Neroued/ninfer) - the engine, developed for the RTX 5090
   (`sm_120a`).
 - [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) - the SM86 compatibility layer,
