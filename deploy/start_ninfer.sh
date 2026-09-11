@@ -61,6 +61,16 @@ MAX_ANCHORS="${NINFER_MAX_LONG_ANCHORS:-32}"
 # 但这些是 EngineStructural 证据, 按设计 (docs/maintainer/resource-scheduling-and-context-cache.md
 # §7.2) 只能用"不降低现有 owner 的空余终态", 默认容量只有 max(并发,4)=4, 容易被占满而发布不出去。
 SHARED_PREFIXES="${NINFER_MAX_SHARED_PREFIXES:-4}"
+# Host StateImage 槽位数。每个 checkpoint(会话端点 1 个 + 每个长锚点 1 个)都要独占一张
+# GDN 递归状态快照,147 MiB,而且它一旦没有 device/host 副本,该 checkpoint 就按设计不可用
+# —— 即使它的 KV 页还在显存里。所以槽位数不足时,症状是"深度端点反复消失、命中退化到浅的
+# 共享前缀、每轮重算几万 token",而不是报错。
+#   Host 槽位需求 ≈ 并发保留的会话数 x (2 + AUTO_ANCHORS) + 活跃 lane 的余量
+#   160 槽 ≈ 23.5 GiB 常驻(在 32 GiB host KV 之外),够 4~5 个长会话用满 32 个锚点
+#   内存不够就减小 AUTO_ANCHORS(每减 8 个锚点省 ~1.2 GiB/会话)
+# 注意 device_state_slots 只有 4(加 4 个活跃 lane);深度端点绝大多数时候待在 host 槽里,
+# 所以这个数字才是长会话能不能"睡下去再醒来"的关键。
+HOST_STATE_SLOTS="${NINFER_HOST_STATE_SLOTS:-160}"
 
 echo "== 前置检查 =="
 [ -x "$BIN" ] || { echo "错误: 二进制不存在: $BIN"; echo "  先编译: cd $NINFER_DIR && cmake --build build -j"; exit 1; }
@@ -142,7 +152,7 @@ setsid nohup "$BIN" "$MODEL" \
   "${VISION_ARGS[@]}" \
   "${YARN_ARGS[@]}" \
   --host-kv-mib 32768 \
-  --host-state-slots 16 \
+  --host-state-slots "$HOST_STATE_SLOTS" \
   --max-private-continuations 8 \
   --max-shared-prefixes "$SHARED_PREFIXES" \
   --max-long-anchors-per-continuation "$MAX_ANCHORS" \
