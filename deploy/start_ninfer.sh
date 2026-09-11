@@ -1,23 +1,75 @@
 #!/usr/bin/env bash
-# 启动 NInfer (Qwen3.8-27B, E8 4-bit KV, 全 262K 原生上下文, MTP3)
+# 启动 NInfer-YaRN (Qwen3.8-27B, E8 4-bit KV, YaRN 线性位置缩放, MTP3, Vision)
+#
+# 这是 ninfer-4090-yarn 这份独立构建的启动脚本, 与 deploy/ 下的原版互不影响:
+# 二进制来自 ninfer-4090-yarn/build, 日志/PID 也落在本目录。
+#
 # 前置: 必须先停掉 vLLM (myai, :30000) —— 它是本会话 AI 的模型后端。
+#
+# 环境变量 (全部可选):
+#   NINFER_PORT          服务端口, 默认 30000 (与 vLLM 一致, 客户端不用改)
+#   NINFER_MAX_CTX       逻辑上下文上限, 默认 658176 (4 路并发下显存允许的最大值)
+#   NINFER_YARN_FACTOR   YaRN 缩放因子, 默认 2.51 (= 658176/262144); 设 1.0 关闭扩展回到原生
+#   NINFER_YARN_ORIG     YaRN 起点阈值, 默认 262144 (模型原生训练长度)
+#   NINFER_CONCURRENCY   并发路数, 默认 4
+#   NINFER_KV_DTYPE      KV 量化, 默认 rk4v4-e8
+#   NINFER_NO_VISION     设 1 则不加 --vision, 省约 0.6 GiB
+#   NINFER_MODEL         模型路径, 默认复用 ninfer-4090/models 下已校验的那份
+#   NINFER_AUTO_LONG_ANCHORS / NINFER_MAX_LONG_ANCHORS
+#                        长锚点窗口与保留上限, 默认 32。跨会话前缀缓存就靠它: 窗口是从末尾往前数
+#                        的 N 个消息边界, 必须 N >= 消息数-1 才能包住"系统提示词末尾"这条所有会话
+#                        都相同的边界。见 README 前缀缓存一节。
+#   NINFER_MAX_SHARED_PREFIXES  共享前缀目录容量, 默认 4 (实测调大不解决长会话问题)
+#   NINFER_DUMP_REQUESTS 若设为目录, 服务会把每个推理请求的原始 JSON body 落盘到该目录,
+#                        用于对比"为什么两个会话没共享前缀缓存"(请求体不落盘时无法从服务端诊断)
+#                        用法: NINFER_DUMP_REQUESTS=$PWD/reqdump ./start_ninfer.sh
+#                        自动清理(默认开启, 每次写入时清理一次, 不会无限增长):
+#                          NINFER_DUMP_REQUESTS_LIMIT         最多保留多少个 body, 默认 100 (0=不限)
+#                          NINFER_DUMP_REQUESTS_MAX_AGE_HOURS 超过多少小时删除, 默认 24 (0=不限)
+#                        只清理本脚本自己写的 req-*.json, 目录里其他文件不动。
+#
+# 并发与容量的关系(实测, 见 README): 池子按需共享、不均分。4 路时池子 658,176,
+# 单个会话活跃时能用满, 4 路同时活跃则各分到约 164,544。
+# 想最大化单会话上下文改用 NINFER_CONCURRENCY=1 NINFER_MAX_CTX=724000 NINFER_YARN_FACTOR=2.76。
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-NINFER_DIR="$HERE/../ninfer-4090"
+NINFER_DIR="$HERE/../ninfer-4090-yarn"
 BIN="$NINFER_DIR/build/apps/ninfer-serve"
-MODEL="$NINFER_DIR/models/qwen3_8_27b.ninfer"
-PORT="${NINFER_PORT:-30000}"   # 与 vLLM 同端口, 客户端配置不用改
+MODEL="${NINFER_MODEL:-$HERE/../ninfer-4090/models/qwen3_8_27b.ninfer}"
+PORT="${NINFER_PORT:-30000}"
 LOG="$HERE/ninfer_serve.log"
 PIDF="$HERE/ninfer_serve.pid"
 
+MAX_CTX="${NINFER_MAX_CTX:-658176}"
+YARN_FACTOR="${NINFER_YARN_FACTOR:-2.51}"
+YARN_ORIG="${NINFER_YARN_ORIG:-262144}"
+CONCURRENCY="${NINFER_CONCURRENCY:-4}"
+KV_DTYPE="${NINFER_KV_DTYPE:-rk4v4-e8}"
+# 跨会话前缀缓存的关键: 自动长锚点窗口 + 保留上限。
+# 引擎在每个 prompt 的「最后 N 个消息边界」上放置私有长锚点 (N=--auto-long-anchors),
+# 而每条 continuation 最多保留 --max-long-anchors-per-continuation 个, 满了就替换最浅的那个。
+# 窗口是从结尾往前数的, 所以 N 太小 + 历史消息多时, 唯一对所有会话都相同的那条边界
+# (developer/system 之后, 即整个系统提示词的末尾) 会落在窗口之外 —— 于是每个新会话都 0 命中。
+# 实测 (本机, 同一份 DSH 历史会话 payload): N=4 时 7/21 条消息的会话全部 0 命中 (7.6-8.5s);
+# N=8 时 7 条消息能命中 (1.4s) 但 10 条消息仍 0 命中; N=32 时 7/10/21 条消息都能命中 8,669
+# (87-90%, TTFT 1.4-2.6s)。显存/内存占用与 N 无关 (锚点复用已预留的 snapshot arena, 实测
+# RSS 36.57 GiB、显存 30,966 MiB 在 N=4/8/32/64 下完全相同), 所以默认给足 32。
+AUTO_ANCHORS="${NINFER_AUTO_LONG_ANCHORS:-32}"
+MAX_ANCHORS="${NINFER_MAX_LONG_ANCHORS:-32}"
+# 共享前缀目录容量。引擎自己对每个 prompt 提出三个候选: 「全部 tools 之后」「连续 leading
+# System/Developer 之后」「full prompt」——第二个就是所有会话都相同的系统提示词末尾。
+# 但这些是 EngineStructural 证据, 按设计 (docs/maintainer/resource-scheduling-and-context-cache.md
+# §7.2) 只能用"不降低现有 owner 的空余终态", 默认容量只有 max(并发,4)=4, 容易被占满而发布不出去。
+SHARED_PREFIXES="${NINFER_MAX_SHARED_PREFIXES:-4}"
+
 echo "== 前置检查 =="
-[ -x "$BIN" ] || { echo "错误: 二进制不存在: $BIN"; exit 1; }
-[ -f "$MODEL" ] || { echo "错误: 模型文件不存在: $MODEL (下载未完成?)"; exit 1; }
+[ -x "$BIN" ] || { echo "错误: 二进制不存在: $BIN"; echo "  先编译: cd $NINFER_DIR && cmake --build build -j"; exit 1; }
+[ -f "$MODEL" ] || { echo "错误: 模型文件不存在: $MODEL"; exit 1; }
 SZ=$(stat -c%s "$MODEL")
 EXPECT=18210531328
 if [ "$SZ" != "$EXPECT" ]; then
-  echo "警告: 模型大小 $SZ != $EXPECT (官方 16.96 GiB / rev 3526913004)。请用下面命令校验 SHA-256:"
-  echo "  cd $NINFER_DIR/models && echo 'eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e  qwen3_8_27b.ninfer' | sha256sum --check"
+  echo "警告: 模型大小 $SZ != $EXPECT. 校验命令:"
+  echo "  cd $(dirname "$MODEL") && echo 'eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e  $(basename "$MODEL")' | sha256sum --check"
 fi
 if ss -tln | grep -q ":$PORT "; then echo "错误: 端口 $PORT 被占用"; exit 1; fi
 if pgrep -f "vllm[.]entrypoints" >/dev/null; then
@@ -59,50 +111,47 @@ fi
 
 if [ "$FREE" -lt 27000 ]; then echo "错误: 空闲显存不足 27000 MiB (需要 ~23 GiB)"; exit 1; fi
 
-echo "== 启动服务 (E8 4-bit KV / 262144 ctx / MTP3 / Vision / 4 路) =="
-# 32 GB 卡预算: 固定 17.55 GiB(权重+MTP+Graph) + vision 0.26 tower + 0.33 scratchpad KV
-#              + 每路 lane 0.38 GiB; --kv-capacity auto 让引擎按实际可用显存算满池子
-#              (留 1024 MiB headroom), 实际值看启动日志
-# 4 路 = 最多 4 个会话按需共享池子(不均分), 实测池子 658,176 token:
-#        单个会话活跃时能用满 658,176; 4 路同时活跃则各约 164,544。
-#        --max-context 262144 是每会话的逻辑天花板(原生长度, 未启用 YaRN),
-#        4 × 262144 = 1,048,576 > 658,176, 所以 4 路各要满 262K 时会有会话排队/被驱逐。
-# 不需要多模态可删掉 --vision
-# 日志用追加模式, 重启不丢历史请求记录
-# setsid: 让服务脱离启动者的会话/进程组。否则启动它的 shell 收到 SIGINT/SIGTERM 时
-#         (例如在终端里按 Ctrl+C), 整组连同 nohup 的子进程会一起被杀。
-echo "===== $(date '+%F %T') 启动 (kv=${NINFER_KV_DTYPE:-rk4v4-e8}) =====" >> "$LOG"
+# YaRN 参数: factor<=1.0 时不传, 保持原生行为
+YARN_ARGS=()
+YARN_DESC="关闭 (原生 262144)"
+if awk "BEGIN{exit !($YARN_FACTOR > 1.0)}"; then
+  YARN_ARGS=(--rope-scaling-factor "$YARN_FACTOR" --rope-scaling-original-context "$YARN_ORIG")
+  YARN_DESC="开启 factor=$YARN_FACTOR 起点=$YARN_ORIG → 逻辑上限 $MAX_CTX"
+fi
+VISION_ARGS=(--vision)
+[ "${NINFER_NO_VISION:-0}" = "1" ] && VISION_ARGS=()
+
+echo "== 启动服务 (kv=$KV_DTYPE / ctx=$MAX_CTX / YaRN: $YARN_DESC / 并发 $CONCURRENCY / 长锚点 auto=$AUTO_ANCHORS max=$MAX_ANCHORS / 共享前缀 $SHARED_PREFIXES) =="
+if [ -n "${NINFER_DUMP_REQUESTS:-}" ]; then
+  mkdir -p "$NINFER_DUMP_REQUESTS"
+  echo "请求体落盘: $NINFER_DUMP_REQUESTS"
+  echo "  保留策略: 最多 ${NINFER_DUMP_REQUESTS_LIMIT:-100} 个 / ${NINFER_DUMP_REQUESTS_MAX_AGE_HOURS:-24} 小时 (0=不限); 含完整对话内容, 不需要时清空该目录即可"
+fi
+echo "===== $(date '+%F %T') 启动 (yarn factor=$YARN_FACTOR ctx=$MAX_CTX) =====" >> "$LOG"
+# setsid: 让服务脱离启动者的会话/进程组。否则启动它的 shell 收到 SIGTERM 时, 整组连同
+# nohup 的子进程一起被杀 —— 服务启动脚本本身不应该有这个脆弱性。
 setsid nohup "$BIN" "$MODEL" \
   --host 0.0.0.0 --port "$PORT" \
   --model-id myai \
-  --max-context 262144 --kv-capacity auto \
-  --max-concurrency 4 --max-pending-requests 16 \
+  --max-context "$MAX_CTX" --kv-capacity auto \
+  --max-concurrency "$CONCURRENCY" --max-pending-requests 16 \
   --pending-timeout-ms 600000 \
-  --prefill-chunk 1024 --kv-dtype "${NINFER_KV_DTYPE:-rk4v4-e8}" \
+  --prefill-chunk 1024 --kv-dtype "$KV_DTYPE" \
   --default-max-tokens 32768 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
-  --vision \
+  "${VISION_ARGS[@]}" \
+  "${YARN_ARGS[@]}" \
   --host-kv-mib 32768 \
   --host-state-slots 16 \
   --max-private-continuations 8 \
-  --max-long-anchors-per-continuation 4 \
-  --auto-long-anchors 4 \
+  --max-shared-prefixes "$SHARED_PREFIXES" \
+  --max-long-anchors-per-continuation "$MAX_ANCHORS" \
+  --auto-long-anchors "$AUTO_ANCHORS" \
   --preserve-thinking >>"$LOG" 2>&1 &
-# 历史会话重用 (对标 vLLM --kv-offloading-size 32):
-#   --default-max-tokens 32768  客户端不传 max_tokens 时的输出预算 (引擎默认 8192 偏小:
-#                           思考与回答共享预算, 且 NInfer 不支持 vLLM 的 thinking_token_budget,
-#                           8192 容易被思考吃光导致没有答案/没有工具调用)。
-#                           优先级: 请求里的 max_tokens > 本默认值; 硬天花板是 prompt+output ≤ max-context。
-#   --host-kv-mib 32768      32 GiB pinned 主机内存保留非活跃会话的 KV/前缀 (默认 8 GiB)
-#   --host-state-slots 16    混合模型的循环状态(48 层 GDN)也保留在主机内存 (默认 8)
-#   --auto-long-anchors 4    在每个 prompt 的最后 4 个消息边界打锚点, 客户端改写近期历史时
-#                            从锚点恢复而不是重新 prefill (配合上面的 anchor 上限与 host slots)
-# 需要在重启后仍能恢复旧会话, 再追加(需先建目录, 客户端调 /slots/{id}?action=save|restore):
-#   --slot-save-path /root/ai/large_models/_ninfer_repos/deploy/slots --auto-save-evicted
 echo $! > "$PIDF"
 echo "pid=$(cat "$PIDF")  日志: $LOG"
 
-echo "== 等待就绪 (加载 17 GiB 权重 + CUDA Graph 捕获, 最长 3 分钟) =="
+echo "== 等待就绪 (最长 3 分钟) =="
 ready=0
 for _ in $(seq 1 36); do
   if curl -s -m 3 -o /dev/null "http://127.0.0.1:$PORT/v1/models"; then ready=1; break; fi
@@ -121,4 +170,6 @@ curl -s -m 120 "http://127.0.0.1:$PORT/v1/chat/completions" \
   -H 'content-type: application/json' \
   -d '{"model":"myai","messages":[{"role":"user","content":"用一句话介绍你自己。"}],"max_tokens":64}' \
   | python3 -m json.tool
-echo "完成。API: http://127.0.0.1:$PORT/v1  模型名: myai  (与 vLLM 一致, 客户端不用改)"
+echo
+echo "完成。API: http://127.0.0.1:$PORT/v1  模型名: myai"
+echo "本次生效的 YaRN: $YARN_DESC"

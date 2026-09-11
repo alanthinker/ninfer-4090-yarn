@@ -25,8 +25,9 @@ Qwen3.6-35B-A3B target are inherited but untested on the RTX 4090.
 > including cherry-picked work, are listed in [Upstream and credits](#upstream-and-credits).
 >
 > **Deploying this engine?** Start from
-> [README_部署说明.md](README_部署说明.md) — deployment scripts, KV-cache memory budgeting, and
-> measured startup and benchmark numbers on an RTX 4080S.
+> [README_部署说明.md](README_部署说明.md) — YaRN long-context deployment: the tested scripts and
+> configurations, KV-cache memory budgeting, prefix-cache diagnosis, defect provenance, and full
+> measured numbers on an RTX 4080S.
 
 ## Measured results on the RTX 4090
 
