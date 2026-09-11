@@ -68,6 +68,21 @@ public:
      * elsewhere. A positive control caught it - a request that demonstrably reused 40,051
      * tokens still reported 0.
      */
+    [[nodiscard]] static const char*
+    materialization_rejection_name(runtime::MaterializationRejection reason) noexcept {
+        switch (reason) {
+        case runtime::MaterializationRejection::None: return "";
+        case runtime::MaterializationRejection::ContextBusy: return "context busy";
+        case runtime::MaterializationRejection::HostAllocationBlocked: return "host allocation";
+        case runtime::MaterializationRejection::PhysicalPeak: return "physical peak";
+        case runtime::MaterializationRejection::SourceUnavailable: return "source unavailable";
+        case runtime::MaterializationRejection::DestinationStale: return "destination stale";
+        case runtime::MaterializationRejection::VictimStale: return "victim stale";
+        case runtime::MaterializationRejection::InvariantFailure: return "invariant";
+        }
+        return "";
+    }
+
     [[nodiscard]] static std::uint32_t
     best_offered_reuse(std::span<const CandidateInput> candidates) noexcept {
         std::uint32_t best = 0;
@@ -144,6 +159,14 @@ public:
         candidate_seed_complete_.assign(candidates.size(), false);
         target_ledger_.reset(candidates.size() + 1U + kTargetBudget);
 
+        // Whether the most reusable candidate is feasible at all is the difference between "the
+        // planner priced reuse worse" and "reuse was never physically available"; the two need
+        // different fixes, and the plan alone cannot tell them apart.
+        bool best_reuse_feasible = false;
+        MaterializationPhysicalStatus best_reuse_physical_status =
+            MaterializationPhysicalStatus::StructuralInvalid;
+        runtime::MaterializationRejection best_reuse_rejection = runtime::MaterializationRejection::None;
+        std::string best_reuse_rejection_detail;
         std::optional<Incumbent> identity_best;
         std::vector<IdentityRoot> roots;
         roots.reserve(candidates.size());
@@ -159,6 +182,16 @@ public:
             if (identity.physical_status == MaterializationPhysicalStatus::Feasible) {
                 goal = logical_goal(input.id, identity.source_mode,
                                     std::span<const PressureOwnerOutcome>{});
+            }
+            if (input.candidate != nullptr &&
+                input.candidate->summary().reusable_prompt_tokens != 0 &&
+                input.candidate->summary().reusable_prompt_tokens ==
+                    best_offered_reuse(candidates)) {
+                best_reuse_physical_status = identity.physical_status;
+                best_reuse_feasible =
+                    identity.physical_status == MaterializationPhysicalStatus::Feasible;
+                best_reuse_rejection = input.candidate->identity_rejection();
+                best_reuse_rejection_detail = input.candidate->identity_rejection_detail();
             }
             if (goal && (!identity_best || cost.less(identity_best->cost))) {
                 identity_best = Incumbent{
@@ -210,6 +243,19 @@ public:
                     projection_work, planning_started, MaterializationStopReason::NoPressure,
                     false);
                 diagnostics.best_reuse_prompt_tokens = best_offered_reuse(candidates);
+        diagnostics.best_reuse_feasible       = best_reuse_feasible;
+        diagnostics.best_reuse_rejection =
+            std::string(materialization_rejection_name(best_reuse_rejection)) + " status=" +
+            std::to_string(static_cast<int>(best_reuse_physical_status)) + " rej=" +
+            std::to_string(static_cast<int>(best_reuse_rejection)) + " " +
+            best_reuse_rejection_detail;
+                diagnostics.best_reuse_feasible       = best_reuse_feasible;
+                diagnostics.best_reuse_rejection =
+                    std::string(materialization_rejection_name(best_reuse_rejection)) +
+                    " status=" +
+                    std::to_string(static_cast<int>(best_reuse_physical_status)) + " rej=" +
+                    std::to_string(static_cast<int>(best_reuse_rejection)) + " " +
+                    best_reuse_rejection_detail;
                 Result result;
                 result.plan             = std::move(*sealed);
                 result.candidate        = candidates[identity_best->candidate_index].id;
@@ -276,8 +322,14 @@ public:
         }
 
         const Clock::time_point search_started = Clock::now();
+        // The budget bounds admission-time planning work; the relative term binds ordinary plans and
+        // this cap only has to leave room for a plan whose reuse is worth minutes of prefill. 5 ms
+        // starved a production case on 2026-09-11: a 579k-token prompt with one offered 224k reuse
+        // candidate assessed no target at all, stopped on TimeBudget, and returned the maximal-drop
+        // incumbent - discarding a prefix the cost model prices about 240 s cheaper to reuse. This
+        // machine also assesses targets far more slowly than the one the 5 ms was calibrated on.
         const std::uint64_t search_budget_ns =
-            std::min<std::uint64_t>(5'000'000ULL, incumbent.cost.total_ns / 20U);
+            std::min<std::uint64_t>(50'000'000ULL, incumbent.cost.total_ns / 20U);
         const std::uint64_t guided_watchdog_ns = search_budget_ns;
         std::uint64_t maximum_step_ns          = 0;
         std::uint32_t optional_targets         = 0;
@@ -620,6 +672,12 @@ public:
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
             stop_reason, budget_exhausted, incumbent.degradation_units, incumbent.root_maximal);
         diagnostics.best_reuse_prompt_tokens = best_offered_reuse(candidates);
+        diagnostics.best_reuse_feasible      = best_reuse_feasible;
+        diagnostics.best_reuse_rejection =
+            std::string(materialization_rejection_name(best_reuse_rejection)) + " status=" +
+            std::to_string(static_cast<int>(best_reuse_physical_status)) + " rej=" +
+            std::to_string(static_cast<int>(best_reuse_rejection)) + " " +
+            best_reuse_rejection_detail;
 
         Result result;
         result.plan                = std::move(*sealed);

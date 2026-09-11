@@ -259,6 +259,10 @@ struct AdmissionCandidateImpl<NINFER_QWEN36_VARIANT> : ResourceCandidateState {
     std::uint32_t root_rebuild_tail_begin = 0;
     bool text_retained_tail_release       = false;
     bool backend_retained_tail_release    = false;
+    // Why this candidate's identity (no-degradation) plan was rejected, when it was. Diagnostic.
+    runtime::MaterializationRejection identity_rejection = runtime::MaterializationRejection::None;
+    // Numbers behind that rejection, when it was a capacity verdict (diagnostic; empty otherwise).
+    std::string identity_rejection_detail;
 };
 
 template <>
@@ -316,6 +320,20 @@ const runtime::IdentityMaterializationAssessment&
 AdmissionCandidate<NINFER_QWEN36_VARIANT>::identity_assessment() const noexcept {
     static const runtime::IdentityMaterializationAssessment empty;
     return impl_ != nullptr ? impl_->identity_assessment : empty;
+}
+
+template <>
+runtime::MaterializationRejection
+AdmissionCandidate<NINFER_QWEN36_VARIANT>::identity_rejection() const noexcept {
+    return impl_ != nullptr ? impl_->identity_rejection
+                            : runtime::MaterializationRejection::InvariantFailure;
+}
+
+template <>
+const std::string& AdmissionCandidate<NINFER_QWEN36_VARIANT>::identity_rejection_detail()
+    const noexcept {
+    static const std::string empty;
+    return impl_ != nullptr ? impl_->identity_rejection_detail : empty;
 }
 
 } // namespace ninfer::targets::qwen3_6
@@ -550,8 +568,9 @@ public:
                                       const PreparedPromptData& prompt,
                                       std::span<const std::uint32_t> frontiers);
     [[nodiscard]] runtime::PreflightStatus
-    revalidate_materialization(const AdmissionCandidate& plan,
-                               const PreparedPromptData& prompt) const;
+    revalidate_materialization(
+        const AdmissionCandidate& plan, const PreparedPromptData& prompt,
+        runtime::MaterializationRejection* rejection = nullptr) const;
     [[nodiscard]] runtime::ContextTransactionReserveStatus
     reserve_materialization(AdmissionCandidate&& plan, PreparedPromptData&& prompt,
                             runtime::CancellationFlagView cancellation);

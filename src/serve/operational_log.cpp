@@ -292,7 +292,42 @@ OperationalRecord render_request_done(const RequestLogContext& context,
         out << " | abandoned prefill: endpoint "
             << product::format_pretty_count(outcome.abandoned_endpoint_tokens);
     } else if (!outcome.abandoned_prefix_note.empty()) {
-        out << " | abandoned prefill: none (" << outcome.abandoned_prefix_note << ')';
+        out << " | abandoned prefill: none (" << outcome.abandoned_prefix_note
+            << (outcome.abandoned_prefix_detail.empty()
+                    ? std::string()
+                    : ": " + outcome.abandoned_prefix_detail)
+            << ')';
+    }
+    // A request that recomputed its whole prompt while a reuse candidate existed, or a very large
+    // prompt that had no candidate at all, is the shape of every "prefix caching stopped working"
+    // report. `best_reuse_prompt_tokens` is what the planner was actually offered, so this
+    // separates "no candidate reached the planner" (matching or admission) from "a candidate lost
+    // to the planner's cost or pressure decision".
+    const std::uint32_t offered = metrics.materialization.best_reuse_prompt_tokens;
+    if (offered != 0 && metrics.prefix_cache_hit_tokens == 0) {
+        out << " | reuse offered " << product::format_pretty_count(offered)
+            << " but planned from root ("
+            << ninfer::materialization_stop_reason_name(metrics.materialization.stop_reason)
+            << ", targets " << metrics.materialization.targets_evaluated << ", future loss "
+            << product::format_pretty_duration(
+                   static_cast<double>(metrics.materialization.predicted_future_loss_ns) / 1e9)
+            << ", planning "
+            << product::format_pretty_duration(
+                   static_cast<double>(metrics.materialization.planning_elapsed_ns) / 1e9)
+            << ", search "
+            << product::format_pretty_duration(
+                   static_cast<double>(metrics.materialization.search_elapsed_ns) / 1e9)
+            << ", reuse "
+            << (metrics.materialization.best_reuse_feasible ? "feasible" : "infeasible")
+            << (metrics.materialization.best_reuse_rejection.empty()
+                    ? ""
+                    : " (" + metrics.materialization.best_reuse_rejection + ")")
+            << (metrics.materialization.selected_maximal_fallback ? ", maximal fallback)" : ")");
+    } else if (offered == 0 && metrics.prefix_cache_hit_tokens == 0 &&
+               outcome.prompt_tokens >= 65536) {
+        out << " | reuse offered none ("
+            << ninfer::materialization_stop_reason_name(metrics.materialization.stop_reason)
+            << ", targets " << metrics.materialization.targets_evaluated << ')';
     }
     if (outcome.thinking.configured_budget) {
         out << " | thinking "

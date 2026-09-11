@@ -1265,10 +1265,13 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_admission(
     plan->impl_->identity_pressure_deficit = materialization_deficit(*plan->impl_);
     plan->impl_->identity_assessment.machine_work =
         materialization_machine_work(*plan->impl_, {}, {});
-    const runtime::PreflightStatus identity_status = revalidate_materialization(*plan, prompt);
+    runtime::MaterializationRejection identity_rejection = runtime::MaterializationRejection::None;
+    const runtime::PreflightStatus identity_status =
+        revalidate_materialization(*plan, prompt, &identity_rejection);
     if (identity_status == runtime::PreflightStatus::InvariantFailure) {
         throw std::logic_error("identity materialization assessment is internally invalid");
     }
+    plan->impl_->identity_rejection = identity_rejection;
     plan->impl_->identity_assessment.physical_status =
         identity_status == runtime::PreflightStatus::Ready
             ? runtime::MaterializationPhysicalStatus::Feasible
@@ -3954,21 +3957,59 @@ bool ProgramImplCore::compose_pressure_candidate(
 
 runtime::PreflightStatus
 ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
-                                            const PreparedPromptData& prompt) const {
-    if (plan.impl_ == nullptr) { return runtime::PreflightStatus::InvariantFailure; }
-    if (has_context_transaction() || pending_transaction_ || has_unsettled_state_fork()) {
+                                            const PreparedPromptData& prompt,
+                                            runtime::MaterializationRejection* rejection) const {
+    const auto reject = [rejection](runtime::MaterializationRejection reason) noexcept {
+        if (rejection != nullptr) { *rejection = reason; }
         return runtime::PreflightStatus::StalePolicyState;
+    };
+    const auto reject_invariant = [rejection]() noexcept {
+        if (rejection != nullptr) {
+            *rejection = runtime::MaterializationRejection::InvariantFailure;
+        }
+        return runtime::PreflightStatus::InvariantFailure;
+    };
+    if (plan.impl_ == nullptr) { return reject_invariant(); }
+    if (has_context_transaction() || pending_transaction_ || has_unsettled_state_fork()) {
+        return reject(runtime::MaterializationRejection::ContextBusy);
     }
 
     const AdmissionCandidateImpl& details = *plan.impl_;
     if (details.blocked_host_allocation_bytes != 0) {
-        return runtime::PreflightStatus::StalePolicyState;
+        return reject(runtime::MaterializationRejection::HostAllocationBlocked);
     }
     const std::optional<MaterializationSourceProtection> protection =
         materialization_source_protection(details);
-    if (!protection) { return runtime::PreflightStatus::StalePolicyState; }
+    if (!protection) { return reject(runtime::MaterializationRejection::SourceUnavailable); }
     if (!physical_peak_fits(details.demand.physical_peak_additional)) {
-        return runtime::PreflightStatus::StalePolicyState;
+        // Name the dimension and its numbers: which capacity blocked reuse is otherwise
+        // indistinguishable from "reuse was priced worse".
+        if (rejection != nullptr) {
+            const detail::PhysicalResources peak = details.demand.physical_peak_additional;
+            const detail::PhysicalResources used = physical_occupancy();
+            const detail::PhysicalResources caps = admission_capacity();
+            const auto part = [](const char* name, std::uint64_t a, std::uint64_t u,
+                                 std::uint64_t c) {
+                if (a <= c && u <= c - a) { return std::string(); }
+                return std::string(name) + " add=" + std::to_string(a) + " used=" +
+                       std::to_string(u) + " cap=" + std::to_string(c) + "; ";
+            };
+            std::string detail;
+            detail += part("lanes", peak.device.active_lanes, used.device.active_lanes,
+                           caps.device.active_lanes);
+            detail += part("state", peak.device.state_slots, used.device.state_slots,
+                           caps.device.state_slots);
+            detail += part("main_kv", peak.device.main_kv_pages, used.device.main_kv_pages,
+                           caps.device.main_kv_pages);
+            detail += part("backend_kv", peak.device.backend_kv_pages, used.device.backend_kv_pages,
+                           caps.device.backend_kv_pages);
+            detail += part("host_state", peak.host.state_slots, used.host.state_slots,
+                           caps.host.state_slots);
+            detail += part("host_kv_bytes", peak.host.kv_bytes, used.host.kv_bytes,
+                           caps.host.kv_bytes);
+            plan.impl_->identity_rejection_detail = std::move(detail);
+        }
+        return reject(runtime::MaterializationRejection::PhysicalPeak);
     }
     const std::size_t victim_count        = details.pressure_options.size();
     const std::size_t shared_victim_count = details.shared_pressure_options.size();
@@ -3979,16 +4020,16 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
         details.shared_pressure_owner_ids.size() != shared_victim_count ||
         details.shared_pressure_indices.size() != shared_victim_count ||
         details.shared_pressure_generations.size() != shared_victim_count) {
-        return runtime::PreflightStatus::InvariantFailure;
+        return reject_invariant();
     }
     const std::uint32_t lane = details.destination.value;
     if (lane >= max_concurrency || (details.has_source && details.has_shared_source)) {
-        return runtime::PreflightStatus::InvariantFailure;
+        return reject_invariant();
     }
     if (details.destination_epoch != lane_epochs[lane] ||
         requests[lane].lifecycle != Lifecycle::Empty ||
         active_continuations[lane] < continuation_capacity) {
-        return runtime::PreflightStatus::StalePolicyState;
+        return reject(runtime::MaterializationRejection::DestinationStale);
     }
 
     const SequenceState* source_state = nullptr;
@@ -3996,7 +4037,7 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
         if (details.source_index >= continuation_capacity ||
             continuation_slots[details.source_index].role != ContinuationSlotRole::Catalogued ||
             continuation_slots[details.source_index].generation != details.source_generation) {
-            return runtime::PreflightStatus::StalePolicyState;
+            return reject(runtime::MaterializationRejection::DestinationStale);
         }
         source_state = &continuation_states[details.source_index];
     }
@@ -4007,7 +4048,7 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
                 SharedPrefixSlotRole::Catalogued ||
             shared_prefix_slots[details.shared_source_index].generation !=
                 details.shared_source_generation) {
-            return runtime::PreflightStatus::StalePolicyState;
+            return reject(runtime::MaterializationRejection::DestinationStale);
         }
         shared_state = &shared_prefix_states[details.shared_source_index];
     }
@@ -4017,7 +4058,7 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
         if (index >= continuation_capacity ||
             continuation_slots[index].role != ContinuationSlotRole::Catalogued ||
             continuation_slots[index].generation != generation) {
-            return runtime::PreflightStatus::StalePolicyState;
+            return reject(runtime::MaterializationRejection::DestinationStale);
         }
         bool matches = false;
         if (details.pressure_options[victim].evicts_continuation) {
@@ -4027,22 +4068,22 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
             matches = pressure_decision_valid(continuation_states[index],
                                               details.pressure_options[victim], &*protection);
         }
-        if (!matches) { return runtime::PreflightStatus::StalePolicyState; }
+        if (!matches) { return reject(runtime::MaterializationRejection::DestinationStale); }
         if (details.has_source && index == details.source_index &&
             generation == details.source_generation) {
-            return runtime::PreflightStatus::InvariantFailure;
+            return reject_invariant();
         }
         for (std::size_t prior = 0; prior < victim; ++prior) {
             if (details.pressure_indices[prior] == index &&
                 details.pressure_generations[prior] == generation) {
-                return runtime::PreflightStatus::InvariantFailure;
+                return reject_invariant();
             }
             if (details.pressure_owner_ids[prior] == details.pressure_owner_ids[victim]) {
-                return runtime::PreflightStatus::InvariantFailure;
+                return reject_invariant();
             }
         }
         if (details.pressure_owner_ids[victim].value == std::numeric_limits<std::uint32_t>::max()) {
-            return runtime::PreflightStatus::InvariantFailure;
+            return reject_invariant();
         }
     }
     for (std::size_t victim = 0; victim < shared_victim_count; ++victim) {
@@ -4051,7 +4092,7 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
         if (index >= shared_prefix_capacity ||
             shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued ||
             shared_prefix_slots[index].generation != generation) {
-            return runtime::PreflightStatus::StalePolicyState;
+            return reject(runtime::MaterializationRejection::DestinationStale);
         }
         bool matches = false;
         if (details.shared_pressure_options[victim].evicts_continuation) {
@@ -4064,16 +4105,16 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
         if ((details.has_shared_source && index == details.shared_source_index &&
              generation == details.shared_source_generation) ||
             shared_prefix_states[index].active_references != 0 || !matches) {
-            return runtime::PreflightStatus::StalePolicyState;
+            return reject(runtime::MaterializationRejection::DestinationStale);
         }
         for (std::size_t prior = 0; prior < victim; ++prior) {
             if (details.shared_pressure_indices[prior] == index &&
                 details.shared_pressure_generations[prior] == generation) {
-                return runtime::PreflightStatus::InvariantFailure;
+                return reject_invariant();
             }
             if (details.shared_pressure_owner_ids[prior] ==
                 details.shared_pressure_owner_ids[victim]) {
-                return runtime::PreflightStatus::InvariantFailure;
+                return reject_invariant();
             }
         }
         if (details.shared_pressure_owner_ids[victim].value ==
@@ -4081,7 +4122,7 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
             std::find(details.pressure_owner_ids.begin(), details.pressure_owner_ids.end(),
                       details.shared_pressure_owner_ids[victim]) !=
                 details.pressure_owner_ids.end()) {
-            return runtime::PreflightStatus::InvariantFailure;
+            return reject_invariant();
         }
     }
 
@@ -4111,45 +4152,45 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
     const std::optional<detail::PressureTargetProjection> projected_pressure =
         evaluate_pressure_target(&*protection, projected_private_owners, details.pressure_options,
                                  projected_shared_owners, details.shared_pressure_options, nullptr);
-    if (!projected_pressure) { return runtime::PreflightStatus::StalePolicyState; }
+    if (!projected_pressure) { return reject(runtime::MaterializationRejection::DestinationStale); }
 
     const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (prompt_tokens != details.summary.prompt_tokens ||
         (details.vision.has_value() && !prompt.has_media()) ||
         ((source_state == nullptr && shared_state == nullptr) !=
          (details.reuse == ReusePath::Root))) {
-        return runtime::PreflightStatus::InvariantFailure;
+        return reject_invariant();
     }
     if (source_state != nullptr &&
         !qwen3_6::detail::prefix_matches(prompt, source_state->ledger,
                                          source_state->prefix_identity, details.reuse_base)) {
-        return runtime::PreflightStatus::StalePolicyState;
+        return reject(runtime::MaterializationRejection::DestinationStale);
     }
     if (shared_state != nullptr &&
         (!shared_state->identity || shared_state->identity->prefix_identity() == nullptr ||
          !qwen3_6::detail::prefix_matches(prompt, shared_state->identity->ledger(),
                                           *shared_state->identity->prefix_identity(),
                                           details.reuse_base))) {
-        return runtime::PreflightStatus::StalePolicyState;
+        return reject(runtime::MaterializationRejection::DestinationStale);
     }
     if (details.reuse == ReusePath::SharedStablePrefix &&
         (!details.selected_checkpoint ||
          details.selected_checkpoint->kind != runtime::CheckpointKind::SharedStablePrefix ||
          details.selected_checkpoint->frontier != shared_state->frontier ||
          details.selected_checkpoint->ordinal != 0)) {
-        return runtime::PreflightStatus::StalePolicyState;
+        return reject(runtime::MaterializationRejection::DestinationStale);
     }
     if (is_rewrite_checkpoint_restore(details.reuse) &&
         (!source_state->rewrite_checkpoint.valid ||
          source_state->rewrite_checkpoint.frontier != details.reuse_base ||
          details.reuse != restore_path(source_state->rewrite_checkpoint.kind))) {
-        return runtime::PreflightStatus::StalePolicyState;
+        return reject(runtime::MaterializationRejection::DestinationStale);
     }
     if (details.rewrite_disposition == RewriteCheckpointDisposition::RetainExisting &&
         (!prompt.identity.rewrite_checkpoint || source_state == nullptr ||
          !can_retain_rewrite_checkpoint(prompt, *prompt.identity.rewrite_checkpoint, *source_state,
                                         details.reuse, details.reuse_base))) {
-        return runtime::PreflightStatus::StalePolicyState;
+        return reject(runtime::MaterializationRejection::DestinationStale);
     }
     if (source_state != nullptr &&
         details.source_mode == runtime::PrivateSourceMode::ConsumeToActive) {
@@ -4164,7 +4205,7 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
         if (details.state_fork_required != projected_fork ||
             details.text_prefix_fork_required != projected_text_fork ||
             details.backend_prefix_fork_required != projected_backend_fork) {
-            return runtime::PreflightStatus::StalePolicyState;
+            return reject(runtime::MaterializationRejection::DestinationStale);
         }
     }
     if (details.reuse == ReusePath::PrivateLongAnchor &&
@@ -4176,7 +4217,7 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
                                  anchor.ordinal == details.selected_checkpoint->ordinal &&
                                  state_store->valid(anchor.state);
                       }))) {
-        return runtime::PreflightStatus::StalePolicyState;
+        return reject(runtime::MaterializationRejection::DestinationStale);
     }
     return runtime::PreflightStatus::Ready;
 }
@@ -9234,26 +9275,64 @@ FinishResult ProgramImplCore::abandon_prefill(SequenceHandle sequence) noexcept 
     // can be served. The conditions below only reject prefixes that cannot be described exactly.
     if (prefill.cursor == 0 || frontier == 0) {
         out.abandon_outcome = runtime::AbandonedPrefixOutcome::NoComputedPrefix;
+        out.abandon_detail = "cursor=" + std::to_string(prefill.cursor) + " frontier=" + std::to_string(frontier);
         return out;
     }
-    out.abandon_outcome = runtime::AbandonedPrefixOutcome::Unavailable;
-    if (frontier != prefill.cursor || frontier >= prefill.prompt_tokens ||
-        state.execution_frontier != 0 || state.ledger_frontier != 0 || state.endpoint_valid ||
-        state.text_kv_valid != frontier) {
-        return out;
+    out.abandon_outcome = runtime::AbandonedPrefixOutcome::StateNotClosed;
+    {
+        // Name the predicate: this guard is six conditions in one, and "not closed" alone cannot
+        // say which bookkeeping lagged.
+        const auto detail = [&](const char* what, std::uint64_t a, std::uint64_t b) {
+            out.abandon_detail = std::string(what) + " a=" + std::to_string(a) +
+                                 " b=" + std::to_string(b);
+        };
+        if (frontier != prefill.cursor) {
+            detail("hidden_frontier vs cursor", frontier, prefill.cursor);
+            return out;
+        }
+        if (frontier >= prefill.prompt_tokens) {
+            detail("frontier vs prompt", frontier, prefill.prompt_tokens);
+            return out;
+        }
+        // A prefix-reused sequence inherits the source's frontier bookkeeping, so these are not
+        // required to be zero: what must hold is that nothing claims to be committed beyond the
+        // frontier being published. The previous requirement (both exactly zero) silently refused
+        // to publish every retry that had itself resumed from an earlier endpoint, which pinned a
+        // long session at its first checkpoint forever: each attempt prefilled ~45k more, refused
+        // to record it, and the next attempt fell back to the same stale frontier.
+        if (state.execution_frontier > frontier) {
+            detail("execution_frontier ahead of publish", state.execution_frontier, frontier);
+            return out;
+        }
+        if (state.ledger_frontier > frontier + 1U) {
+            detail("ledger_frontier ahead of publish", state.ledger_frontier, frontier + 1U);
+            return out;
+        }
+        if (state.endpoint_valid) {
+            detail("endpoint_valid", 1, 0);
+            return out;
+        }
+        if (state.text_kv_valid != frontier) {
+            detail("text_kv_valid vs frontier", state.text_kv_valid, frontier);
+            return out;
+        }
     }
     if (state.ledger.size() <= frontier || state.prefix_identity.size() <= frontier ||
         state.prefix_digests.size() <= frontier) {
         out.abandon_outcome = runtime::AbandonedPrefixOutcome::NoBoundaryHidden;
+        out.abandon_detail = "sizes ledger=" + std::to_string(state.ledger.size()) + " frontier=" + std::to_string(frontier);
         return out;
     }
     if (speculative_backend == SpeculativeBackend::Mtp && state.mtp_kv_valid < frontier - 1U) {
+        out.abandon_outcome = runtime::AbandonedPrefixOutcome::BackendCoverageMissing;
         return out;
     }
     if (speculative_backend == SpeculativeBackend::DFlash &&
         state.dflash_context_frontier < frontier) {
+        out.abandon_outcome = runtime::AbandonedPrefixOutcome::BackendCoverageMissing;
         return out;
     }
+    out.abandon_outcome = runtime::AbandonedPrefixOutcome::Unavailable;
     // The committed prefix is exactly a resolved prompt frontier: one committed token beyond the
     // executed KV, with a rebuild cost measured from the root. The guards above make every resize
     // a truncation, so a failure here can only decline the publication; the ResourceManager then
@@ -9282,7 +9361,7 @@ FinishResult ProgramImplCore::abandon_prefill(SequenceHandle sequence) noexcept 
     FinishResult published  = publish_continuation(sequence, frontier);
     published.abandon_outcome = published.disposition == runtime::FinishDisposition::Catalogued
                                     ? runtime::AbandonedPrefixOutcome::Retained
-                                    : runtime::AbandonedPrefixOutcome::Unavailable;
+                                    : runtime::AbandonedPrefixOutcome::PublicationDeclined;
     return published;
 }
 
@@ -11688,6 +11767,11 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                         // The prompt-frontier state becomes publishable only after the generated
                         // Begin token is committed. commit() emits the offer for this group.
                     } else {
+                        // This chunk ended on a planned capture frontier and wrote the boundary
+                        // hidden for it, so the committed prefix is closed here too: a client that
+                        // abandons the prefill while a capture offer is in flight must still be
+                        // able to resume from it.
+                        staged.boundary_hidden_frontier = staged.cursor;
                         staged.elapsed_seconds +=
                             std::chrono::duration<double>(Clock::now() - started).count();
                         if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }

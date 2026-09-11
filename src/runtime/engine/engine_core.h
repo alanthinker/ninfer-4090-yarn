@@ -1102,8 +1102,11 @@ private:
         case AbandonedPrefixOutcome::NotApplicable: return {};
         case AbandonedPrefixOutcome::NoComputedPrefix: return "no committed prefix";
         case AbandonedPrefixOutcome::NoBoundaryHidden: return "no boundary hidden";
-        case AbandonedPrefixOutcome::Unavailable: return "unavailable";
+        case AbandonedPrefixOutcome::Unavailable: return "cache unavailable";
         case AbandonedPrefixOutcome::Conflicted: return "resource transaction";
+        case AbandonedPrefixOutcome::StateNotClosed: return "frontier not closed";
+        case AbandonedPrefixOutcome::BackendCoverageMissing: return "backend KV coverage missing";
+        case AbandonedPrefixOutcome::PublicationDeclined: return "publication declined";
         }
         return {};
     }
@@ -1154,6 +1157,7 @@ private:
         result.abandoned_endpoint_tokens = request->abandoned_endpoint_tokens;
         result.abandoned_prefix_note =
             std::string(abandoned_prefix_note(request->abandoned_prefix_outcome));
+        result.abandoned_prefix_detail = request->abandoned_prefix_detail;
         if (request->first_token) {
             result.timings.first_token_seconds =
                 request->prepare_seconds +
@@ -1293,6 +1297,7 @@ private:
                 auto abandoned = resources_.abandon_prefill(*instance_.program, *request->lane,
                                                             *request->sequence);
                 request->abandoned_prefix_outcome = abandoned.abandon_outcome;
+                request->abandoned_prefix_detail  = abandoned.abandon_detail;
                 request->abandoned_endpoint_tokens =
                     abandoned.disposition == FinishDisposition::Catalogued &&
                             abandoned.summary.endpoint

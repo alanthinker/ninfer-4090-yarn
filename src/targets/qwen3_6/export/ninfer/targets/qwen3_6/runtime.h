@@ -247,6 +247,9 @@ public:
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
     [[nodiscard]] const runtime::IdentityMaterializationAssessment&
     identity_assessment() const noexcept;
+    // First constraint that rejected this candidate's identity plan (diagnostic only).
+    [[nodiscard]] runtime::MaterializationRejection identity_rejection() const noexcept;
+    [[nodiscard]] const std::string& identity_rejection_detail() const noexcept;
 
 public:
     // Family-private construction/storage seam. Exact packages expose only the completed alias;
@@ -843,6 +846,8 @@ struct FinishResult {
     std::optional<ContinuationHandle<Variant>> continuation;
     // Set only by abandon_prefill(); says whether that call retained the abandoned prefix.
     runtime::AbandonedPrefixOutcome abandon_outcome = runtime::AbandonedPrefixOutcome::NotApplicable;
+    // Which predicate decided that outcome, in numbers, when it was not Retained.
+    std::string abandon_detail;
 };
 
 template <class Variant>

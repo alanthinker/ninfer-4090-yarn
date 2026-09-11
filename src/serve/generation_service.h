@@ -57,6 +57,7 @@ struct GenerationOutcome {
     // why nothing was retained when it is zero.
     std::uint32_t abandoned_endpoint_tokens = 0;
     std::string abandoned_prefix_note;
+    std::string abandoned_prefix_detail;
     int prompt_tokens     = 0;
     int completion_tokens = 0;
     int reasoning_tokens  = 0;

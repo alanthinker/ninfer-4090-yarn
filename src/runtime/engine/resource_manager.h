@@ -1215,6 +1215,7 @@ private:
             released.status          = ConsumeStatus::Consumed;
             released.disposition     = FinishDisposition::Released;
             released.abandon_outcome = result.abandon_outcome;
+            released.abandon_detail  = std::move(result.abandon_detail);
             released.timings         = discarded.timings;
             released.speculative     = std::move(discarded.speculative);
             return released;

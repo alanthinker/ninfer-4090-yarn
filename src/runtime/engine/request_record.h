@@ -180,6 +180,7 @@ struct RequestRecord {
     // published for it (0 when nothing was retained) and why. Diagnostic only.
     std::uint32_t abandoned_endpoint_tokens = 0;
     AbandonedPrefixOutcome abandoned_prefix_outcome = AbandonedPrefixOutcome::NotApplicable;
+    std::string abandoned_prefix_detail;
     EngineRequestState model_state        = EngineRequestState::Waiting;
     bool capture_pending                  = false;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;

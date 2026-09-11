@@ -211,8 +211,11 @@ enum class AbandonedPrefixOutcome : std::uint8_t {
     Retained,          // the committed prefix was published as the continuation endpoint
     NoComputedPrefix,  // no chunk had committed a prefix yet
     NoBoundaryHidden,  // the committed prefix has no recorded boundary hidden
-    Unavailable,       // context cache disabled, no publication capacity, or KV coverage missing
+    Unavailable,       // context cache disabled or no publication capacity
     Conflicted,        // an open resource transaction or an unexpected lifecycle
+    StateNotClosed,    // the committed frontier disagrees with the sequence's own bookkeeping
+    BackendCoverageMissing,  // the frontier has no complete backend (MTP/DFlash) KV coverage
+    PublicationDeclined,     // the resource layer declined to retain the continuation
 };
 
 // The product Engine only needs statistics for rows whose sequence is released by commit.
@@ -348,6 +351,20 @@ enum class PreflightStatus : std::uint8_t {
     Ready,
     StalePolicyState,
     InvariantFailure,
+};
+
+// First constraint that rejected a candidate's identity (no-degradation) plan. Diagnostic only:
+// the planner treats every non-Ready verdict the same way, but the cause decides whether the fix
+// belongs in peak accounting, host allocation, or candidate matching.
+enum class MaterializationRejection : std::uint8_t {
+    None,
+    ContextBusy,             // an open resource transaction or an unsettled StateImage fork
+    HostAllocationBlocked,   // the plan needs Host KV bytes the arena cannot promise
+    PhysicalPeak,            // Device lanes/state slots/pages or Host state slots exceed capacity
+    SourceUnavailable,       // the private or shared source is no longer catalogued
+    DestinationStale,        // the destination lane moved, is busy, or lost its reservation
+    VictimStale,             // a selected pressure victim changed
+    InvariantFailure,        // the candidate itself is internally inconsistent
 };
 
 enum class CheckpointKind : std::uint8_t {

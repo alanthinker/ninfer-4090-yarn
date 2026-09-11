@@ -803,6 +803,15 @@ struct MaterializationDiagnostics {
      */
     std::uint32_t best_reuse_prompt_tokens = 0;
 
+    // Whether that most-reusable candidate was physically feasible for this request at all. False
+    // beside a nonzero `best_reuse_prompt_tokens` means reuse was never available (its coverage or
+    // placement could not be satisfied); true means the planner saw a usable plan and chose
+    // another one.
+    bool best_reuse_feasible = false;
+
+    // Which constraint rejected that candidate when it was infeasible ("" when it was feasible).
+    std::string best_reuse_rejection;
+
     [[nodiscard]] friend constexpr bool
     operator==(const MaterializationDiagnostics&,
                const MaterializationDiagnostics&) noexcept = default;
@@ -836,6 +845,8 @@ struct GenerationResult {
     // the request's own outcome is FinishReason::Cancelled either way.
     std::uint32_t abandoned_endpoint_tokens = 0;
     std::string abandoned_prefix_note;
+    // Which predicate produced that note, with its numbers (diagnostic; usually empty).
+    std::string abandoned_prefix_detail;
     ThinkingBudgetStats thinking;
 };
 
