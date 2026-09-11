@@ -9212,6 +9212,65 @@ DiscardResult ProgramImplCore::abort_pending(PendingBatch&& pending) noexcept {
 }
 
 FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
+    return publish_continuation(sequence, std::nullopt);
+}
+
+void ProgramImplCore::request_prefill_abandon(SequenceHandle sequence) noexcept {
+    if (has_context_transaction() || pending_transaction_ || !valid_sequence(sequence)) { return; }
+    const std::uint32_t lane = ContractAccess::lane(sequence).value;
+    RequestControl& request  = requests[lane];
+    if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) { return; }
+    request.prefill->abandon = true;
+}
+
+FinishResult ProgramImplCore::abandon_prefill(SequenceHandle sequence) noexcept {
+    FinishResult out;
+    if (has_context_transaction() || pending_transaction_ || !valid_sequence(sequence)) {
+        return out;
+    }
+    const std::uint32_t lane = ContractAccess::lane(sequence).value;
+    RequestControl& request  = requests[lane];
+    if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) { return out; }
+    RequestControl::Prefill& prefill = *request.prefill;
+    SequenceState& state             = active_sequence(lane);
+    const std::uint32_t frontier     = prefill.abandon_frontier;
+    // The closing step closed the committed prefix at `frontier`. Without that frontier - a prompt
+    // suffix too short to host a closing chunk, or a lane that never prefilled - the prefix cannot
+    // be described exactly and the lane is discarded exactly as before.
+    if (frontier == 0 || frontier >= prefill.prompt_tokens || state.execution_frontier != 0 ||
+        state.ledger_frontier != 0 || state.endpoint_valid || state.text_kv_valid != frontier ||
+        state.ledger.size() <= frontier || state.prefix_identity.size() <= frontier ||
+        state.prefix_digests.size() <= frontier) {
+        return out;
+    }
+    if (speculative_backend == SpeculativeBackend::Mtp && state.mtp_kv_valid < frontier - 1U) {
+        return out;
+    }
+    if (speculative_backend == SpeculativeBackend::DFlash &&
+        state.dflash_context_frontier < frontier) {
+        return out;
+    }
+    // The closed prefix is exactly a resolved prompt frontier: one committed token beyond the
+    // executed KV, with a rebuild cost measured from the root. The boundary hidden copied by the
+    // closing step keeps the endpoint materializable for the speculative bridge. The guards above
+    // make every resize a truncation, so a failure here can only decline the publication; the
+    // ResourceManager then discards the lane exactly as an abort would.
+    try {
+        state.execution_frontier = frontier;
+        state.ledger_frontier    = frontier + 1U;
+        state.ledger.resize(frontier + 1U);
+        state.prefix_identity.truncate(frontier + 1U);
+        state.prefix_digests.truncate(frontier + 1U);
+        state.rebuild_work =
+            runtime::make_prefill_work(0, frontier, state.rebuild_work.vision_items,
+                                       state.rebuild_work.vision_patches, prefill_chunk);
+        state.rebuild_tail_begin = 0;
+    } catch (...) { return out; }
+    return publish_continuation(sequence, frontier);
+}
+
+FinishResult ProgramImplCore::publish_continuation(
+    SequenceHandle sequence, std::optional<std::uint32_t> abandoned_frontier) noexcept {
     FinishResult out;
     if (has_context_transaction() || pending_transaction_ || !valid_sequence(sequence)) {
         return out;
@@ -9220,7 +9279,14 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
     RequestControl& request                = requests[lane];
     SequenceState& state                   = active_sequence(lane);
     const std::uint32_t continuation_index = active_continuations[lane];
-    if (request.lifecycle != Lifecycle::Finishable) { return out; }
+    if (abandoned_frontier) {
+        if (request.lifecycle != Lifecycle::Prefilling ||
+            state.execution_frontier != *abandoned_frontier) {
+            return out;
+        }
+    } else if (request.lifecycle != Lifecycle::Finishable) {
+        return out;
+    }
     if (!request.publish_continuation) {
         if (!clear_lane_strict(state, request)) { return out; }
         out.disposition = runtime::FinishDisposition::Released;
@@ -9281,6 +9347,7 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
     request.optional_resources                  = {};
     request.lifecycle                           = Lifecycle::Empty;
     request.pending                             = {};
+    request.prefill.reset();
     continuation_slots[continuation_index].role = ContinuationSlotRole::Catalogued;
     active_continuations[lane]                  = continuation_capacity;
     invalidate_lane(lane);
@@ -11458,6 +11525,21 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                         .prefix_reuse_path    = staged.reuse};
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
+    // An abandoned prefill closes at a chunk boundary instead of the prompt frontier. The closing
+    // step must not sample, because the engine publishes the closed prefix rather than a first
+    // generated token, and its planned frontier captures are superseded by that endpoint.
+    const bool closing_abandon = staged.abandon;
+    if (closing_abandon) {
+        staged.next_capture = staged.capture_groups.size();
+        if (staged.cursor >= staged.prompt_tokens || staged.prompt_tokens - staged.cursor <= 1U) {
+            staged.abandon = false;
+            return runtime::PrefillStepResult{
+                .summary                 = summary,
+                .processed_prompt_tokens = 0,
+                .timing                  = timing.finish(),
+            };
+        }
+    }
     try {
         if (staged.next_capture < staged.capture_groups.size() &&
             staged.capture_groups[staged.next_capture].frontier == staged.cursor) {
@@ -11529,8 +11611,13 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         }
 
         if (staged.cursor < staged.prompt_tokens) {
-            const std::uint32_t nominal =
-                std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            const std::uint32_t suffix_tokens = staged.prompt_tokens - staged.cursor;
+            std::uint32_t nominal             = std::min(prefill_chunk, suffix_tokens);
+            if (closing_abandon && nominal == suffix_tokens) {
+                // Leave the last prompt token unexecuted: this step closes a prefix, it does not
+                // sample the prompt's first generated token.
+                nominal -= 1U;
+            }
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
             if (speculative_backend == SpeculativeBackend::DFlash) {
@@ -11626,6 +11713,21 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             if (!finalized) {
                 if (staged.cursor == staged.prompt_tokens) {
                     throw std::logic_error("staged prefill reached the prompt without sampling");
+                }
+                if (closing_abandon) {
+                    // The closing prefix is publishable only with its boundary hidden: that row is
+                    // what a speculative retry bridges from, and the StateImage slot below is the
+                    // same one a planned frontier capture would have written. Without it the step
+                    // records no frontier and the lane is released the way it is today.
+                    refresh_state_views(sequence);
+                    if (final_chunk_tokens != 0 && sequence.tail_hidden.data != nullptr) {
+                        copy_tail(sequence, prefill_hidden.slice(
+                                                1,
+                                                static_cast<std::int32_t>(final_chunk_tokens) - 1,
+                                                1));
+                        staged.abandon_frontier = staged.cursor;
+                    }
+                    staged.abandon = false;
                 }
                 staged.elapsed_seconds +=
                     std::chrono::duration<double>(Clock::now() - started).count();

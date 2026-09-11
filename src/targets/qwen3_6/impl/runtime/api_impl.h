@@ -534,6 +534,17 @@ FinishResult<Variant> Program<Variant>::finish(SequenceHandle<Variant> sequence)
 }
 
 template <>
+void Program<Variant>::request_prefill_abandon(SequenceHandle<Variant> sequence) noexcept {
+    impl_->request_prefill_abandon(sequence);
+}
+
+template <>
+FinishResult<Variant>
+Program<Variant>::abandon_prefill(SequenceHandle<Variant> sequence) noexcept {
+    return impl_->abandon_prefill(sequence);
+}
+
+template <>
 AbortResult<Variant> Program<Variant>::abort(SequenceHandle<Variant> sequence) noexcept {
     return impl_->abort(sequence);
 }

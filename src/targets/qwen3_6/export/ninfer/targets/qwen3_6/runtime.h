@@ -953,6 +953,13 @@ public:
            runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] DiscardResult<Variant> abort_pending(PendingBatch<Variant>&& pending) noexcept;
     [[nodiscard]] FinishResult<Variant> finish(SequenceHandle<Variant> sequence) noexcept;
+    // Marks an in-flight prefill as abandoned. The next prefill step closes the computed prefix at
+    // a chunk boundary so abandon_prefill() can publish it. Ignored for any other lifecycle.
+    void request_prefill_abandon(SequenceHandle<Variant> sequence) noexcept;
+    // Publishes an abandoned prefill's computed prefix as the continuation endpoint, so a client
+    // that retries the same prompt resumes from that frontier instead of prefilling from zero.
+    // Declines (Released) when the prefix cannot be resumed.
+    [[nodiscard]] FinishResult<Variant> abandon_prefill(SequenceHandle<Variant> sequence) noexcept;
     [[nodiscard]] AbortResult<Variant> abort(SequenceHandle<Variant> sequence) noexcept;
     [[nodiscard]] ReleaseResult<Variant>
     release_continuation(ContinuationHandle<Variant>&& continuation) noexcept;

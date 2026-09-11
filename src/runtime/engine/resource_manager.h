@@ -931,71 +931,17 @@ public:
 
     [[nodiscard]] FinishResult finish(Program& program, LaneId lane, SequenceHandle sequence) {
         require_lane(lane, LogicalLaneState::TerminalPending);
-        if (!std::holds_alternative<std::monostate>(transaction_) ||
-            program.has_context_transaction()) {
-            throw std::logic_error("terminal finish overlaps an open resource transaction");
-        }
-        ActiveEntry& active = active_[lane.value];
-        FinishResult result = program.finish(sequence);
-        if (result.status != ConsumeStatus::Consumed) {
-            AbortResult discarded = program.abort(sequence);
-            if (discarded.status != ConsumeStatus::Consumed) {
-                throw std::logic_error(
-                    "Program could neither retain nor discard terminal sequence");
-            }
-            release_active_references(lane);
-            clear_catalog_entry(catalog_.at(active.publication_slot));
-            reset_active_entry(active);
-            lanes_[lane.value] = LogicalLaneState::Free;
+        return publish_terminal(program, lane, sequence, false);
+    }
 
-            FinishResult released;
-            released.status      = ConsumeStatus::Consumed;
-            released.disposition = FinishDisposition::Released;
-            released.timings     = discarded.timings;
-            released.speculative = std::move(discarded.speculative);
-            return released;
-        }
-        CatalogEntry& publication = catalog_.at(active.publication_slot);
-        if (!cache_enabled_ || result.disposition == FinishDisposition::Released) {
-            if (result.disposition != FinishDisposition::Released || result.continuation) {
-                throw std::logic_error("released finish returned a continuation");
-            }
-            release_active_references(lane);
-            clear_catalog_entry(publication);
-            reset_active_entry(active);
-            lanes_[lane.value] = LogicalLaneState::Free;
-            return result;
-        }
-        if (result.disposition != FinishDisposition::Catalogued || !result.continuation ||
-            !valid_continuation_summary(result.summary) ||
-            publication.state != CatalogState::ReservedForActive ||
-            publication.id != active.continuation_id) {
-            if (result.continuation) {
-                (void)program.release_continuation(std::move(*result.continuation));
-                result.continuation.reset();
-            }
-            throw std::logic_error("Program returned an invalid terminal continuation");
-        }
-
-        release_active_references(lane);
-        publication.state = CatalogState::Catalogued;
-        assign_continuation_summary(publication.summary, result.summary);
-        publication.handle.emplace(std::move(*result.continuation));
-        result.continuation.reset();
-        publication.session   = active.session;
-        publication.retention = active.retention;
-        migrate_observations(publication, result.summary, active.retention);
-        advance_revision(publication.revision);
-        if (publication.session && active.update_session_index) {
-            if (!publish_session(*publication.session, active.publication_slot, publication.id,
-                                 publication.revision, active.publication_order)) {
-                publication.session.reset();
-                publication.retention = RetentionClass::RecentPrivate;
-            }
-        }
-        reset_active_entry(active);
-        lanes_[lane.value] = LogicalLaneState::Free;
-        return result;
+    // A request whose client abandoned it mid-prefill keeps the prefix it already computed: the
+    // Program closes that prefix at a chunk boundary and publishes it as the continuation endpoint,
+    // so a retry of the same prompt resumes from that frontier instead of prefilling from zero. A
+    // prefix that cannot be resumed is released exactly like an aborted request.
+    [[nodiscard]] FinishResult
+    abandon_prefill(Program& program, LaneId lane, SequenceHandle sequence) {
+        require_lane(lane, LogicalLaneState::Active);
+        return publish_terminal(program, lane, sequence, true);
     }
 
     [[nodiscard]] AbortResult abort(Program& program, LaneId lane, SequenceHandle sequence) {
@@ -1239,6 +1185,82 @@ public:
     }
 
 private:
+    // Shared terminal publication for a finished request (`abandoned == false`) and an abandoned
+    // prefill (`abandoned == true`). Both hand a continuation to the catalog through the active
+    // lane's pre-reserved publication slot, and both release the lane when the Program declines to
+    // retain anything.
+    [[nodiscard]] FinishResult
+    publish_terminal(Program& program, LaneId lane, SequenceHandle sequence, bool abandoned) {
+        if (!std::holds_alternative<std::monostate>(transaction_) ||
+            program.has_context_transaction()) {
+            throw std::logic_error(abandoned
+                                       ? "prefill abandon overlaps an open resource transaction"
+                                       : "terminal finish overlaps an open resource transaction");
+        }
+        ActiveEntry& active = active_[lane.value];
+        FinishResult result =
+            abandoned ? program.abandon_prefill(sequence) : program.finish(sequence);
+        if (result.status != ConsumeStatus::Consumed) {
+            AbortResult discarded = program.abort(sequence);
+            if (discarded.status != ConsumeStatus::Consumed) {
+                throw std::logic_error(
+                    "Program could neither retain nor discard terminal sequence");
+            }
+            release_active_references(lane);
+            clear_catalog_entry(catalog_.at(active.publication_slot));
+            reset_active_entry(active);
+            lanes_[lane.value] = LogicalLaneState::Free;
+
+            FinishResult released;
+            released.status      = ConsumeStatus::Consumed;
+            released.disposition = FinishDisposition::Released;
+            released.timings     = discarded.timings;
+            released.speculative = std::move(discarded.speculative);
+            return released;
+        }
+        CatalogEntry& publication = catalog_.at(active.publication_slot);
+        if (!cache_enabled_ || result.disposition == FinishDisposition::Released) {
+            if (result.disposition != FinishDisposition::Released || result.continuation) {
+                throw std::logic_error("released finish returned a continuation");
+            }
+            release_active_references(lane);
+            clear_catalog_entry(publication);
+            reset_active_entry(active);
+            lanes_[lane.value] = LogicalLaneState::Free;
+            return result;
+        }
+        if (result.disposition != FinishDisposition::Catalogued || !result.continuation ||
+            !valid_continuation_summary(result.summary) ||
+            publication.state != CatalogState::ReservedForActive ||
+            publication.id != active.continuation_id) {
+            if (result.continuation) {
+                (void)program.release_continuation(std::move(*result.continuation));
+                result.continuation.reset();
+            }
+            throw std::logic_error("Program returned an invalid terminal continuation");
+        }
+
+        release_active_references(lane);
+        publication.state = CatalogState::Catalogued;
+        assign_continuation_summary(publication.summary, result.summary);
+        publication.handle.emplace(std::move(*result.continuation));
+        result.continuation.reset();
+        publication.session   = active.session;
+        publication.retention = active.retention;
+        migrate_observations(publication, result.summary, active.retention);
+        advance_revision(publication.revision);
+        if (publication.session && active.update_session_index) {
+            if (!publish_session(*publication.session, active.publication_slot, publication.id,
+                                 publication.revision, active.publication_order)) {
+                publication.session.reset();
+                publication.retention = RetentionClass::RecentPrivate;
+            }
+        }
+        reset_active_entry(active);
+        lanes_[lane.value] = LogicalLaneState::Free;
+        return result;
+    }
+
     struct Candidate {
         std::optional<AdmissionCandidate> plan;
         bool current_session_binding = false;

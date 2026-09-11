@@ -1262,8 +1262,17 @@ private:
             const auto& request = slots_[lane];
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
             if (request->capture_pending) { continue; }
+            if (request->abandon_prefill_requested) { continue; }
             if (!request->sequence || !request->lane || request->lane->value != lane) {
                 throw std::logic_error("active cancellation has no sequence binding");
+            }
+            if (request->is_prefilling()) {
+                // A cancelled prefill is not released here. The next prefill step closes the
+                // computed prefix at a chunk boundary, and the resource layer publishes it as the
+                // session endpoint, so an identical retry resumes from that frontier instead of
+                // prefilling the prompt from token zero. The request still completes as cancelled.
+                request->abandon_prefill_requested = true;
+                continue;
             }
             (void)request->output.preview_terminal(FinishReason::Cancelled);
             auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
@@ -1643,7 +1652,16 @@ private:
             progress.capture.reset();
             return;
         }
-        if (!progress.complete) { return; }
+        if (!progress.complete) {
+            if (request->abandon_prefill_requested) {
+                if (!request->lane) {
+                    throw std::logic_error("abandoned prefill lost its lane binding");
+                }
+                phase.finish();
+                abandon_prefill_request(request, request->lane->value);
+            }
+            return;
+        }
         if (!request->lane || !progress.pending) {
             throw std::logic_error("completed prefill has no lane or pending token");
         }
@@ -1662,6 +1680,26 @@ private:
         progress.pending.reset();
     }
 
+    // Terminal settlement for a request whose client abandoned it mid-prefill. The closing step
+    // already recorded the computed prefix, so the resource layer either retains it as a resumable
+    // session endpoint or releases the lane. Either way the request completes as cancelled: it never
+    // reports a finished generation and never emits an output delta.
+    void abandon_prefill_request(const std::shared_ptr<Request>& request, std::uint32_t lane) {
+        if (request == nullptr || !request->sequence || !request->lane ||
+            request->lane->value != lane || !request->budget) {
+            throw std::logic_error("abandoned prefill has no active Engine binding");
+        }
+        auto abandoned =
+            resources_.abandon_prefill(*instance_.program, *request->lane, *request->sequence);
+        request->generation_timings = abandoned.timings;
+        request->speculative_stats  = std::move(abandoned.speculative);
+        if (scheduler_.prefill_lane() == lane) { scheduler_.clear_prefill_lane(lane); }
+        (void)request->output.preview_terminal(FinishReason::Cancelled);
+        append_output(request, request->output.commit_preview());
+        complete_success(request, FinishReason::Cancelled);
+        remove_completed_slot(lane);
+    }
+
     void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
@@ -1674,6 +1712,10 @@ private:
         }
         if (!request->sequence) {
             throw std::logic_error("prefill request has no sequence handle");
+        }
+        if (request->abandon_prefill_requested) {
+            // The Program closes the next step at a chunk boundary instead of the prompt frontier.
+            instance_.program->request_prefill_abandon(*request->sequence);
         }
         setup.finish();
         ProgramCallScope program_call(*this);

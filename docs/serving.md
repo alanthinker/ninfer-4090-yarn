@@ -992,6 +992,17 @@ processed by one model traversal and, when graphs are enabled, one exact-batch C
 request joins that batch only after its single-request prefill finishes; when it completes or is
 cancelled, the next boundary rebuilds the batch without an empty row.
 
+A cancellation that lands while a request is prefilling does not discard the prefix already
+computed. The executor lets one more chunk close that prefix at a chunk boundary, publishes it as
+the session's continuation endpoint - the same state a finished prompt of that length would leave -
+and then releases the lane. The request itself still terminates as cancelled: it reports no finished
+generation and emits no output delta, and a client that is still connected sees the same terminal it
+saw before. The retained endpoint is what makes a retry of a very long prompt converge: an identical
+prompt resumes from that frontier, so the `cache` field of the retry reports the reused tokens
+instead of re-prefilling from token zero. When the prefix cannot be resumed - context cache
+disabled, no session index, or a prompt suffix too short to host a closing chunk - the lane is
+released exactly as before.
+
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in
 CPU/media preparation and completed model results whose response has not yet been released. A full

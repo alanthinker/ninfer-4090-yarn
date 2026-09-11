@@ -475,6 +475,11 @@ struct RequestControl {
         std::vector<CaptureGroup> capture_groups;
         std::size_t next_capture            = 0;
         std::uint64_t pending_capture_offer = 0;
+        // Abandoned prefill: the next step runs one bounded closing chunk that also records the
+        // boundary hidden, so the committed prefix can be published as the continuation endpoint
+        // instead of being discarded with the lane. Terminal once abandon_frontier is set.
+        bool abandon                   = false;
+        std::uint32_t abandon_frontier = 0;
         std::uint32_t base                  = 0;
         std::uint32_t cursor                = 0;
         std::uint32_t prompt_tokens         = 0;
@@ -600,6 +605,14 @@ public:
                                       runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
+    // Marks an in-flight prefill as abandoned. The next advance_prefill step closes the prompt
+    // prefix at a chunk boundary and records the boundary hidden, after which abandon_prefill()
+    // can publish it. Ignored for any other lifecycle.
+    void request_prefill_abandon(SequenceHandle sequence) noexcept;
+    // Publishes an abandoned prefill's committed prefix as the continuation endpoint, so a client
+    // that retries the same prompt resumes from that frontier instead of prefilling from zero.
+    // Declines (Released) when the prefix cannot satisfy a resume.
+    [[nodiscard]] FinishResult abandon_prefill(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
@@ -1174,6 +1187,12 @@ private:
     [[nodiscard]] bool can_clear_lane_strict(const SequenceState& sequence) const;
     [[nodiscard]] bool clear_lane_strict(SequenceState& sequence, RequestControl& request) noexcept;
     void clear_lane_best_effort(SequenceState& sequence, RequestControl& request) noexcept;
+    // Physical publication shared by a normally finished request (endpoint at the resolved
+    // frontier) and an abandoned prefill (endpoint at its last closed chunk frontier). The
+    // abandoned form additionally closes the ledger at that frontier before publishing.
+    [[nodiscard]] FinishResult
+    publish_continuation(SequenceHandle sequence,
+                         std::optional<std::uint32_t> abandoned_frontier) noexcept;
     void ordered_reset(SequenceState& sequence);
     [[nodiscard]] StateImageSelectors state_selectors(const SequenceState& sequence) const;
     [[nodiscard]] detail::PhysicalResources
