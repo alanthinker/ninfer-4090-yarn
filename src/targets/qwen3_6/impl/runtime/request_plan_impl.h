@@ -556,7 +556,12 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             ((source != nullptr && source->mtp_kv_valid >= plan->reuse_base - 1) ||
              (shared_source != nullptr && shared_source->backend_frontier >= plan->reuse_base - 1));
         if (plan->reuse != ReusePath::Root && !append_ready && !checkpoint_ready) {
-            throw std::logic_error("published MTP checkpoint is not materializable");
+            // A catalogued checkpoint can lose the backend KV or boundary hidden that this reuse
+            // path needs - the planner demotes and drops replicas under pressure, and the catalog
+            // does not promise the deployed backend's bridge. That makes this candidate
+            // unusable, not the request invalid: skip it and let the search fall back to a
+            // shallower checkpoint or the root, exactly as a failed exact match does.
+            return std::nullopt;
         }
     }
 
@@ -569,7 +574,8 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                                 source->dflash_context_frontier < plan->reuse_base)) ||
          (shared_source != nullptr && (!shared_source->kv || !shared_source->kv->backend ||
                                        shared_source->backend_frontier < plan->reuse_base)))) {
-        throw std::logic_error("published DFlash checkpoint is not materializable");
+        // Same as the MTP case above: an unusable candidate is skipped, not fatal.
+        return std::nullopt;
     }
 
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;

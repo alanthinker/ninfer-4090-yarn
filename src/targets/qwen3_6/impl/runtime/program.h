@@ -475,11 +475,10 @@ struct RequestControl {
         std::vector<CaptureGroup> capture_groups;
         std::size_t next_capture            = 0;
         std::uint64_t pending_capture_offer = 0;
-        // Abandoned prefill: the next step runs one bounded closing chunk that also records the
-        // boundary hidden, so the committed prefix can be published as the continuation endpoint
-        // instead of being discarded with the lane. Terminal once abandon_frontier is set.
-        bool abandon                   = false;
-        std::uint32_t abandon_frontier = 0;
+        // Frontier whose boundary hidden is recorded in the continuation StateImage: the last chunk
+        // this prefill committed. An abandoned prefill publishes exactly this prefix, so it can be
+        // resumed without running another chunk.
+        std::uint32_t boundary_hidden_frontier = 0;
         std::uint32_t base                  = 0;
         std::uint32_t cursor                = 0;
         std::uint32_t prompt_tokens         = 0;
@@ -605,13 +604,9 @@ public:
                                       runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
-    // Marks an in-flight prefill as abandoned. The next advance_prefill step closes the prompt
-    // prefix at a chunk boundary and records the boundary hidden, after which abandon_prefill()
-    // can publish it. Ignored for any other lifecycle.
-    void request_prefill_abandon(SequenceHandle sequence) noexcept;
     // Publishes an abandoned prefill's committed prefix as the continuation endpoint, so a client
     // that retries the same prompt resumes from that frontier instead of prefilling from zero.
-    // Declines (Released) when the prefix cannot satisfy a resume.
+    // Declines (Released) when the prefix cannot be resumed; `abandon_outcome` names the case.
     [[nodiscard]] FinishResult abandon_prefill(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;

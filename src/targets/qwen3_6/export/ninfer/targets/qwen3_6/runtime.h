@@ -841,6 +841,8 @@ struct FinishResult {
     SpeculativeStats speculative;
     ContinuationSummary summary;
     std::optional<ContinuationHandle<Variant>> continuation;
+    // Set only by abandon_prefill(); says whether that call retained the abandoned prefix.
+    runtime::AbandonedPrefixOutcome abandon_outcome = runtime::AbandonedPrefixOutcome::NotApplicable;
 };
 
 template <class Variant>
@@ -953,12 +955,9 @@ public:
            runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] DiscardResult<Variant> abort_pending(PendingBatch<Variant>&& pending) noexcept;
     [[nodiscard]] FinishResult<Variant> finish(SequenceHandle<Variant> sequence) noexcept;
-    // Marks an in-flight prefill as abandoned. The next prefill step closes the computed prefix at
-    // a chunk boundary so abandon_prefill() can publish it. Ignored for any other lifecycle.
-    void request_prefill_abandon(SequenceHandle<Variant> sequence) noexcept;
-    // Publishes an abandoned prefill's computed prefix as the continuation endpoint, so a client
+    // Publishes an abandoned prefill's committed prefix as the continuation endpoint, so a client
     // that retries the same prompt resumes from that frontier instead of prefilling from zero.
-    // Declines (Released) when the prefix cannot be resumed.
+    // Declines (Released) when the prefix cannot be resumed, and reports which case in the result.
     [[nodiscard]] FinishResult<Variant> abandon_prefill(SequenceHandle<Variant> sequence) noexcept;
     [[nodiscard]] AbortResult<Variant> abort(SequenceHandle<Variant> sequence) noexcept;
     [[nodiscard]] ReleaseResult<Variant>

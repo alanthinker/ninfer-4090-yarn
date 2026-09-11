@@ -1212,10 +1212,11 @@ private:
             lanes_[lane.value] = LogicalLaneState::Free;
 
             FinishResult released;
-            released.status      = ConsumeStatus::Consumed;
-            released.disposition = FinishDisposition::Released;
-            released.timings     = discarded.timings;
-            released.speculative = std::move(discarded.speculative);
+            released.status          = ConsumeStatus::Consumed;
+            released.disposition     = FinishDisposition::Released;
+            released.abandon_outcome = result.abandon_outcome;
+            released.timings         = discarded.timings;
+            released.speculative     = std::move(discarded.speculative);
             return released;
         }
         CatalogEntry& publication = catalog_.at(active.publication_slot);

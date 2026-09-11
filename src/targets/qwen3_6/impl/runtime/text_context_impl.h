@@ -1304,14 +1304,16 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
             }
 
-            if (split_rel > 0 && t0 + len == split_rel &&
-                rewrite_checkpoint_hidden_output_ != nullptr) {
-                require_tensor_shape(*rewrite_checkpoint_hidden_output_, DType::BF16,
-                                     {kCfg.hidden, 1}, "rewrite checkpoint hidden output");
-                const Tensor checkpoint_hidden = xf.slice(1, len - 1, 1);
-                CUDA_CHECK(cudaMemcpyAsync(rewrite_checkpoint_hidden_output_->data,
-                                           checkpoint_hidden.data, checkpoint_hidden.bytes(),
-                                           cudaMemcpyDeviceToDevice, s));
+            // One segment per call, so the last row of this segment is the boundary hidden of the
+            // frontier this call commits - the same row a capture frontier inside the segment
+            // names. Recording it every time keeps the committed prefix publishable at any chunk
+            // boundary, which is what lets an abandoned prefill resume without another chunk.
+            if (boundary_hidden_output_ != nullptr) {
+                require_tensor_shape(*boundary_hidden_output_, DType::BF16, {kCfg.hidden, 1},
+                                     "boundary hidden output");
+                const Tensor boundary_hidden = xf.slice(1, len - 1, 1);
+                CUDA_CHECK(cudaMemcpyAsync(boundary_hidden_output_->data, boundary_hidden.data,
+                                           boundary_hidden.bytes(), cudaMemcpyDeviceToDevice, s));
             }
         }
 

@@ -53,6 +53,10 @@ struct GenerationOutcome {
     std::string reasoning;
     std::vector<ninfer::GeneratedToolCall> tool_calls;
     ninfer::ToolCallParseDiagnostics tool_call_parse;
+    // Diagnostic for a request a client abandoned mid-prefill: the frontier retained for it, and
+    // why nothing was retained when it is zero.
+    std::uint32_t abandoned_endpoint_tokens = 0;
+    std::string abandoned_prefix_note;
     int prompt_tokens     = 0;
     int completion_tokens = 0;
     int reasoning_tokens  = 0;

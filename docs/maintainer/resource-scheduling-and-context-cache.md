@@ -456,13 +456,14 @@ TerminalPending request 继续持有 `SequenceHandle` 和完整 reservation，�
 inactive owners，但只有严格优于 private-only baseline 的完整终态才会提交；否则跳过 shared publication，
 不阻塞 active request，也不改变同一 frontier 原本可执行的 private capture。
 
-一个 client 在 prefill 中途放弃的 ReadWrite request 同样走 Finish，而不是立即 Discard：executor 让
-一个 bounded closing chunk 把已经算出的 prefix 收在一个 chunk frontier 上（该 frontier 之前 KV 已
-committed，该 chunk 同时把 boundary hidden 写入 StateImage），Program 以该 frontier 作为 endpoint 发布
-同一个 continuation，ResourceManager 复用 active lane 已预留的 publication slot。请求本身的终态仍是
-cancelled，不产生任何输出；只有它的 prefix 成为可继续的 endpoint，使同一 prompt 的重试从该 frontier
-续算。凡 frontier 无法被精确描述的情形——suffix 不足以承载 closing chunk、context cache disabled、
-没有可绑定的 SessionIndex——一律退回 Discard。
+一个 client 在 prefill 中途放弃的 ReadWrite request 同样走 Finish，而不是立即 Discard：每个 prefill
+chunk 都把本次提交 token 的 boundary hidden 写入 destination StateImage 的边界槽，因此取消发生的那个
+boundary 上的 prefix 已经可直接发布——Program 以该 frontier 作为 endpoint 发布同一个 continuation，
+ResourceManager 复用 active lane 已预留的 publication slot，发布与取消在同一个 boundary 内完成，抢在
+下一次 admission 之前。请求本身的终态仍是 cancelled，不产生任何输出；只有它的 prefix 成为可继续的
+endpoint，使同一 prompt 的重试从该 frontier 续算。凡 frontier 无法被精确描述或缺少 typed KV coverage
+的情形——尚未提交任何 chunk、没有 boundary hidden、context cache disabled、没有 publication slot——
+一律退回 Discard，并把这个结果报告给请求诊断。
 
 ### 6.3 Persistent backfill proof
 

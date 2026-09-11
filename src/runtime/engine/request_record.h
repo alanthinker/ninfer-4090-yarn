@@ -176,9 +176,10 @@ struct RequestRecord {
     std::optional<LaneId> lane;
     std::optional<SequenceHandle> sequence;
     std::atomic<bool> cancelled{false};
-    // Set when the worker observed a cancellation of an in-flight prefill. The lane is kept for one
-    // closing prefill step, which publishes the computed prefix instead of discarding it.
-    bool abandon_prefill_requested = false;
+    // Set when a cancellation released an in-flight prefill: the frontier of the endpoint that was
+    // published for it (0 when nothing was retained) and why. Diagnostic only.
+    std::uint32_t abandoned_endpoint_tokens = 0;
+    AbandonedPrefixOutcome abandoned_prefix_outcome = AbandonedPrefixOutcome::NotApplicable;
     EngineRequestState model_state        = EngineRequestState::Waiting;
     bool capture_pending                  = false;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;

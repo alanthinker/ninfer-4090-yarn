@@ -288,6 +288,12 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             << '/' << product::format_pretty_count(metrics.speculative_draft_tokens) << " ("
             << product::format_pretty_percent(acceptance) << ')';
     }
+    if (outcome.abandoned_endpoint_tokens != 0) {
+        out << " | abandoned prefill: endpoint "
+            << product::format_pretty_count(outcome.abandoned_endpoint_tokens);
+    } else if (!outcome.abandoned_prefix_note.empty()) {
+        out << " | abandoned prefill: none (" << outcome.abandoned_prefix_note << ')';
+    }
     if (outcome.thinking.configured_budget) {
         out << " | thinking "
             << product::format_pretty_count(outcome.thinking.model_thinking_tokens) << '/'

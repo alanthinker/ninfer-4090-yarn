@@ -843,6 +843,22 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
+
+Every retained checkpoint - a session endpoint or a long anchor - owns one GDN StateImage, about
+147 MiB for Qwen3.8-27B, and a checkpoint without a complete Device or Host replica is unusable even
+when its KV pages are still resident. Size the two state capacities for the sessions you intend to
+keep warm at once:
+
+```text
+Host StateImage slots >= retained sessions x (2 + --max-long-anchors-per-continuation)
+Device StateImage slots = --max-concurrency + --device-state-slots   (active lanes are separate)
+```
+
+A deficit does not fail; the planner simply drops checkpoints it cannot place, and the visible
+symptom is a deep session whose `cache` hit keeps collapsing to a shallower prefix and re-prefilling
+tens of thousands of tokens per turn. Raising `--host-state-slots` is the cheap fix (pinned RAM,
+about 147 MiB per slot); lowering `--max-long-anchors-per-continuation` costs about 147 MiB per
+session per anchor and gives up the deeper recovery points.
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |
 | `--top-k N` | process-level top-k override (`0..20`; zero selects the top-20 cap) | unset |
@@ -993,15 +1009,18 @@ request joins that batch only after its single-request prefill finishes; when it
 cancelled, the next boundary rebuilds the batch without an empty row.
 
 A cancellation that lands while a request is prefilling does not discard the prefix already
-computed. The executor lets one more chunk close that prefix at a chunk boundary, publishes it as
-the session's continuation endpoint - the same state a finished prompt of that length would leave -
-and then releases the lane. The request itself still terminates as cancelled: it reports no finished
-generation and emits no output delta, and a client that is still connected sees the same terminal it
-saw before. The retained endpoint is what makes a retry of a very long prompt converge: an identical
-prompt resumes from that frontier, so the `cache` field of the retry reports the reused tokens
-instead of re-prefilling from token zero. When the prefix cannot be resumed - context cache
-disabled, no session index, or a prompt suffix too short to host a closing chunk - the lane is
-released exactly as before.
+computed. Every prefill chunk records the hidden state of the token it commits, so the committed
+prefix is publishable as it stands: the cancellation publishes it as the session's continuation
+endpoint - the same state a finished prompt of that length would leave - and releases the lane in
+that same boundary, before anything else is admitted. The request itself still terminates as
+cancelled: it reports no finished generation and emits no output delta, and a client that is still
+connected sees the same terminal it saw before. The retained endpoint is what makes a retry of a
+very long prompt converge: an identical prompt resumes from that frontier, so the `cache` field of
+the retry reports the reused tokens instead of re-prefilling from token zero, and the completion
+line reports the outcome for the abandoned request itself (`abandoned prefill: endpoint N`, or
+`none (<reason>)`). When the prefix cannot be resumed - context cache disabled, no publication
+capacity, or a frontier whose typed KV coverage is incomplete - the lane is released exactly as
+before.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in

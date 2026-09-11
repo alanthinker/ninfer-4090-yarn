@@ -829,6 +829,13 @@ struct GenerationResult {
     // the request released its context instead of retaining it.
     std::int32_t slot = -1;
     std::string session_digest;
+    // A client that abandons an in-flight prefill keeps the prefix it has already computed whenever
+    // the resource layer can publish it as the session's continuation endpoint: this is that
+    // endpoint's frontier, and `abandoned_prefix_note` names why it is zero when nothing was
+    // retained. Both stay empty for a request that was not an abandoned prefill. Diagnostic only:
+    // the request's own outcome is FinishReason::Cancelled either way.
+    std::uint32_t abandoned_endpoint_tokens = 0;
+    std::string abandoned_prefix_note;
     ThinkingBudgetStats thinking;
 };
 

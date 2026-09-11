@@ -456,6 +456,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.matched_stop_string = std::move(result.matched_stop_string);
     outcome.id_slot             = result.slot;
     outcome.session_digest      = std::move(result.session_digest);
+    outcome.abandoned_endpoint_tokens = result.abandoned_endpoint_tokens;
+    outcome.abandoned_prefix_note     = std::move(result.abandoned_prefix_note);
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     outcome.metrics.ttft_seconds =

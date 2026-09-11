@@ -203,6 +203,18 @@ enum class CommitDisposition : std::uint8_t {
     CancelledReleased,
 };
 
+// Why a prefill that a client abandoned mid-flight did or did not retain the prefix it had already
+// computed. Diagnostic only: the request's own outcome is FinishReason::Cancelled either way, and
+// every case other than Retained releases the lane exactly as an abort would.
+enum class AbandonedPrefixOutcome : std::uint8_t {
+    NotApplicable,     // the request was not a prefill abandoned mid-flight
+    Retained,          // the committed prefix was published as the continuation endpoint
+    NoComputedPrefix,  // no chunk had committed a prefix yet
+    NoBoundaryHidden,  // the committed prefix has no recorded boundary hidden
+    Unavailable,       // context cache disabled, no publication capacity, or KV coverage missing
+    Conflicted,        // an open resource transaction or an unexpected lifecycle
+};
+
 // The product Engine only needs statistics for rows whose sequence is released by commit.
 // Direct diagnostic callers may temporarily request cumulative snapshots for every row.
 enum class CommitObservation : std::uint8_t {

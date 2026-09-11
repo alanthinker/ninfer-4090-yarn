@@ -180,8 +180,11 @@ public:
         rope_scaling_original_context_  = static_cast<std::int32_t>(original_context);
     }
 
-    void set_rewrite_checkpoint_hidden_output(Tensor* output) noexcept {
-        rewrite_checkpoint_hidden_output_ = output;
+    // Destination for the hidden state of the last token this chunk call processes. A prefill
+    // chunk always writes it when the caller asks, so every committed frontier carries a recorded
+    // boundary hidden; a capture frontier inside the chunk names the same row.
+    void set_boundary_hidden_output(Tensor* output) noexcept {
+        boundary_hidden_output_ = output;
     }
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
@@ -327,7 +330,7 @@ private:
     GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;
     const GdnReplayRecords* replay_records_   = nullptr;
     std::int64_t prefill_split_frontier_      = -1;
-    Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
+    Tensor* boundary_hidden_output_           = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
 
     const Weight* embed_                        = nullptr;

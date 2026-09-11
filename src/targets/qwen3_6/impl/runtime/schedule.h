@@ -67,7 +67,7 @@ struct PrefillContext {
     DFlashPersistentState* dflash;
     std::uint32_t text_kv_base;
     const ops::SamplingConfig* sampling;
-    Tensor* rewrite_checkpoint_hidden;
+    Tensor* boundary_hidden;
     std::int32_t state_source_slot                          = 0;
     std::int32_t state_destination_slot                     = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
