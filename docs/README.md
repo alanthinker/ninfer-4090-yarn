@@ -48,6 +48,7 @@ Runtime and Op references:
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
+- [YaRN port provenance: defect attribution against the gzenz merge parent, and prefill/decode consistency evidence](maintainer/yarn-port-provenance.md)
 
 `engine-architecture.md` is the sole top-level Engine architecture reference.
 `resource-scheduling-and-context-cache.md` is its narrower authority for resource selection,
