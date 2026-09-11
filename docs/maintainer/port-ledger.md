@@ -1,0 +1,249 @@
+# Port ledger
+
+The RTX 4090 fork (this repository, branch `rtx4090-port`) and the RTX 5090 fork
+([sergiuszm/ninfer-5090](https://github.com/sergiuszm/ninfer-5090), branch
+`nuntius-serve`) share almost all of their engine and serve code. Features are
+born in one tree and cherry-picked into the other. This ledger records, per
+feature, the commit hash in each tree, so coverage stays checkable without
+archaeology.
+
+Maintenance rules:
+
+- Cherry-pick with `git cherry-pick -x`, so the destination commit records its
+  source hash. Each repository holds the other as a local remote
+  (`local-5090` here, `local-4090` there).
+- Port in the session that ships the feature. Delayed ports pay a growing
+  adaptation cost; `f640b404` on the 5090 side is the receipt.
+- When a feature is deliberately not ported, record the decision here instead
+  of leaving a silent gap.
+
+## Feature rows
+
+| Feature | 4090 (`rtx4090-port`) | 5090 (`nuntius-serve`) | Notes |
+|---|---|---|---|
+| `context_window` in `/v1/models` | `0f308358` | `ed606ed5` | |
+| Prometheus `/metrics` | (commit series) | `fc582982`, `5fa5ffa1` | |
+| Retained depth on idle `/slots` | `b0893e79` | `1a9640f1` | |
+| Vision modality in `/v1/models` | `b6172f24` | `61013cf1` | Born on the 5090 side |
+| fp16-accumulate PV tiles | part of `ce50e995` | `4483c820` | 4090 folds it into the sm_89 retune |
+| 413 body fix + media prompt cap | `85f685a3`, `bde2765c` | `66423552`, `e9093c77` | Born on the 5090 side |
+| sws_scale stride pad | `5a08683d` | `060bb320` | Born on the 5090 side |
+| Tool content-part arrays | `d78df936` | `b0a0a6fe` | |
+| llama.cpp-compatible `timings` | `0f95b32e` | `0834b6cb` | From the shantanusingh16 fork |
+| Final-chunk usage param fix | `265011d9` | `51857983` | |
+| Slot save/restore to disk | `beaeb70a` | `aeaf3f28` | 5090 needed `f640b404` (KV modes) |
+| Session digests + `if_digest` | `8e478945` | `40504615` | |
+| Cheapest-lane reuse tie-break | `1614ef54` | `59cb1afb` | |
+| `/slots` snapshot publishing | `4a4fa92b` | `93fadf94` | |
+| Live llamacpp `/metrics` counters | `656b0df7` | `b38ae92d` | |
+| Turn checkpoint ring | `3a2e7f07`, `cba2c1f8`, `2cbe488d`, `3419fe43` | `6826b8b0`, `1ac61caf`, `8b28e502`, `66401303` | Picked with `-x` |
+| Auto-save on eviction | `8093c640` | `cad0218e` | Picked with `-x` |
+| Causal-tile key-block partition | `694e01f0` | `b5179823` | i8 body re-applied per schedule; bf16 and common taken verbatim |
+| E8 codec hardening | `bc569eb8`, `a0e03d37` | not applicable | The 5090 tree carries no E8 code. Third-hand from upstream PR #35 through the sibling fork; authorship preserved |
+| Production E8 codec test | `94830b3f` | not applicable | Same reason. Also registers the standalone oracle, which ctest had never run |
+| GDN QK norm XOR butterfly | `6e239351` | open | Bit-exact over 6.4M lanes, measures near zero. Port is cheap; value is consistency, not throughput |
+| GDN uniform value pack | `c4d09b61` | open | Bit-exact over all 65536 bf16 patterns, measures near zero. Born here, not a port |
+
+## Inbound ports from downstream forks
+
+Nine forks of `sergiuszm/ninfer-4090` now exist. This table records what each
+one contributed and what was declined, so that a later sweep does not
+re-examine the same commits. Survey date: 2026-08-29.
+
+| Source commit | Here | Decision |
+|---|---|---|
+| jomcgi `a0d78215`, `chat_template_kwargs` aliases | `6affed2e` | Ported. llama.cpp and vLLM spell the Qwen thinking controls under `chat_template_kwargs`. Existing clients reach the effort knob without a change |
+| Don-Chad `db076d67`, remove CUDA forward-compat libraries | `ff925039` | Ported. Our `Dockerfile` uses the same `nvidia/cuda:13.1.2` base and carried the same latent failure. The deployed `ninfer-dev:runtime` image is built by hand, so no rebuild is forced |
+| Don-Chad `ccb20680`, qualify Qwen3.8 on SM89 | not applicable | `layouts_impl.h` already gates on `device.sm() != 89`. The upstream form admits 86 or 89 and would loosen our gate |
+| jomcgi `1513de5a`, ghcr image workflow | declined | Hardwired to `ghcr.io/jomcgi` and to a `runAsNonRoot` cluster policy. We deploy hand-built local images |
+| Don-Chad `7afc8e17`, resident-CTA budget from the runtime SM count | open | Not a cherry-pick. See the note below |
+
+The `7afc8e17` principle applies to us, but its constants do not. That fix
+separates per-SM occupancy from the device-wide budget for sm_86, where the
+supported range is 82 to 84 SMs. Our `bf16_gdn_gating_proj_plan.cpp` hardcodes
+the 128-SM budget of the RTX 4090 and feeds the same constants to a
+`static_assert`. The number is correct for the RTX 4090 and wrong for every
+other Ada device: the RTX 4080 has 76 SMs and the L40S has 142. On a card with
+fewer SMs the budget is overstated. A cooperative launch that does not fit is
+then accepted, and the driver rejects it with
+`cudaErrorCooperativeLaunchTooLarge`. A port needs `DeviceContext::sm_count()`,
+our own per-SM occupancy figures, and a `kMinSupportedSmCount` value for sm_89.
+
+## Inbound sweep 2026-09-01 (UDP fork)
+
+`udp/feat/rtx-4090-sm89-native` moved from `8bba5eb4` to `717479fe`: 25 commits,
+almost all dated 2026-09-01. Four are correctness fixes; the rest are sm_89 kernel
+and build tuning. Triage of the four, checked against this tree rather than read
+from their messages:
+
+| Source commit | Applies here | Decision |
+|---|---|---|
+| `05a88712`, transient admission shortfall bricks the executor | class real, trigger blocked here | CLOSED 2026-09-01 after a GPU-window repro attempt: three interleaved conversations deepening 49k->58k tokens, 30 requests, a save/restore loop at 0.5 s beside them. No latch, `/health` 200 throughout, and the only failures were `classification=timeout` (the graceful pending-deadline path). The external half of their trigger cannot occur here - every concurrent slot save/restore was refused `409 slot_busy`, because this catalog serialises slot operations against open resource transactions. The in-engine half DID occur: auto-save-on-eviction spilled 1.2-1.4 GB snapshots concurrently with admission seven times without ill effect. The failure CLASS stays real (`fail_all_locked` latches permanently; the worker catch-all converts any admission `logic_error` into it), which is why `dd5206f0` was worth porting on its own. |
+| `dd5206f0`, `/health` reports the executor's real state | yes | PORTED as `60764d66` (adaptation, not a cherry-pick - their executor and service layers have diverged). `healthy()` on both cores, forwarded through Engine and GenerationService; 503 + `{"status":"error"}` when the engine has latched. NOT YET DEPLOYED: the running 8086 binary still answers a hardcoded ok |
+| `8488278c`, publish snapshot saves whose write already finished | no | Not applicable. `src/core/disk_state_cache.*` exists only in the UDP tree - neither here nor in `neroued/master` |
+| `e2556b50`, render mid-conversation system turns in place | no | Already covered by a different implementation. Our template folds only `messages[0]` (`chat_template.cpp:464-477`) and renders later instruction turns in place in the message loop, so the shape that threw for them returns 200 here - verified against the live 8086 server. Their fix also edits `anthropic_schema.cpp`, a file the upstream Anthropic rework replaced in our merge |
+
+The ~15 perf commits are subject to the standing rule from `docs/udp-fork-comparison.md`:
+kernel-bench before any perf pick, because their dequant micro-optimisations lost on
+measurement here. Start with `45a5ae57` ("size CTA waves from the target SM count, not
+an RTX 5090"): it may be the sm_89 form of the Don-Chad `7afc8e17` row still open above,
+which needs `DeviceContext::sm_count()`, our own per-SM occupancy figures and a
+`kMinSupportedSmCount`.
+
+## Upstream catch-up 2026-09-05: `neroued/master` `ad0f3d38` merged
+
+Merge commit on `recon/catchup-20260904` (worktree `ninfer-recon`), 20 upstream commits since
+`5438b743`. Full inventory and every decision: `ninfer-recon-notes/CATCHUP-20260904.md`.
+
+What rode along and how it landed:
+
+| Item | Outcome |
+|---|---|
+| `a140e7ae` exact agent prefix reuse, `b8786751` aliased state ownership | Merged; `engine_core.h` auto-merged, `program_impl.h` two trivial hunks. `b8786751` removed `SequenceState::state_source_retained`; our restore path stopped assigning it. Default shared capacity is now `max(max_concurrency, 4)`; production pins `--max-shared-prefixes 1`, so its geometry is unchanged |
+| `4ac73c47`, `21a0e85f`, `a2761ec1` KV-cache restructure | **Interface adopted, kernels kept.** `KvCacheStorage` + `PagedKVStorageLayout` replace the flag bag everywhere; the four fork modes are described in `paged_kv_storage.h` and `kv_fork_mode_flags()` feeds our unchanged int8/E8 kernels. fp16 V storage for the bf16 mode adopted (35 files; no production path). The fork's two-phase bf16 prompt kernel (`694e01f0`) was DROPPED for upstream's bf16 kernels - re-port only if bf16-mode prefill on the 4090 ever matters. nvfp4/k8v4 kernels are excluded on sm_89 (`cvt.e2m1x2`), stubbed, and the modes are rejected at startup |
+| `550d0ac3` llama.cpp timings + prompt progress | Upstream's `timings` block replaces ours (superset minus `ttft_ms`, which nothing consumed); `id_slot`/`session_digest` kept |
+| `5f6d44e4` health readiness | `/health` is 503 until the service attaches and after a latched failure; our latch check kept |
+| `6e2786c5` readable operational logs | Upstream's prose capacity lines NOT used; our structured `engine capacity/context_cache/state_pools` boot lines kept in `apps/serve/main.cpp` (`quote_log_value` re-homed there). The request done line is upstream's prose (it now carries MTP acceptance and thinking accounting itself); the fork's 09-01 structured suffix (`speculative_*`, `host_exposed_ms`, `decode_*_us_per_round`, `thinking_*`) is DROPPED - every field is in the request JSONL. LOG-CONTRACT.md refresh is a phase-2 item |
+| `e51b585c` cooperative launch capacity | Mechanism adopted (runtime SM count, tile partitioning); our sm_89 route bounds kept, our hand-rolled residency predicates deleted |
+| `3b50962b`, `0c5d570c`, `719d56ef` tool-call frontend; `e3aeaf8c`; `f0eb3ac7` httplib 0.54.1; `863aa8a5`; perf and fixture commits | Merged clean |
+| `5973313d` self-contained frontend fixtures | Our official-tokenizer test gate removed; `NINFER_QWEN3_6_27B_HF_DIR` no longer needed by the frontend test |
+
+Also taken in the same pass: 3090 base `5820660d` (pairwise K reduction in the unsplit GDN
+gating projection, cherry-picked clean; the numerics miss it fixes is the one our own
+`test_gdn_gating_proj.cpp` comment documents at the T=2689 onset).
+
+Deliberately NOT taken: the fork's two-phase bf16 prompt kernel (see above), the request-line
+suffix (see above), `ttft_ms` in the chat `timings` block (nothing consumed it), the
+200-before-attach `/health` behavior.
+
+## Inbound sweep 2026-09-04 (all remotes and forks)
+
+Survey of `neroued/master` (upstream), `Don-Chad/ninfer-3090` (the 3090 base),
+`UDPSendToFailed/ninfer-4090`, the 13 forks of this repository, and the recently active forks
+of upstream and of the 3090 base. Counts are commits absent from `rtx4090-port` at `4565c832`.
+Bodies were read from the commits, not inferred from subjects; applicability was checked
+against this tree.
+
+### Upstream `neroued/master`: 20 commits since the 2026-09-01 catch-up
+
+`5438b743` to `ad0f3d38`. Ranked by value to this fork:
+
+| Commit | What it does | Value | Merge risk |
+|---|---|---|---|
+| `a140e7ae` preserve exact agent prefix reuse (43 files) | Makes NInfer's own accepted output an exact endpoint for an unmodified replay: the Frontend detects the reconstruction boundary, the Engine carries accepted-prefix metadata, the Program commits identity atomically. Preserves JSON member order in tool schemas and tool arguments end to end. Consumes Claude Code's `x-anthropic-billing-header` System block before identity construction. Raises default shared capacity to `max(max_concurrency, 4)`. Fewer turns diverge at all, which complements the automatic anchors. | High | engine_core.h, anthropic_messages.h |
+| `b8786751` correct aliased state ownership (program_impl.h, 356 lines; 264 test lines) | Separates global physical occupancy from owner-exclusive resources and fixes borrowed-read lifetime for a Fork from a retained source. That is the path every long-anchor restore takes. | High, correctness | program_impl.h, heavy |
+| `3b50962b`, `0c5d570c`, `719d56ef` tool-call frontend | Schema-guided typed conversion of Qwen's untyped parameter text; embedded `<parameter=...>` markup preserved with fallback to content when unbalanced; structure recognition separated from normalization. Relevant to pi's tool loop. Not a repair for the `<function=command>` slip, which falls back to content by design today. | Medium | frontend, docs |
+| `550d0ac3` llama.cpp timing and prompt progress; `5f6d44e4` health reports engine readiness; `6e2786c5` readable operational logs | Each collides with a fork-local feature: our `timings` block, our `/health` port `60764d66`, our LOG-CONTRACT. Reconcile by hand. | Medium | serve, conflict-heavy |
+| `e51b585c` respect cooperative launch capacity | Sources the SM count from `DeviceContext` and keeps the 5090 route table. The generic form of the open `7afc8e17` row; our gating-proj plan hardcodes 128 SMs. | High for other Ada cards, low for the 4090 | gdn kernels |
+| `4ac73c47`, `21a0e85f`, `a2761ec1` KV cache | nvfp4 and k8v4 modes, fp16 V storage and PV compute, centralized format contracts. Ada has no FP4 tensor cores. fp16 V may move numerics and speed of every mode. | Low; bench first | same layer as our E8 modes |
+| the rest | httplib 0.54.1, dflash vision, media bench, rmsnorm and MoE perf (the 27B is dense), fixtures, funding | Low | none |
+
+### 3090 base `origin/master`: 36 commits of its own
+
+- `5820660d` sum the unsplit GDN gating projection's K reduction pairwise. Numerics:
+  `ninfer_gdn_gating_proj_test` exceeded the fp32 relative-L2 bound at T=3457 and T=4097. Our
+  `bf16_gdn_gating_proj_gemm_mma.cuh` has no pairwise reduction and differs from their post-fix
+  file. **High.** Run our test at those two T values first; port if it fails.
+- `7afc8e17` resident-CTA budget from the runtime SM count: still open. Take the upstream form
+  `e51b585c` instead.
+- `249d96c3` stop aborting startup on a device-wide memory reading: check whether our startup
+  has the same abort. Low.
+- `aea729f3` stream tool-call whitespace linearly: small. Low.
+- Everything else is MSVC and Windows portability, a NixOS flake, 3090 bench cohorts, the ECC
+  startup warning, and docs. Not applicable.
+
+### UDP `feat/rtx-4090-sm89-native`: 127 commits of its own
+
+- Already handled: `dd5206f0` (ported), `05a88712` (closed), `8488278c` and `e2556b50` (not
+  applicable), and `8bba5eb4` malformed UTF-8 repair, which this tree already has
+  (`consume_generated_utf8`, `kUtf8Replacement`).
+- `c15e0e9e` chunk KV snapshot staging into bounded page batches. Their save and restore
+  allocated one buffer the size of the whole snapshot and ran out of memory at 280K on 24 GB.
+  Our v3 serializer does not use that staging code; peak memory of a 5 GB save here is
+  unmeasured. Low. Measure before porting.
+- `5e76d11a` MTP restore stride: fixes their staging code. Our restores reuse MTP correctly in
+  production (96 to 99% reuse after restore). Not applicable unless it reproduces.
+- `378e0ad8` scale default max tokens to context size: policy; pi sets `max_tokens`. Low.
+- About 30 perf commits from 09-01 and 09-02 (small-T tensor-core routing, W8 and Q5 wave-tax
+  removal, GDN conv staging, decode grid alignment). Bench-first rule stands. Start with
+  `45a5ae57`.
+
+### Forks of this repository (13, compared against `rtx4090-port`)
+
+| Fork | Ahead | What is there | Decision |
+|---|---:|---|---|
+| xkeyC/ninfer-4090 | 5 | `69e6ae19` chunked host prefix reuse: `--host-prefix-cache-mib`, content-hashed 64-token KV page groups plus GDN state blocks stored once across branches, recency-and-frequency eviction, restore streamed to pinned staging. `14faf879` prefix cache hits in `usage`. `60a5c687` stream retained snapshot blocks. Measured: four agents rotating to 200K on a 4090 with a 20 GiB host cache, median TTFT 4.36 s against 150 s cold, 627 requests. | **High.** This addresses our "three sessions on two cells thrash" directly. About 2,000 lines on a base 177 commits behind ours: a design port, not a cherry-pick, after the upstream merge. `14faf879` alone is small and lets pi display cache hits. |
+| tensorninja/ninfer-4090 | 31 | `e3a129c3` record why a deferred continuation restore never returns: four `ContinuationDiagnostics` fields in the JSONL around the restore gate (4 files). The rest is LoRA training and a dashboard. | **High, small.** Fills our "a failed restore logs nothing" gap. Builds on their `c1e4eb1e` deferral semantics; check we have the equivalent. |
+| pxzleo/ninfer-4090-48g | 35 | A web UI (throughput charts, themes) and 48 GB card support. | Not applicable to a 24 GB card; a UI is a separate product decision. |
+| jomcgi | 2 | `chat_template_kwargs` aliases (ported as `6affed2e`), ghcr CI (declined). | Done. |
+| IronKinoko | 4 | Windows PowerShell packaging. | Not applicable. |
+| shantanusingh16 | 3 | `timings` (ported), llama-swap image, docs. | Done. |
+| pefman | 1 | A docker serve script. | No. |
+| KasoLu, aakash-chaddha, mhux2000, NeuronsReact, HermiG, MohitBurkule | 0 | | |
+
+### Siblings worth knowing about
+
+- `iamwavecut/ninfer-3090` `feat/kv-content-cache-upstream` (17 commits, 72 files, Aug 21 to 24,
+  164 behind the 3090 base): a content-addressed host KV cache with prefix and trajectory
+  restore, and coalescing of identical in-flight prompts. The same idea as xkeyC's block cache
+  on an older base. Read for design, do not port.
+- Other-hardware ports of upstream (gfx906, V100, RTX Pro 4000, Windows, C#): not applicable.
+
+### Recommended order for the next session
+
+1. Upstream catch-up merge to `ad0f3d38`. Items `a140e7ae`, `b8786751`, the tool-call trio and
+   `e51b585c` ride along; reconcile the three serve collisions by hand; bench the KV-cache
+   trio before accepting it. Same procedure as 2026-09-01: compile early, expect cluster-A
+   conflicts in engine_core.h and program_impl.h, where the A2 persistence, D2, D3 and the
+   automatic anchors all live.
+2. `5820660d`: run `ninfer_gdn_gating_proj_test` at T=3457 and T=4097 on our kernel; port if
+   it fails.
+3. tensorninja `e3a129c3` restore diagnostics.
+4. xkeyC `14faf879` cached tokens in `usage`. Evaluate the host prefix block cache as a design
+   port afterwards, with the four-agent 200K rotation as the acceptance test.
+5. The pending `fix/d1-planner-search-budget` rebase (D1b). Re-measure with the diag field
+   first: `a140e7ae` and `b8786751` may change the planner picture.
+
+## Upstream catch-up backlog (as of 2026-09-01)
+
+`neroued/master` is 16 commits ahead of the `6b94b8c5` merge target, touching 309 files,
+33 of which this fork has modified since the merge. Two clusters matter:
+
+- **Logging replatform** (`4a1a2188` spdlog foundation, `5438b743` unify product
+  operational logs). `5438b743` touches `src/serve/console_log.cpp`, `apps/serve/main.cpp`
+  and `src/serve/http_server.cpp` - the same three files the deprecation warning and the
+  `/health` fix just edited, so expect conflicts there. The log-format contract it
+  threatens is OURS, not the dashboard's: `fleet-probe` filters containers by
+  `SERVER_HINT = llama|llm|vllm|ollama|tabby`, which `ninfer-qwen38` / `ninfer-dev:runtime`
+  does not match, so magnus's logs are never parsed (its card is built from HTTP endpoints).
+  What does depend on the formats is every diagnosis this project runs: the boot
+  KV-capacity line, `[req N] done ... reuse= cache= ttft=`, and the
+  `slot save`/`slot restore`/`slot auto-save` lines that are the only production evidence
+  that persistence works.
+- **Runtime and context-cache fixes** (`da49c0d6` materialization sources excluded from
+  pressure, `3d9fda22` reuse under bounded pressure search, `5e4bf313` bounded shared
+  capture expansion, `138d76ae` resource scheduling ownership). These land in the same
+  cluster A files the A2 catalog work rewrote, so expect the merge to conflict there
+  again.
+
+Also new: `neroued/feat/kv-nvfp4-k8v4` (`1e7b5877`, nvfp4 and k8v4 KV modes). Relevant to
+the E8 non-port row below, which says to revisit if NVFP4 becomes the goal on the 5090.
+
+## Deliberate non-ports
+
+| Feature | Lives in | Decision |
+|---|---|---|
+| sm_89 attention retune (`ce50e995`) | 4090 | Architecture-specific by design |
+| E8 lattice KV modes (`c3a6e5c4`, `ec56f922`, series) | 4090 | Declined for the 5090 on 2026-08-19: 32 GB fits the full 262K context on `int8`, so E8 would buy only the decode-at-depth gain. **Revisit if NVFP4 becomes the goal**: upstream PR #35 ports E8 to sm_120a, and NVFP4 cannot reach 262K on `int8` at all. Wait for that PR to merge rather than hand-porting it. See `docs/udp-fork-comparison.md` |
+| `--vision-max-tokens` (`0c3d2bee`, `73b42127`) | 4090 | Open: the 5090 fits the legacy 32K scratchpad next to 262K + vision, so nothing forces the port |
+| Single-token W8 column-store fix (`68e2d0be`) | 4090 | Not applicable: the 5090 tree's `w8_linear_add_gemm_splitk.cu` is the upstream variant without the vulnerable tail dispatch |
+| NVFP4 weights profile | 5090 (upstream) | Ada has no FP4 tensor cores; the 4090 gates the A4 tests off instead |
+
+## Long-term direction
+
+The measured divergence between the trees is about 40 files once in-flight
+ports land: roughly half architecture-specific kernels, half platform
+configuration. The plan of record is to converge on one repository with two
+architecture profiles (`sm_89` and `sm_120a` behind a CMake switch) and retire
+the second tree to a deploy configuration. Until then, this ledger is the
+source of truth for coverage.
