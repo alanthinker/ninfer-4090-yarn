@@ -83,6 +83,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] [--auto-long-anchors N] "
+            "[--fair-share-buckets N] "
            "[--auto-anchor-spacing N] "
            "[--request-log-jsonl FILE] [--slot-save-path DIR] [--auto-save-evicted] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
@@ -120,7 +121,12 @@ std::string serve_usage_text(const char* argv0) {
            "the set is full), so raise it with --max-long-anchors-per-continuation and "
            "--host-state-slots for deeper edits; defaults to the cap and is clamped to it; "
            "0 disables (anchors then need explicit markers, which no HTTP protocol can place)\n"
-           "       --auto-save-evicted spills an involuntarily evicted session back to the "
+           "       --fair-share-buckets N reserves the most recently active N private "
+            "sessions' checkpoint sets (state images plus KV pages) against eviction by other "
+            "sessions' pressure; they stay out of pressure victim domains until a request that "
+            "fits no other way forces the engine to release them, oldest first. 0 disables; "
+            "defaults to 8\n"
+            "       --auto-save-evicted spills an involuntarily evicted session back to the "
            "slot file it was last saved to or restored from, before the eviction destroys it "
            "(requires --slot-save-path; explicit erase never auto-saves)\n"
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
@@ -288,6 +294,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--max-long-anchors-per-continuation"),
                                       "max-long-anchors-per-continuation"));
             context_capacity_explicit = true;
+        } else if (arg == "--fair-share-buckets") {
+            options.context_cache.fair_share_buckets = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--fair-share-buckets"), "fair-share-buckets"));
+            context_capacity_explicit = true;
         } else if (arg == "--auto-long-anchors") {
             options.auto_long_anchors = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--auto-long-anchors"), "auto-long-anchors"));
@@ -423,6 +433,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.context_cache.enabled                = false;
         options.context_cache.host_state_slots       = 0;
         options.context_cache.host_kv_capacity_bytes = 0;
+        options.context_cache.fair_share_buckets     = 0;
         options.auto_long_anchors                    = 0;
     }
     if (options.port <= 0 || options.port > 65535) {

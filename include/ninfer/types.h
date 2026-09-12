@@ -142,8 +142,8 @@ struct SlotAutoSaveEvent {
 
 struct ContextCacheOptions {
     // Engine resolves every optional once at construction. With C=max_concurrency, the enabled
-    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=max(C,4) and L=2;
-    // Engine::options() returns those effective values.
+    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=max(C,4), L=2 and F=8 (fair-share
+    // buckets); Engine::options() returns those effective values.
     bool enabled = true;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
     std::optional<std::uint32_t> device_state_slots;
@@ -154,6 +154,11 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
     std::optional<std::uint32_t> max_long_anchors_per_continuation;
+    // Fair-share checkpoint retention: the most recently active N private sessions are
+    // victim-protected (their checkpoints are excluded from pressure victim domains and from
+    // shared-capture pressure) until a request that fits no other way forces the engine to
+    // release them, oldest first. 0 disables protection. Only meaningful with the cache enabled.
+    std::uint32_t fair_share_buckets = 8;
 };
 
 struct ContextCostOptions {
@@ -787,6 +792,13 @@ struct MaterializationDiagnostics {
     std::uint64_t projection_work            = 0;
     std::uint64_t planning_elapsed_ns        = 0;
     std::uint64_t search_elapsed_ns          = 0;
+    // Wall-clock budget the bounded pressure search was given this planning problem (0 when no
+    // optional search ran). Diagnostic: a `time_budget` stop_reason beside a small value beside
+    // a large candidate count means the search stopped before seeing every retention closure.
+    std::uint64_t search_budget_ns           = 0;
+    // Fair-share buckets released (oldest first) before this plan became feasible; 0 means the
+    // selected plan never had to sacrifice a victim-protected session.
+    std::uint32_t fair_share_released_buckets = 0;
     MaterializationStopReason stop_reason    = MaterializationStopReason::NoPressure;
     bool budget_exhausted                    = false;
     std::uint32_t selected_degradation_units = 0;

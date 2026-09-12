@@ -249,14 +249,17 @@ public:
 
     ResourceManager(std::uint32_t lane_count, std::uint32_t private_catalog_capacity,
                     std::uint32_t shared_catalog_capacity, bool cache_enabled,
-                    std::uint32_t max_long_anchors, ContextMachineCostModel cost_model)
+                    std::uint32_t max_long_anchors, std::uint32_t fair_share_buckets,
+                    ContextMachineCostModel cost_model)
         : lane_count_(lane_count), catalog_count_(private_catalog_capacity),
           shared_catalog_count_(shared_catalog_capacity), cache_enabled_(cache_enabled),
           catalog_(private_catalog_capacity), shared_catalog_(shared_catalog_capacity),
           session_index_(private_catalog_capacity),
           prefix_index_(checked_prefix_index_capacity(private_catalog_capacity,
                                                       shared_catalog_capacity, max_long_anchors)),
-          max_long_anchors_(max_long_anchors), cost_model_(std::move(cost_model)) {
+          max_long_anchors_(max_long_anchors),
+          fair_share_buckets_(cache_enabled ? fair_share_buckets : 0),
+          cost_model_(std::move(cost_model)) {
         if (lane_count == 0 || lane_count > kMaximumConcurrency ||
             private_catalog_capacity < lane_count) {
             throw std::invalid_argument("logical resource-manager bounds are invalid");
@@ -630,6 +633,10 @@ public:
             owner_policies.reserve(catalog_count_ + shared_catalog_count_);
             checkpoint_policies.reserve(prefix_index_.size());
             capture_owner_records.reserve(catalog_count_ + shared_catalog_count_);
+            // Fair-share buckets are structurally unevictable: shared capture may demote or
+            // evict shared-pool owners but never a protected session, so the protected set is
+            // absent from the capture victim domain and the portfolio entirely.
+            const std::vector<std::uint32_t> protected_slots = fair_share_protected_slots();
             const auto append_private_checkpoint = [&](PlanningOwnerId owner, std::uint32_t slot,
                                                        const auto& checkpoint) {
                 const CatalogEntry& entry = catalog_[slot];
@@ -646,7 +653,8 @@ public:
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
                 const CatalogEntry& entry = catalog_[slot];
                 if (entry.state != CatalogState::Catalogued || !entry.handle ||
-                    private_has_active_edge(slot)) {
+                    private_has_active_edge(slot) ||
+                    is_fair_share_protected(protected_slots, slot)) {
                     continue;
                 }
                 const PlanningOwnerId owner{
@@ -744,7 +752,8 @@ public:
                     for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
                         const CatalogEntry& entry = catalog_[slot];
                         if (entry.state != CatalogState::Catalogued || !entry.handle ||
-                            private_has_active_edge(slot)) {
+                            private_has_active_edge(slot) ||
+                            is_fair_share_protected(protected_slots, slot)) {
                             continue;
                         }
                         private_owners.push_back(&*entry.handle);
@@ -1139,6 +1148,7 @@ public:
         if (entry.id == 0) { entry.id = next_continuation_id_++; }
         entry.session.reset();
         entry.retention = RetentionClass::RecentPrivate;
+        touch_activity(slot);
         assign_continuation_summary(entry.summary, summary);
         migrate_observations(entry, summary, entry.retention);
         advance_revision(entry.revision);
@@ -1307,6 +1317,9 @@ private:
         std::optional<CacheSessionKey> session;
         std::vector<CheckpointObservation> observations;
         RetentionClass retention = RetentionClass::RecentPrivate;
+        // Monotonic last-activity marker (publication, reuse hit, restore) used to rank the
+        // fair-share retention buckets most-recently-used first.
+        std::uint64_t activity_epoch = 0;
     };
 
     struct SharedCatalogEntry {
@@ -1708,6 +1721,7 @@ private:
         entry.session.reset();
         entry.observations.clear();
         entry.retention = RetentionClass::RecentPrivate;
+        entry.activity_epoch = 0;
         advance_revision(entry.revision);
     }
 
@@ -1803,9 +1817,11 @@ private:
         if (!reuse_diagnostics_enabled()) { return; }
         int accepted = 0;
         int rejected = 0;
-        std::fprintf(stderr, "reuse-diag: prompt=%u index=%zu catalog=%zu shared=%zu\n",
+        const std::vector<std::uint32_t> protected_slots = fair_share_protected_slots();
+        std::fprintf(stderr,
+                     "reuse-diag: prompt=%u index=%zu catalog=%zu shared=%zu fair=%zu\n",
                      base.summary().prompt_tokens, prefix_index_.size(), catalog_count_,
-                     shared_catalog_count_);
+                     shared_catalog_count_, protected_slots.size());
         for (const PrefixIndexEntry& index : prefix_index_) {
             if (!index.occupied) { continue; }
             const char* kind = "unknown";
@@ -1829,7 +1845,10 @@ private:
                 }
                 detail = " state=" + std::to_string(static_cast<int>(entry.state)) +
                          " edge=" + std::to_string(private_has_active_edge(index.slot) ? 1 : 0) +
-                         " anchors=" + std::to_string(entry.summary.long_anchors.size());
+                         " anchors=" + std::to_string(entry.summary.long_anchors.size()) +
+                         " fair=" +
+                         std::to_string(is_fair_share_protected(protected_slots, index.slot) ? 1
+                                                                                            : 0);
             }
             const std::optional<PrefixShortlistKey> incoming =
                 base.prefix_shortlist_key(index.key.frontier);
@@ -1861,6 +1880,54 @@ private:
         return epoch;
     }
 
+    // Fair-share retention: ranks the idle private sessions that still hold a resident
+    // checkpoint set (endpoint, rewrite or long anchor) most-recently-active first. The first
+    // `fair_share_buckets_` of them form the guaranteed buckets: while the shared pool has
+    // capacity left, their checkpoint sets (StateImages and KV pages held together as one
+    // owner) are excluded from pressure victim domains and from shared-capture pressure, so an
+    // active neighbor's churn can no longer evict an idle session's deep endpoint. A request
+    // that fits no other way forces the buckets open, oldest first (see plan_materialization).
+    [[nodiscard]] std::vector<std::uint32_t> fair_share_protected_slots() const noexcept {
+        std::vector<std::uint32_t> protected_slots;
+        if (!cache_enabled_ || fair_share_buckets_ == 0) { return protected_slots; }
+        protected_slots.reserve(std::min<std::size_t>(fair_share_buckets_, catalog_count_));
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            const CatalogEntry& entry = catalog_[slot];
+            if (entry.state != CatalogState::Catalogued || !entry.handle ||
+                private_has_active_edge(slot) || !valid_continuation_summary(entry.summary)) {
+                continue;
+            }
+            protected_slots.push_back(slot);
+        }
+        std::sort(protected_slots.begin(), protected_slots.end(),
+                  [&](std::uint32_t left, std::uint32_t right) {
+                      const std::uint64_t activity_left  = catalog_[left].activity_epoch;
+                      const std::uint64_t activity_right = catalog_[right].activity_epoch;
+                      return activity_left != activity_right
+                                 ? activity_left > activity_right
+                                 : left < right;
+                  });
+        if (protected_slots.size() > fair_share_buckets_) {
+            protected_slots.resize(fair_share_buckets_);
+        }
+        return protected_slots;
+    }
+
+    [[nodiscard]] bool is_fair_share_protected(const std::vector<std::uint32_t>& protected_slots,
+                                               std::uint32_t slot) const noexcept {
+        return std::find(protected_slots.begin(), protected_slots.end(), slot) !=
+               protected_slots.end();
+    }
+
+    // Marks the cell as the most recently active session. Publication covers the session's own
+    // requests; reuse hits and restores rank sessions that are only read from.
+    void touch_activity(std::uint32_t slot) noexcept {
+        if (slot >= catalog_count_) { return; }
+        ++activity_sequence_;
+        if (activity_sequence_ == 0) { ++activity_sequence_; }
+        catalog_[slot].activity_epoch = activity_sequence_;
+    }
+
     template <class SplitCostFn>
     [[nodiscard]] std::vector<std::uint32_t> select_materialization_shared_captures(
         Program& program, const RequestBasePlan& base, const Candidate& selected_candidate,
@@ -1877,6 +1944,9 @@ private:
 
         std::vector<ProjectedSharedCandidate> shared_candidates;
         shared_candidates.reserve(base.context_cache().opportunities.size());
+        // Fair-share buckets are structurally unevictable, so their portfolio value cannot
+        // move between the capture baseline and any target: they stay out of the fold.
+        const std::vector<std::uint32_t> protected_slots = fair_share_protected_slots();
         const std::uint32_t vacant_shared_slots = static_cast<std::uint32_t>(
             std::count_if(shared_catalog_.begin(), shared_catalog_.end(), [](const auto& entry) {
                 return entry.state == SharedCatalogState::Vacant;
@@ -1951,7 +2021,7 @@ private:
         for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
             const CatalogEntry& entry = catalog_[slot];
             if (entry.state != CatalogState::Catalogued || !entry.handle ||
-                private_has_active_edge(slot) ||
+                private_has_active_edge(slot) || is_fair_share_protected(protected_slots, slot) ||
                 (selected_candidate.private_source &&
                  slot == selected_candidate.private_source->slot)) {
                 continue;
@@ -2079,12 +2149,40 @@ private:
             });
         }
 
-        bool pressure_inputs_built       = false;
-        const auto build_pressure_inputs = [&]() -> typename Planner::PressureInputs {
-            if (pressure_inputs_built) {
-                throw std::logic_error("materialization pressure inputs requested twice");
-            }
-            pressure_inputs_built = true;
+        // Fair-share retention: the most recently active `fair_share_buckets_` idle sessions
+        // with a resident checkpoint set are victim-protected. The first planning attempt
+        // excludes the whole protected set from the pressure victim domain, so an active
+        // neighbor's churn can only evict shared-pool owners before it may touch a bucket.
+        // When the search finds no feasible target at all - even the root maximal, which
+        // releases every unprotected owner - the shared pool is exhausted: the oldest bucket
+        // is released and planning re-runs with one fewer protected session. The final
+        // attempt runs with the complete victim domain, whose root maximal target is the
+        // unbounded correctness fallback, so fair share can never make a runnable request
+        // report as blocked without every bucket having been offered up, oldest first.
+        const std::vector<std::uint32_t> protected_slots = fair_share_protected_slots();
+        std::optional<typename Planner::Result> planned;
+        std::uint32_t released_buckets = 0;
+        for (std::size_t attempt = 0;; ++attempt) {
+            const std::size_t protected_limit =
+                attempt < protected_slots.size() ? protected_slots.size() - attempt : 0;
+            released_buckets =
+                static_cast<std::uint32_t>(protected_slots.size() - protected_limit);
+            const std::vector<std::uint32_t> limited_protected(
+                protected_slots.begin(),
+                protected_slots.begin() + static_cast<std::ptrdiff_t>(protected_limit));
+            private_owners.clear();
+            private_owner_ids.clear();
+            shared_owners.clear();
+            shared_owner_ids.clear();
+            owner_records.clear();
+            owner_policies.clear();
+            checkpoint_policies.clear();
+            bool pressure_inputs_built = false;
+            const auto build_pressure_inputs = [&]() -> typename Planner::PressureInputs {
+                if (pressure_inputs_built) {
+                    throw std::logic_error("materialization pressure inputs requested twice");
+                }
+                pressure_inputs_built = true;
             private_owners.reserve(catalog_count_);
             private_owner_ids.reserve(catalog_count_);
             shared_owners.reserve(shared_catalog_count_);
@@ -2098,6 +2196,9 @@ private:
                 if (entry.state != CatalogState::Catalogued || !entry.handle ||
                     private_has_active_edge(slot)) {
                     continue;
+                }
+                if (is_fair_share_protected(limited_protected, slot)) {
+                    continue; // fair-share bucket: victim-protected this attempt
                 }
                 const PlanningOwnerId owner{.value =
                                                 static_cast<std::uint32_t>(owner_records.size())};
@@ -2313,9 +2414,14 @@ private:
                                                           provisional_demand, split_cost);
         };
 
-        std::optional<typename Planner::Result> planned =
-            planner_.plan(program, prompt, cost_model_, candidate_inputs, 0, build_pressure_inputs,
-                          logical_goal, final_schedule, planning_started);
+            planned = planner_.plan(program, prompt, cost_model_, candidate_inputs, 0,
+                                    build_pressure_inputs, logical_goal, final_schedule,
+                                    planning_started);
+            if (planned || protected_limit == 0) { break; }
+            // No feasible target while this attempt's buckets are closed: the shared pool and
+            // every unprotected owner are exhausted, so the oldest bucket is released and the
+            // planning problem re-runs with one fewer protected session.
+        }
         const auto selected_candidate =
             planned ? std::find_if(candidate_inputs.begin(), candidate_inputs.end(),
                                    [&](const typename Planner::CandidateInput& input) {
@@ -2338,6 +2444,7 @@ private:
         choice.publication_slot_               = planned->publication_slot;
         choice.selected_observation_           = candidate.selected_observation;
         choice.diagnostics_                    = planned->diagnostics;
+        choice.diagnostics_.fair_share_released_buckets = released_buckets;
         provisional_demand.selected_source_key = candidate.source_key;
         choice.demand_                         = std::move(provisional_demand);
         for (const PressureOwnerOutcome& outcome : planned->owner_outcomes) {
@@ -2566,6 +2673,9 @@ private:
             if (selected) {
                 saturating_increment(selected->selected_hit_count);
                 selected->last_hit_epoch = ++retention_epoch_;
+                if (!record.selected_observation->shared) {
+                    touch_activity(record.selected_observation->slot);
+                }
             }
         }
     }
@@ -3138,6 +3248,7 @@ private:
         publication.id            = next_continuation_id_++;
         publication.session       = record->session;
         publication.retention     = record->retention;
+        touch_activity(record->publication_slot);
         advance_revision(publication.revision);
         if (publication.id == 0) { publication.id = next_continuation_id_++; }
 
@@ -3615,6 +3726,9 @@ private:
     std::vector<CheckpointObservation> observation_scratch_;
     std::vector<PrefixDemandRecord> demand_window_;
     std::uint32_t max_long_anchors_ = 0;
+    // Number of most-recently-active private sessions whose checkpoints are victim-protected;
+    // 0 disables fair-share protection. Force-zeroed when the cache is disabled.
+    std::uint32_t fair_share_buckets_ = 0;
     std::array<ActiveEntry, kMaximumConcurrency> active_{};
     using ContextTransaction =
         std::variant<std::monostate, MaterializationRecord, ActiveCaptureRecord>;
@@ -3629,6 +3743,7 @@ private:
     std::uint64_t next_shared_prefix_id_ = 1;
     std::uint64_t retention_epoch_       = 0;
     std::uint64_t demand_epoch_          = 0;
+    std::uint64_t activity_sequence_     = 0;
 };
 
 } // namespace ninfer::runtime

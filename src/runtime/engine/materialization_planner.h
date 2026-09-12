@@ -322,22 +322,35 @@ public:
         }
 
         const Clock::time_point search_started = Clock::now();
-        // The budget bounds admission-time planning work; the relative term binds ordinary plans and
-        // this cap only has to leave room for a plan whose reuse is worth minutes of prefill. 5 ms
-        // starved a production case on 2026-09-11: a 579k-token prompt with one offered 224k reuse
-        // candidate assessed no target at all, stopped on TimeBudget, and returned the maximal-drop
-        // incumbent - discarding a prefix the cost model prices about 240 s cheaper to reuse. This
-        // machine also assesses targets far more slowly than the one the 5 ms was calibrated on.
+        // The budget bounds admission-time planning work. The relative term binds ordinary
+        // plans; the cap only has to leave room for a plan whose reuse is worth minutes of
+        // prefill. The floor and the per-candidate floor guarantee that every candidate's
+        // retention closure is seeded even on machines whose exact target assessment is slow
+        // relative to the prefill cost model: the pre-scale budget (5 ms, later
+        // incumbent-cost/20) starved the 2026-09-11 579k-token production case of every
+        // assessment, and on 2026-09-12 a 201k-token prompt with 60+ indexed candidates
+        // stopped on TimeBudget after a fraction of them because the budget scaled with
+        // incumbent prefill cost only, which this machine prices far below its actual
+        // assessment time. Planning time is charged against the prefill it is trying to
+        // avoid, so a budget worth a fraction of that recompute is a favorable trade; the
+        // cap bounds the worst case at two minutes of planning latency.
+        const std::uint64_t per_candidate_assessment_ns = 500'000ULL;
+        const std::uint64_t candidate_floor_ns = candidates.size() * per_candidate_assessment_ns;
         const std::uint64_t search_budget_ns =
-            std::min<std::uint64_t>(50'000'000ULL, incumbent.cost.total_ns / 20U);
-        // The directed pass that walks each candidate's own guidance to its retention closure keeps
-        // the original small window: it is the cheap part of planning, and letting it run for the
-        // whole search budget turned it into a breadth-first walk of every alternative on the way
-        // (a 7-owner pressure case then assessed more than twice the targets its closure needs).
-        // The larger budget above is for the best-first phase, which is what the 579k-token
-        // production case was starving on.
+            std::min<std::uint64_t>(90'000'000ULL,
+                                    std::max<std::uint64_t>(15'000'000ULL,
+                                                             std::max(incumbent.cost.total_ns /
+                                                                          20U,
+                                                                      candidate_floor_ns)));
+        // The directed pass seeds each candidate's own retention closure, one candidate per
+        // iteration, so its window scales per candidate at the same rate; after it spends the
+        // window, the best-first phase evaluates whatever remains within the full budget.
+        // Capping it at the search budget keeps the pass from turning into a breadth-first
+        // walk of every alternative on the way (a 7-owner pressure case once assessed more
+        // than twice the targets its closure needed).
         const std::uint64_t guided_watchdog_ns =
-            std::min<std::uint64_t>(5'000'000ULL, search_budget_ns);
+            std::min(search_budget_ns,
+                     std::max<std::uint64_t>(5'000'000ULL, candidate_floor_ns));
         std::uint64_t maximum_step_ns          = 0;
         std::uint32_t optional_targets         = 0;
         std::uint32_t guided_assessments       = 0;
@@ -677,7 +690,8 @@ public:
 
         MaterializationDiagnostics diagnostics = make_diagnostics(
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
-            stop_reason, budget_exhausted, incumbent.degradation_units, incumbent.root_maximal);
+            search_budget_ns, stop_reason, budget_exhausted, incumbent.degradation_units,
+            incumbent.root_maximal);
         diagnostics.best_reuse_prompt_tokens = best_offered_reuse(candidates);
         diagnostics.best_reuse_feasible      = best_reuse_feasible;
         diagnostics.best_reuse_rejection =
@@ -1247,15 +1261,15 @@ private:
                          std::uint64_t projection_work, Clock::time_point planning_started,
                          MaterializationStopReason reason, bool maximal_fallback) noexcept {
         return make_diagnostics(cost, targets_evaluated, projection_work, planning_started, 0,
-                                reason, false, 0, maximal_fallback);
+                                0, reason, false, 0, maximal_fallback);
     }
 
     [[nodiscard]] static MaterializationDiagnostics
     make_diagnostics(const FoldedCost& cost, std::uint32_t targets_evaluated,
                      std::uint64_t projection_work, Clock::time_point planning_started,
-                     std::uint64_t search_elapsed_ns, MaterializationStopReason reason,
-                     bool budget_exhausted, std::uint32_t degradation_units,
-                     bool maximal_fallback) noexcept {
+                     std::uint64_t search_elapsed_ns, std::uint64_t search_budget_ns,
+                     MaterializationStopReason reason, bool budget_exhausted,
+                     std::uint32_t degradation_units, bool maximal_fallback) noexcept {
         return MaterializationDiagnostics{
             .predicted_now_ns           = cost.now_ns,
             .predicted_future_loss_ns   = cost.future_loss_ns,
@@ -1264,6 +1278,7 @@ private:
             .projection_work            = projection_work,
             .planning_elapsed_ns        = elapsed_ns(planning_started, Clock::now()),
             .search_elapsed_ns          = search_elapsed_ns,
+            .search_budget_ns           = search_budget_ns,
             .stop_reason                = reason,
             .budget_exhausted           = budget_exhausted,
             .selected_degradation_units = degradation_units,

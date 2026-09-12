@@ -942,7 +942,45 @@ target 必须先建立 replacement，或同时删除该 checkpoint。
 Placement 只在 admission、capture、finish 或显式 inactive release 的 resource boundary 改变。普通 decode
 不运行周期性 promotion/demotion。
 
-### 10.2 Session ordering
+### 10.2 Fair-share retention（保底桶）
+
+retention class 的 prior 只能影响可行 target 之间的取舍，无法阻止容量不足时唯一可行的 victim
+选择——一个空闲会话的深度端点仍会被活跃邻居的 churn 整段释放（2026-09-12 生产事故：空闲
+155k 会话在邻居 76 分钟增长/压缩 churn 中 0% 命中）。公平份额保留用结构性保护补上这一层：
+
+1. ResourceManager 为每个 catalogued private continuation 维护 last-activity epoch
+   （publication、reuse hit、restore 时推进）；
+2. 没有 active edge 且仍持有 checkpoint 集合的会话按 MRU 排序，前
+   `fair_share_buckets` 个（配置轴，默认 8，0 禁用）构成保底桶；
+3. 保底桶 owner 的 checkpoint 集合（StateImage 与 KV 页随 owner 一体）从 materialization
+   pressure 的 victim domain、shared-capture pressure domain 与 shared-capture portfolio
+   中整体缺席——价值模型永远看不到它们，因此任何压力目标都无法驱逐；
+4. 当共享池与全部未保护 owner 耗尽、连 root maximal 都不可行时，`plan_materialization`
+   释放最老的保底桶并整体重规划，直至请求可行或全部桶释放完毕；最后一次尝试运行于完整
+   victim domain，其 root maximal target 即无界 correctness fallback，因此保底桶永远不会
+   把一个本可运行的请求误判为 blocked；
+5. 释放桶只影响该次规划的 victim 域；会话的下一次活动会重新进入 MRU 排序。桶被释放后
+   会话被驱逐时，既有 eviction/spill 观察器照常生效。
+
+保底桶是硬保证，与 retention weight 的软排序正交：weight 决定“可行时牺牲谁”，保底桶决定
+“谁不可被牺牲”。
+
+### 10.3 规划器时间预算
+
+materialization 的有界压力搜索使用随候选规模缩放的墙钟预算：
+
+```text
+search_budget = min(90 s, max(15 s, incumbent 成本 / 20, 候选数 × 500 ms))
+guided window = min(search_budget, max(5 ms, 候选数 × 500 ms))
+```
+
+固定小窗口会在精确评估较慢的机器上漏掉大量候选的 retention closure（2026-09-11 的 579k
+token 生产案例、2026-09-12 的 201k token / 60+ 候选案例均撞顶）。规划时间计在它所试图避免
+的重算成本上，因此“候选数 × 单候选评估费率”是自然尺度；90 s 上限约束最坏 TTFT。诊断
+（`MaterializationDiagnostics.search_budget_ns` 与 done 行 `budget` 字段）用于核对
+`time_budget` 停止时是否真的评完了全部候选。
+
+### 10.4 Session ordering
 
 SessionKey 属于 ResourceManager，只提供 candidate lookup 与 binding。Program 不读取 SessionKey。
 
@@ -956,7 +994,7 @@ SessionKey 属于 ResourceManager，只提供 candidate lookup 与 binding。Pro
 
 Capability generation 判断 handle 是否仍有效，publication order 判断哪个完成结果更新 session；两者职责不同。
 
-### 10.3 Logical publication capacity
+### 10.5 Logical publication capacity
 
 ResourceManager 必须在 Program mutation 前预留 active/private/shared destination slot。Program commit 后的
 logical adoption 不再扩容或搜索 slot。
@@ -978,6 +1016,7 @@ terminal Finish 没有合法 publication capacity 时采用 Discard。
 | `max_private_continuations` | private owner/catalog 容量 |
 | `max_shared_prefixes` | shared immutable owner/catalog 容量 |
 | `max_long_anchors_per_continuation` | 每条 private history 的 retained long checkpoints 上限 |
+| `fair_share_buckets` | 保底桶数：按 MRU 顺序对空闲 private 会话 checkpoint 集合做硬 victim 保护的数量（默认 8，0 禁用；cache 禁用时强制 0） |
 
 所有 stores、catalogs、Program unique-object scratch 和 reusable planner frontiers 都按解析后的上限建立。
 每个 pressure planning session 的 target arena、hash 和 assessment storage 在 session 开始时按固定上限取得
@@ -1021,6 +1060,9 @@ Context cache disabled 时采用 root-only 语义：不读取或发布 inactive 
     saving。
 17. Candidate selection 不是资源预留；实际 capture target 必须在 frontier 到达后按当前 revision 重新
     证明完整物理终态。
+18. Fair-share 保底桶只改变哪些 owner 进入 pressure victim domain；最后一次规划运行于完整 victim
+    domain，因此保底桶永远不能把本可运行的请求判为 blocked，只会在共享池耗尽时按 MRU 顺序
+    让最老桶依次让出容量。
 
 ---
 

@@ -60,7 +60,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
             (cache.max_private_continuations && *cache.max_private_continuations != concurrency) ||
             (cache.max_shared_prefixes && *cache.max_shared_prefixes != 0) ||
             (cache.max_long_anchors_per_continuation &&
-             *cache.max_long_anchors_per_continuation != 0)) {
+             *cache.max_long_anchors_per_continuation != 0) ||
+            cache.fair_share_buckets != 0) {
             throw std::invalid_argument("disabled context cache accepts only root-only capacities");
         }
         cache.device_state_slots                = 0;
@@ -69,6 +70,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         cache.max_private_continuations         = concurrency;
         cache.max_shared_prefixes               = 0;
         cache.max_long_anchors_per_continuation = 0;
+        cache.fair_share_buckets                = 0;
         return options;
     }
 

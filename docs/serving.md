@@ -884,6 +884,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
 | `--auto-long-anchors N` | propose a private long anchor at each of the last N message boundaries of every prompt; clamped to the anchor limit, `0` disables | anchor limit |
 | `--auto-anchor-spacing N` | also propose a private long anchor at the first message boundary at or after every N tokens of the prompt, so a divergence in the middle of a long history resumes nearby instead of from token zero; `0` disables | `0` |
+| `--fair-share-buckets N` | most recently active N idle private sessions are victim-protected: their checkpoint sets (state images plus KV pages) cannot be evicted by other sessions' pressure; a request that fits no other way releases them oldest first; `0` disables | `8` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
@@ -912,6 +913,19 @@ symptom is a deep session whose `cache` hit keeps collapsing to a shallower pref
 tens of thousands of tokens per turn. Raising `--host-state-slots` is the cheap fix (pinned RAM,
 about 147 MiB per slot); lowering `--max-long-anchors-per-continuation` costs about 147 MiB per
 session per anchor and gives up the deeper recovery points.
+
+The two capacity axes above size what can be resident; `--fair-share-buckets` decides who keeps a
+place when it cannot all fit. The most recently active N idle sessions are victim-protected against
+other sessions' pressure, so a chatty neighbor growing and compacting for an hour no longer evicts
+an idle session's deep endpoint out of the shared pool (the 2026-09-12 incident: an idle 155k
+session returned 0% after its neighbor's churn, then paid a full 3m40s re-prefill on return).
+Protection is structural, not a value-weight hint: protected checkpoints are absent from the
+pressure victim domain entirely. When the shared pool and every unprotected owner are exhausted and
+even the maximal plan does not fit, the engine releases the oldest protected bucket and replans,
+oldest first, so a request that fits only by giving up a bucket still runs. The cost is that a
+single very large active session can borrow less of the pool while many buckets are full: the
+cut is the cheapest shallow anchors of shared-pool owners, and endpoint/tail-anchor reuse of the
+active session itself is unaffected.
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |
 | `--top-k N` | process-level top-k override (`0..20`; zero selects the top-20 cap) | unset |

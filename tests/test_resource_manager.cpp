@@ -1799,9 +1799,10 @@ struct FakePackage {
 using FakeManager = ninfer::runtime::ResourceManager<FakePackage>;
 
 FakeManager make_manager(std::uint32_t lanes = 1, std::uint32_t private_capacity = 4,
-                         std::uint32_t shared_capacity = 0, bool cache_enabled = true) {
+                         std::uint32_t shared_capacity = 0, bool cache_enabled = true,
+                         std::uint32_t fair_share_buckets = 8) {
     return FakeManager(lanes, private_capacity, shared_capacity, cache_enabled, 2,
-                       test_cost_model());
+                       fair_share_buckets, test_cost_model());
 }
 
 struct ActiveRequest {
@@ -2994,7 +2995,9 @@ void test_shared_fanout_keeps_owner_edges_live_across_summary_refresh() {
 }
 
 void test_shared_capture_combines_two_pressure_owners() {
-    FakeManager manager = make_manager(1, 4, 1);
+    // Capture pressure against private owners: fair-share protection off, the bucket behavior
+    // is covered by test_fair_share_capture_pressure_cannot_touch_protected_sessions.
+    FakeManager manager = make_manager(1, 4, 1, true, 0);
     FakeProgram program;
     const ActiveRequest first = start_active(manager, program, 41, make_base(41), 1);
     (void)finish_active(manager, program, first);
@@ -3036,7 +3039,8 @@ void test_shared_capture_combines_two_pressure_owners() {
 }
 
 void test_aborted_shared_capture_start_rolls_back_logical_claims() {
-    FakeManager manager = make_manager(1, 4, 1);
+    // Fair-share protection off: this fixture verifies claim rollback, not bucket behavior.
+    FakeManager manager = make_manager(1, 4, 1, true, 0);
     FakeProgram program;
     const ActiveRequest first = start_active(manager, program, 141, make_base(141), 1);
     (void)finish_active(manager, program, first);
@@ -3085,7 +3089,8 @@ void test_aborted_shared_capture_start_rolls_back_logical_claims() {
 }
 
 void test_capture_result_is_validated_before_any_adoption() {
-    FakeManager manager = make_manager(1, 4, 1);
+    // Fair-share protection off: this fixture verifies result validation, not bucket behavior.
+    FakeManager manager = make_manager(1, 4, 1, true, 0);
     FakeProgram program;
     const ActiveRequest first = start_active(manager, program, 241, make_base(241), 1);
     (void)finish_active(manager, program, first);
@@ -3128,7 +3133,8 @@ void test_capture_result_is_validated_before_any_adoption() {
 }
 
 void test_capture_result_is_adopted_by_owner_identity() {
-    FakeManager manager = make_manager(1, 4, 1);
+    // Fair-share protection off: this fixture verifies adoption identity, not bucket behavior.
+    FakeManager manager = make_manager(1, 4, 1, true, 0);
     FakeProgram program;
     const ActiveRequest first = start_active(manager, program, 251, make_base(251), 1);
     (void)finish_active(manager, program, first);
@@ -3290,6 +3296,78 @@ void test_shortlist_collision_requires_program_exact_verification() {
             "shortlist collision bypassed Program exact identity verification");
 }
 
+// 2026-09-12 17:09 incident class: an idle deep session lost its endpoint to an active
+// neighbor's growth/compaction churn and paid a full re-prefill on return. With the default
+// fair-share buckets, both idle sessions here are victim-protected, so a request whose
+// pressure only closes by evicting one of them must first find nothing (both protected),
+// then release exactly the OLDEST bucket: the MRU session's endpoint survives the churn.
+void test_fair_share_releases_oldest_bucket_only_when_shared_pool_exhausted() {
+    FakeManager manager = make_manager(1, 4); // default fair_share_buckets = 8
+    FakeProgram program;
+    const ActiveRequest older = start_active(
+        manager, program, 401,
+        make_base(401, FakeCacheSessionKey{401}, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, older);
+    const ActiveRequest newer = start_active(
+        manager, program, 402,
+        make_base(402, FakeCacheSessionKey{402}, RetentionClass::LiveSession), 2);
+    (void)finish_active(manager, program, newer);
+
+    // One pressure action is required and only an owner eviction can provide it: with both
+    // sessions in the protected set the first planning pass has an empty victim domain and
+    // must return nothing instead of evicting the MRU session.
+    program.required_pressure_actions = 1;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{403}, make_base(403), 3);
+    require(inspection.choice.has_value(),
+            "shared-pool exhaustion did not reach the oldest-bucket release path");
+
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                          FakePreparedPrompt{403}, {});
+    require(program.started_action_ids.size() == 1 &&
+                program.started_action_ids.front() == 1000U + older.sequence.id,
+            "bucket release sacrificed a session other than the oldest protected one");
+    require(manager.catalog_state(1) == FakeManager::CatalogState::Catalogued,
+            "MRU bucket lost its endpoint to a neighbor's pressure");
+}
+
+// Fair-share protection must hold on the capture path as well: a shared-capture offer whose
+// only feasible target would consume a protected session's checkpoint set falls back to the
+// private baseline / skip instead of evicting the bucket.
+void test_fair_share_capture_pressure_cannot_touch_protected_sessions() {
+    FakeManager manager = make_manager(1, 4, 1); // default fair_share_buckets = 8
+    FakeProgram program;
+    const ActiveRequest idle = start_active(
+        manager, program, 411,
+        make_base(411, FakeCacheSessionKey{411}, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, idle);
+
+    FakeRequestBasePlan request = make_base(412);
+    request.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .frontier = 64,
+    });
+    const ActiveRequest active           = start_active(manager, program, 412, request, 2);
+    program.required_pressure_actions    = 1;
+    program.pressure_action_immediate_ns = 0;
+    program.capture_assessment           = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = 412, .frontier = 64},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_shared       = true,
+        .physically_feasible    = false,
+    };
+
+    const auto reserved =
+        manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 11}, 0, {});
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Skipped,
+            "shared capture pressure tried to consume a fair-share bucket");
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "protected session was claimed for a shared-capture pressure target");
+    (void)finish_active(manager, program, active);
+}
+
 } // namespace
 
 int main() {
@@ -3359,6 +3437,10 @@ int main() {
     run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
     run_test("shortlist exact verification",
              test_shortlist_collision_requires_program_exact_verification);
+    run_test("fair-share oldest bucket release",
+             test_fair_share_releases_oldest_bucket_only_when_shared_pool_exhausted);
+    run_test("fair-share capture protection",
+             test_fair_share_capture_pressure_cannot_touch_protected_sessions);
     if (failures != 0) { return 1; }
     std::cout << "ok\n";
     return 0;
