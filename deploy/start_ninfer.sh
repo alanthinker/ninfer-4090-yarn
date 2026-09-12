@@ -64,21 +64,33 @@ DEFAULT_EFFORT="${NINFER_DEFAULT_EFFORT:-medium}"
 # RSS 36.57 GiB、显存 30,966 MiB 在 N=4/8/32/64 下完全相同), 所以默认给足 32。
 AUTO_ANCHORS="${NINFER_AUTO_LONG_ANCHORS:-32}"
 MAX_ANCHORS="${NINFER_MAX_LONG_ANCHORS:-64}"
+# 同时保留的续算条目数(每个会话链一份端点/rewrite)。8 时,5~6 条会话每次发布都挤同一个
+# 上限,容易把别的会话的深度端点顶掉;16 给多会话留出余量。真正的上限是 Host KV 池
+# (32 GiB ≈ 188 万 token),条目再多也超不过它。
+PRIVATE_CONTINUATIONS="${NINFER_MAX_PRIVATE_CONTINUATIONS:-16}"
 # 共享前缀目录容量。引擎自己对每个 prompt 提出三个候选: 「全部 tools 之后」「连续 leading
 # System/Developer 之后」「full prompt」——第二个就是所有会话都相同的系统提示词末尾。
 # 但这些是 EngineStructural 证据, 按设计 (docs/maintainer/resource-scheduling-and-context-cache.md
 # §7.2) 只能用"不降低现有 owner 的空余终态", 默认容量只有 max(并发,4)=4, 容易被占满而发布不出去。
-SHARED_PREFIXES="${NINFER_MAX_SHARED_PREFIXES:-4}"
+SHARED_PREFIXES="${NINFER_MAX_SHARED_PREFIXES:-8}"
 # Host StateImage 槽位数。每个 checkpoint(会话端点 1 个 + 每个长锚点 1 个)都要独占一张
 # GDN 递归状态快照,147 MiB,而且它一旦没有 device/host 副本,该 checkpoint 就按设计不可用
 # —— 即使它的 KV 页还在显存里。所以槽位数不足时,症状是"深度端点反复消失、命中退化到浅的
 # 共享前缀、每轮重算几万 token",而不是报错。
-#   Host 槽位需求 ≈ 并发保留的会话数 x (2 + AUTO_ANCHORS) + 活跃 lane 的余量
-#   160 槽 ≈ 23.5 GiB 常驻(在 32 GiB host KV 之外),够 4~5 个长会话用满 32 个锚点
-#   内存不够就减小 AUTO_ANCHORS(每减 8 个锚点省 ~1.2 GiB/会话)
-# 注意 device_state_slots 只有 4(加 4 个活跃 lane);深度端点绝大多数时候待在 host 槽里,
-# 所以这个数字才是长会话能不能"睡下去再醒来"的关键。
-HOST_STATE_SLOTS="${NINFER_HOST_STATE_SLOTS:-160}"
+#   Host 槽位需求 ≈ 并发保留的会话数 x (2 + 尾部锚点 + 铺开锚点) + 活跃 lane 的余量
+#   实测 2026-09-12:一条 278k 会话在 07:58-08:03 全热(100%/99.9%),08:25 再发时目录里只剩
+#   26 个 checkpoint、它自己的深度工件一个都不剩,只能从 token 0 重算 —— 同一时刻按
+#   "5 个会话 x (2 + 32 尾部 + 8~10 铺开) ≈ 165" 已经越过当时 160 槽的上限,引擎按策略
+#   把 checkpoint 释放掉了。所以这里按"这台机器专职跑这个"给足:
+#   320 槽 ≈ 46 GiB 常驻(在 32 GiB host KV 之外),够 6~7 个长会话同时保住全套锚点。
+#   内存账(本机 91.9 GiB):host state 46 + host KV 32 + 引擎自身 ≈ 80 GiB,余 ~11 GiB;
+#   跑别的重活(第二个引擎实例、大编译)之前先把这个数降下来,或用
+#   NINFER_HOST_STATE_SLOTS=256 临时跑。
+# device_state_slots 默认只有 4:那是"活跃 lane 之外还能在显存里留住几个 checkpoint"的额度,
+# 深度端点绝大多数时候待在 host 槽里,所以 host 槽位数才是长会话能不能"睡下去再醒来"的关键;
+# 显存侧留 8 个(4 x 147 MiB ≈ 0.6 GiB)让 restore 不必等 lane 空出来。
+HOST_STATE_SLOTS="${NINFER_HOST_STATE_SLOTS:-320}"
+DEVICE_STATE_SLOTS="${NINFER_DEVICE_STATE_SLOTS:-8}"
 # 自动长锚点的"铺开"间隔(token)。除了上面"最后 N 个消息边界"的窗口(服务于最近编辑),
 # 再在整个 prompt 上每隔 N 个 token 放一个锚点,对齐到其后的第一个消息边界。
 # 为什么需要:会话压缩(compaction)会保留末尾一小段逐字内容、丢掉中间,并把摘要指令接在切割点
@@ -171,7 +183,8 @@ setsid nohup "$BIN" "$MODEL" \
   "${YARN_ARGS[@]}" \
   --host-kv-mib 32768 \
   --host-state-slots "$HOST_STATE_SLOTS" \
-  --max-private-continuations 8 \
+  --device-state-slots "$DEVICE_STATE_SLOTS" \
+  --max-private-continuations "$PRIVATE_CONTINUATIONS" \
   --max-shared-prefixes "$SHARED_PREFIXES" \
   --max-long-anchors-per-continuation "$MAX_ANCHORS" \
   --auto-long-anchors "$AUTO_ANCHORS" \
