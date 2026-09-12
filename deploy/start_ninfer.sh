@@ -86,11 +86,14 @@ SHARED_PREFIXES="${NINFER_MAX_SHARED_PREFIXES:-8}"
 #   内存账(本机 91.9 GiB):host state 46 + host KV 32 + 引擎自身 ≈ 80 GiB,余 ~11 GiB;
 #   跑别的重活(第二个引擎实例、大编译)之前先把这个数降下来,或用
 #   NINFER_HOST_STATE_SLOTS=256 临时跑。
-# device_state_slots 默认只有 4:那是"活跃 lane 之外还能在显存里留住几个 checkpoint"的额度,
-# 深度端点绝大多数时候待在 host 槽里,所以 host 槽位数才是长会话能不能"睡下去再醒来"的关键;
-# 显存侧留 8 个(4 x 147 MiB ≈ 0.6 GiB)让 restore 不必等 lane 空出来。
+# device_state_slots 保持 4(引擎缺省):那是"活跃 lane 之外还能在显存里留住几个 checkpoint"的额度,
+# 深度端点绝大多数时候待在 host 槽里,所以 host 槽位数才是长会话能不能"睡下去再醒来"的关键。
+# 实测 2026-09-12:改成 8 时启动直接被拒 ——
+#   "minimum Engine runtime reservation requires 14869674752 B + 1 GiB headroom,
+#    but only 15329323520 B are available after weights"
+# 差的 0.57 GiB 正好是 4 x 147 MiB。weights 之后的可用显存只有 ~15.3 GB,没有余量再加槽位。
 HOST_STATE_SLOTS="${NINFER_HOST_STATE_SLOTS:-320}"
-DEVICE_STATE_SLOTS="${NINFER_DEVICE_STATE_SLOTS:-8}"
+DEVICE_STATE_SLOTS="${NINFER_DEVICE_STATE_SLOTS:-4}"
 # 自动长锚点的"铺开"间隔(token)。除了上面"最后 N 个消息边界"的窗口(服务于最近编辑),
 # 再在整个 prompt 上每隔 N 个 token 放一个锚点,对齐到其后的第一个消息边界。
 # 为什么需要:会话压缩(compaction)会保留末尾一小段逐字内容、丢掉中间,并把摘要指令接在切割点
