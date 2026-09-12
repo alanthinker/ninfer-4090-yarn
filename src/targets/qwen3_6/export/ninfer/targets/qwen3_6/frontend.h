@@ -21,9 +21,11 @@ struct FrontendOptions {
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
-    // Vision scratchpad token capacity. This fork keeps the legacy 32K scratchpad next to the
-    // full 262K context, so the cap stays configurable. Zero derives the cap from max_context;
-    // production paths normalize an unset value to 8192 in startup_features.h.
+    // Per-item Vision scratchpad token capacity: the largest merged-token count of one
+    // image/video item that the Vision encode workspace and handoff cover (hard bound 16,384).
+    // Aggregate Vision load per prompt is bounded by context/KV capacity and the media
+    // live-byte budget, not by this value. Zero derives the bound from max_context; production
+    // paths normalize an unset value to 8192 in startup_features.h.
     std::uint32_t vision_max_tokens = 0;
 };
 

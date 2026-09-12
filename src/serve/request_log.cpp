@@ -312,8 +312,7 @@ Json arena_json(const ninfer::ArenaMemorySummary& arena) {
 
 Json vision_workspace_json(const std::optional<ninfer::VisionWorkspaceMemorySummary>& vision) {
     if (!vision) { return nullptr; }
-    return Json{{"aggregate_prompt_tokens", vision->aggregate_prompt_tokens},
-                {"max_item_tokens", vision->max_item_tokens},
+    return Json{{"max_item_tokens", vision->max_item_tokens},
                 {"general_capacity_bytes", vision->general_capacity_bytes},
                 {"encode_peak_bytes", vision->encode_peak_bytes},
                 {"handoff_offset_bytes", vision->handoff_offset_bytes},

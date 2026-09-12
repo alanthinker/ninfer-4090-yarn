@@ -19,11 +19,10 @@ struct ToolCallOutputContract;
 
 inline constexpr std::size_t kPreparedVisionPatchFeatures = 3ULL * 2ULL * 16ULL * 16ULL;
 inline constexpr std::uint64_t kRawPatchesPerVisionToken  = 4;
-// Aggregate prompt capacity and one-item execution capacity are intentionally distinct. Multiple
-// media items are retained by one prepared prompt but pass through the Vision tower sequentially.
-inline constexpr std::uint64_t kMaximumPromptVisionTokens = 32'768;
-inline constexpr std::uint64_t kMaximumPromptVisionRawPatches =
-    kMaximumPromptVisionTokens * kRawPatchesPerVisionToken;
+// There is deliberately no aggregate per-prompt Vision token budget. A prepared prompt retains
+// every media item, but the Vision tower passes through them one at a time (the handoff holds a
+// single item), and tokens already served from a reused prefix are never re-encoded. Aggregate
+// Vision load is bounded by the prompt's context/KV capacity and the media live-byte account.
 inline constexpr std::uint64_t kMaximumVisionItemTokens = 16'384;
 inline constexpr std::uint64_t kMaximumVisionItemRawPatches =
     kMaximumVisionItemTokens * kRawPatchesPerVisionToken;

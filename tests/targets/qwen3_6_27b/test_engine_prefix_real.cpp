@@ -2203,7 +2203,7 @@ int verify_loaded_product(const ninfer::Engine& engine, std::string_view expecte
         memory.sequence.capacity_bytes == 0 || memory.sequence.used_bytes == 0 ||
         memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
         memory.workspace.capacity_bytes == 0 || vision == nullptr ||
-        vision->aggregate_prompt_tokens != 4096 || vision->max_item_tokens != 4096 ||
+        vision->max_item_tokens != 4096 ||
         vision->general_capacity_bytes == 0 || vision->encode_peak_bytes == 0 ||
         vision->handoff_offset_bytes > memory.workspace.capacity_bytes ||
         vision->handoff_capacity_bytes == 0 ||

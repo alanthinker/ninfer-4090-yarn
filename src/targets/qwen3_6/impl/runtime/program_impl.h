@@ -12539,8 +12539,6 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
                                        std::max(work.peak_used(), workspace_logical_peak_bytes)};
     if (workspace_plan.vision) {
         out.vision_workspace = VisionWorkspaceMemorySummary{
-            .aggregate_prompt_tokens = static_cast<std::uint32_t>(
-                std::min<std::uint64_t>(capacity, kMaximumPromptVisionTokens)),
             .max_item_tokens        = workspace_plan.vision->max_merged_tokens,
             .general_capacity_bytes = workspace_plan.vision->general_capacity_bytes,
             .encode_peak_bytes      = workspace_plan.vision->encode_peak_bytes,

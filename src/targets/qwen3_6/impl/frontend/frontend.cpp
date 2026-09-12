@@ -925,22 +925,28 @@ public:
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
-        // The vision encode workspace is sized to vision_max_tokens; keep the processor
-        // budget in lockstep so oversized media fails as MediaBudgetExceeded before it
-        // reaches the encoder. Zero leaves the cap derived from max_context.
-        std::uint64_t vision_tokens =
-            std::min<std::uint64_t>(options.max_context, kMaximumPromptVisionTokens);
+        // The Vision encode workspace and handoff cover ONE item at a time (items pass through
+        // the tower sequentially and the handoff is retired after each), so the processor's
+        // per-item budget must stay in lockstep with that workspace: the larger of the two
+        // would let the frontend admit an item the encoder cannot execute. There is no
+        // aggregate per-prompt Vision budget - reuse skips re-encoding cached items, and the
+        // prompt's total Vision load is bounded by context/KV capacity plus the media
+        // live-byte account. A zero --vision-max-tokens leaves the item cap at the 16K bound.
+        std::uint64_t item_tokens =
+            std::min<std::uint64_t>(options.max_context, kMaximumVisionItemTokens);
         if (options.vision_max_tokens > 0) {
-            vision_tokens = std::min<std::uint64_t>(vision_tokens, options.vision_max_tokens);
+            item_tokens = std::min<std::uint64_t>(item_tokens, options.vision_max_tokens);
         }
-        processor.max_vision_tokens = vision_tokens;
-        processor.max_raw_patches   = vision_tokens * kRawPatchesPerVisionToken;
+        processor.item_max_vision_tokens  = item_tokens;
+        processor.item_max_raw_patches    = item_tokens * kRawPatchesPerVisionToken;
+        processor.media_live_capacity_bytes = options.media_live_bytes;
         if (vision_enabled) {
             const std::uint64_t minimum_live =
-                processor.max_raw_patches * kPreparedVisionPatchFeatures * sizeof(std::uint16_t);
+                processor.item_max_raw_patches *
+                kPreparedVisionPatchFeatures * sizeof(std::uint16_t);
             if (minimum_live > options.media_live_bytes) {
                 throw std::invalid_argument(
-                    "media live-byte capacity cannot hold the maximum supported Vision prompt");
+                    "media live-byte capacity cannot hold a maximum-size Vision item");
             }
             media_cache = std::make_shared<fi::MediaPreprocessCache>(
                 options.media_cache_bytes, options.media_live_bytes,

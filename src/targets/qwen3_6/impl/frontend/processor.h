@@ -91,11 +91,19 @@ struct ProcessorOptions {
     std::uint64_t max_decoded_video_pixels = 128ULL * 1024ULL * 1024ULL;
     int max_video_source_frames            = 100'000;
     double max_video_duration_seconds      = 600.0;
-    std::uint64_t max_raw_patches          = kMaximumPromptVisionRawPatches;
-    std::uint64_t max_vision_tokens        = kMaximumPromptVisionTokens;
-    double video_fps                       = 2.0;
-    int video_min_frames                   = 4;
-    int video_max_frames                   = 768;
+    // Per-item Vision execution capacity: the largest merged-token count the Vision encode
+    // workspace (and one handoff) covers, so one media item must fit it. The frontend resolves
+    // it from --vision-max-tokens; there is no aggregate per-prompt Vision budget - item count
+    // is bounded by context/KV capacity and the media live-byte account.
+    std::uint64_t item_max_raw_patches   = kMaximumVisionItemRawPatches;
+    std::uint64_t item_max_vision_tokens = kMaximumVisionItemTokens;
+    // Live-byte capacity of the media account; the request claims its full staged extent before
+    // any payload allocation so an over-capacity prompt fails fast instead of deadlocking the
+    // account. Zero disables the pre-claim.
+    std::size_t media_live_capacity_bytes = 0;
+    double video_fps                      = 2.0;
+    int video_min_frames                  = 4;
+    int video_max_frames                  = 768;
 };
 
 struct ProcessedInput {

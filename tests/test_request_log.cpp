@@ -119,7 +119,6 @@ int main() {
     memory.sequence.capacity_bytes     = 200;
     memory.workspace.capacity_bytes    = 500;
     memory.vision_workspace            = ninfer::VisionWorkspaceMemorySummary{
-                   .aggregate_prompt_tokens = 32768,
                    .max_item_tokens         = 16384,
                    .general_capacity_bytes  = 300,
                    .encode_peak_bytes       = 400,

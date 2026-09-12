@@ -198,7 +198,6 @@ int verify_profile_mismatch_rejection() {
 }
 
 int verify_vision_workspace_planning() {
-    static_assert(ninfer::targets::qwen3_6::kMaximumPromptVisionTokens == 32768);
     static_assert(ninfer::targets::qwen3_6::kMaximumVisionItemTokens == 16384);
     constexpr std::size_t kExpectedMaximumItemWorkspace = 866'648'064;
 

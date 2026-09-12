@@ -1593,6 +1593,102 @@ int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
     return failures;
 }
 
+int test_vision_budgets_are_per_item(const Frontend& frontend) {
+    const std::vector<std::uint8_t> bytes = gradient_ppm();
+
+    // No aggregate per-prompt Vision budget: the merged Vision total (12,000 tokens) far
+    // exceeds the legacy per-prompt 8,192 token budget, so the prompt must be admitted.
+    constexpr std::size_t kManyItems = 3000;
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    for (std::size_t index = 0; index < kManyItems; ++index) {
+        ninfer::OwnedMedia media;
+        media.kind        = ninfer::MediaKind::Image;
+        media.bytes       = bytes;
+        media.media_type  = "image/x-portable-pixmap";
+        media.source_name = "many-" + std::to_string(index) + ".ppm";
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Media, .text = {}, .media = std::move(media)});
+    }
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    const auto prepared = frontend.prepare(std::move(input));
+    const auto& data    = FrontendFactory::inspect(prepared);
+    int failures       = check(data.prepare.media_items == kManyItems &&
+                                   data.prepare.vision_tokens == kManyItems * 4,
+                               "processor still enforces an aggregate per-prompt Vision budget");
+
+    // One item at 9,216 merged tokens (3072x3072): rejected above the 8,192 per-item budget
+    // before payload allocation, admitted at the 16,384 hard bound.
+    const std::vector<std::uint8_t> large = block_ppm(3072, 3072, 200);
+    const auto item_processor = [](std::uint64_t item_tokens) {
+        fi::ProcessorOptions options;
+        options.image_max_pixels          = 3072ULL * 3072ULL;
+        options.item_max_vision_tokens    = item_tokens;
+        options.item_max_raw_patches      = item_tokens * 4;
+        options.media_live_capacity_bytes = ninfer::kDefaultMediaLiveBytes;
+        auto cache = std::make_shared<fi::MediaPreprocessCache>(
+            ninfer::kDefaultMediaCacheBytes, ninfer::kDefaultMediaLiveBytes);
+        return fi::Processor(fixture_tokenizer(), thinking_toggle_template(), std::move(options),
+                             std::move(cache));
+    };
+    const auto large_message = [large]() {
+        fi::ChatMessage m;
+        m.role = ninfer::ChatRole::User;
+        m.parts.push_back(fi::ChatPart::image(fi::MediaData{.bytes       = large,
+                                                             .media_type  = "image/x-portable-pixmap",
+                                                             .source_name = "large.ppm"}));
+        return m;
+    };
+    failures += check(
+        throws_processor_budget([&] {
+            auto processor = item_processor(8192);
+            (void)processor.process(std::vector<fi::ChatMessage>{large_message()});
+        }),
+        "processor admitted a single item above the per-item Vision budget");
+    try {
+        auto processor = item_processor(16384);
+        (void)processor.process(std::vector<fi::ChatMessage>{large_message()});
+    } catch (const fi::ProcessorError& error) {
+        std::cerr << "per-item budget at the hard bound rejected: " << error.what() << '\n';
+        failures++;
+    }
+
+    // The prompt's staged live extent (one distinct payload per distinct miss, 48 KiB each)
+    // is claimed against the media live budget: 22 items x 48 KiB exceed a 1 MiB budget and
+    // fail fast, while 20 items fit.
+    constexpr std::size_t kSmallLive = 1024 * 1024;
+    const auto small_live_processor = [kSmallLive]() {
+        fi::ProcessorOptions options;
+        options.media_live_capacity_bytes = kSmallLive;
+        auto cache = std::make_shared<fi::MediaPreprocessCache>(kSmallLive, kSmallLive, 4, 1);
+        return fi::Processor(fixture_tokenizer(), thinking_toggle_template(), std::move(options),
+                             std::move(cache));
+    };
+    const auto small_live_message = [](std::size_t count) {
+        fi::ChatMessage m;
+        m.role = ninfer::ChatRole::User;
+        for (std::size_t index = 0; index < count; ++index) {
+            m.parts.push_back(fi::ChatPart::image(fi::MediaData{
+                .bytes       = block_ppm(64, 64, static_cast<std::uint8_t>(1 + 2 * index)),
+                .media_type  = "image/x-portable-pixmap",
+                .source_name = "live-" + std::to_string(index) + ".ppm"}));
+        }
+        return m;
+    };
+    {
+        auto processor = small_live_processor();
+        (void)processor.process(std::vector<fi::ChatMessage>{small_live_message(20)});
+    }
+    failures += check(throws_processor_budget([&] {
+                          auto processor = small_live_processor();
+                          (void)processor.process(std::vector<fi::ChatMessage>{
+                              small_live_message(22)});
+                      }),
+                      "processor did not fail fast when staged media exceeded the live budget");
+    return failures;
+}
+
 int test_multimodal_prompt_over_removed_32k_cap(const Frontend& frontend) {
     const std::string long_text(40'000, 'x');
     const ninfer::MediaCacheSummary before_count = frontend.media_cache_summary();
@@ -2340,6 +2436,7 @@ int main() {
     failures += test_explicit_leading_instruction_cache_boundary();
     failures += test_automatic_private_anchor_opportunities();
     failures += test_media_admission_uses_aggregate_resources(frontend);
+    failures += test_vision_budgets_are_per_item(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);
     failures += test_video_prepare(frontend);

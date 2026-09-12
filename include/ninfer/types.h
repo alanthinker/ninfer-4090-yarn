@@ -869,7 +869,6 @@ struct ArenaMemorySummary {
 // Logical regions within the one physical workspace allocation. These byte values describe
 // layout and live extents and must not be added to workspace.capacity_bytes.
 struct VisionWorkspaceMemorySummary {
-    std::uint32_t aggregate_prompt_tokens = 0;
     std::uint32_t max_item_tokens         = 0;
     std::size_t general_capacity_bytes    = 0;
     std::size_t encode_peak_bytes         = 0;

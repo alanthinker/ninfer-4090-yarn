@@ -70,6 +70,13 @@ std::uint64_t checked_mul(std::uint64_t a, std::uint64_t b, std::string_view lab
     return a * b;
 }
 
+std::uint64_t checked_add(std::uint64_t a, std::uint64_t b, std::string_view label) {
+    if (b > std::numeric_limits<std::uint64_t>::max() - a) {
+        throw std::invalid_argument(std::string(label) + " overflow");
+    }
+    return a + b;
+}
+
 int round_even(double value) { return static_cast<int>(std::nearbyint(value)); }
 
 Size smart_resize_image(int height, int width, std::uint64_t min_pixels, std::uint64_t max_pixels) {
@@ -272,26 +279,39 @@ void append_patch(const std::vector<const media::decode::Image*>& frames, int gr
 }
 
 void add_budget(PreprocessStats& stats, const VisionItem& item);
-void enforce_media_item_resource_limits(const PreprocessStats& stats);
-void enforce_media_resource_limits(const PreprocessStats& stats, const ProcessorOptions& options);
+void enforce_media_item_resource_limits(const PreprocessStats& stats,
+                                        const ProcessorOptions& options);
 
-// Miss builders run concurrently. Claim their aggregate extent before allocating the retained
-// patch payload so an invalid prompt cannot fill the live-byte account and leave another worker
-// waiting for memory that this same request will never release.
+// Miss builders run concurrently. Claim the prompt's full staged live-byte extent before any
+// patch payload allocation so an over-capacity prompt fails fast instead of filling the
+// live-byte account and leaving another worker waiting for memory this request will never
+// release. The claim covers every item of the prompt - items later served from a reused prefix
+// are staged at preparation time and return to the account only when their references drop.
 class ConcurrentMediaBudget {
 public:
     explicit ConcurrentMediaBudget(const ProcessorOptions& options) : options_(options) {}
 
     void claim(const VisionItem& item) {
+        const std::uint64_t spatial =
+            checked_mul(static_cast<std::uint64_t>(item.grid.h), item.grid.w, "vision spatial grid");
+        const std::uint64_t patches =
+            checked_mul(static_cast<std::uint64_t>(item.grid.t), spatial, "vision raw patches");
+        const std::uint64_t live_bytes =
+            checked_mul(patches, kPreparedVisionPatchFeatures * sizeof(std::uint16_t),
+                        "vision live bytes");
         std::lock_guard lock(mutex_);
-        add_budget(stats_, item);
-        enforce_media_resource_limits(stats_, options_);
+        claimed_live_bytes_ = checked_add(claimed_live_bytes_, live_bytes, "vision live claim");
+        if (options_.media_live_capacity_bytes > 0 &&
+            claimed_live_bytes_ > options_.media_live_capacity_bytes) {
+            throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                                 "vision media live bytes exceed the processor live budget");
+        }
     }
 
 private:
     const ProcessorOptions& options_;
     std::mutex mutex_;
-    PreprocessStats stats_;
+    std::uint64_t claimed_live_bytes_ = 0;
 };
 
 Prepared prepare_image(std::span<const std::uint8_t> bytes, const ProcessorOptions& options,
@@ -307,7 +327,7 @@ Prepared prepare_image(std::span<const std::uint8_t> bytes, const ProcessorOptio
     out.item.grid     = {1, gh, gw};
     PreprocessStats item_stats;
     add_budget(item_stats, out.item);
-    enforce_media_item_resource_limits(item_stats);
+    enforce_media_item_resource_limits(item_stats, options);
     request_budget.claim(out.item);
     const std::size_t elements = static_cast<std::size_t>(gh) * gw * kPatchFeatures;
     out.payload                = cache.allocate_payload(elements, control);
@@ -362,7 +382,7 @@ Prepared prepare_video(std::span<const std::uint8_t> bytes, const ProcessorOptio
     out.item.grid     = {gt, gh, gw};
     PreprocessStats item_stats;
     add_budget(item_stats, out.item);
-    enforce_media_item_resource_limits(item_stats);
+    enforce_media_item_resource_limits(item_stats, options);
     request_budget.claim(out.item);
     const std::size_t elements = static_cast<std::size_t>(gt) * gh * gw * kPatchFeatures;
     out.payload                = cache.allocate_payload(elements, control);
@@ -413,11 +433,17 @@ std::vector<ChatPart*> media_parts(std::vector<ChatMessage>& messages) {
 
 std::size_t validate_media_inputs(std::span<ChatPart* const> parts,
                                   const ProcessorOptions& options) {
-    const std::uint64_t maximum_items_from_extents =
-        std::min(options.max_raw_patches / kMinimumRawPatchesPerItem, options.max_vision_tokens);
-    if (std::cmp_greater(parts.size(), maximum_items_from_extents)) {
-        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "minimum Vision grids exceed processor extent budget");
+    // Item count is bounded by the media live budget: each item stages at least one minimum
+    // Vision grid, so an item count whose minimum grids cannot fit the live account fails
+    // before any per-item work. (There is no aggregate per-prompt Vision token budget.)
+    if (options.media_live_capacity_bytes > 0) {
+        const std::uint64_t minimum_item_live_bytes =
+            kMinimumRawPatchesPerItem * kPreparedVisionPatchFeatures * sizeof(std::uint16_t);
+        const std::uint64_t maximum_items = options.media_live_capacity_bytes / minimum_item_live_bytes;
+        if (std::cmp_greater(parts.size(), maximum_items)) {
+            throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                                 "minimum Vision grids exceed the media live budget");
+        }
     }
     std::size_t remaining = options.max_encoded_media_bytes;
     for (const ChatPart* part : parts) {
@@ -617,25 +643,15 @@ void add_budget(PreprocessStats& stats, const VisionItem& item) {
                                          "vision attention pairs");
 }
 
-void enforce_media_item_resource_limits(const PreprocessStats& stats) {
-    if (stats.raw_patches > kMaximumVisionItemRawPatches) {
+void enforce_media_item_resource_limits(const PreprocessStats& stats,
+                                        const ProcessorOptions& options) {
+    if (stats.raw_patches > options.item_max_raw_patches) {
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "single media item raw patches exceed Vision execution capacity");
+                             "single media item raw patches exceed the Vision item budget");
     }
-    if (stats.vision_tokens > kMaximumVisionItemTokens) {
+    if (stats.vision_tokens > options.item_max_vision_tokens) {
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "single media item tokens exceed Vision execution capacity");
-    }
-}
-
-void enforce_media_resource_limits(const PreprocessStats& stats, const ProcessorOptions& options) {
-    if (stats.raw_patches > options.max_raw_patches) {
-        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "vision raw patches exceed processor budget");
-    }
-    if (stats.vision_tokens > options.max_vision_tokens) {
-        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "vision tokens exceed processor budget");
+                             "single media item tokens exceed the Vision item budget");
     }
 }
 
@@ -857,8 +873,8 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
     : tokenizer_(tokenizer), chat_template_(chat_template), options_(std::move(options)),
       media_cache_(std::move(media_cache)) {
     if (options_.max_encoded_media_bytes == 0 || options_.max_decoded_pixels == 0 ||
-        options_.max_decoded_video_pixels == 0 || options_.max_raw_patches == 0 ||
-        options_.max_vision_tokens == 0 || options_.image_min_pixels == 0 ||
+        options_.max_decoded_video_pixels == 0 || options_.item_max_raw_patches == 0 ||
+        options_.item_max_vision_tokens == 0 || options_.image_min_pixels == 0 ||
         options_.image_max_pixels < options_.image_min_pixels || options_.video_min_pixels == 0 ||
         options_.video_max_pixels < options_.video_min_pixels || !(options_.video_fps > 0.0) ||
         options_.video_min_frames <= 0 || options_.video_max_frames < options_.video_min_frames ||
@@ -899,9 +915,8 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
                                   : inspect_video_item(part->media.bytes, options_, policy);
             PreprocessStats item_stats;
             add_budget(item_stats, item);
-            enforce_media_item_resource_limits(item_stats);
+            enforce_media_item_resource_limits(item_stats, options_);
             add_budget(stats, item);
-            enforce_media_resource_limits(stats, options_);
             items.push_back(std::move(item));
         }
     } catch (const media::decode::Error& error) { throw_decode_error(error); }
@@ -1033,9 +1048,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         try {
             PreprocessStats item_stats;
             add_budget(item_stats, item);
-            enforce_media_item_resource_limits(item_stats);
+            enforce_media_item_resource_limits(item_stats, options_);
             add_budget(stats, item);
-            enforce_media_resource_limits(stats, options_);
         } catch (...) {
             preparation_error = std::current_exception();
             stop_preparation.store(true, std::memory_order_relaxed);
@@ -1076,7 +1090,6 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     output.message_boundaries          = std::move(encoded.message_boundaries);
     output.cache_boundaries            = std::move(encoded.cache_boundaries);
     stats.prompt_tokens                = output.input_ids.size();
-    enforce_media_resource_limits(stats, options_);
 
     stats.media_cache_hits              = cache_stats.hits;
     stats.media_cache_misses            = cache_stats.misses;

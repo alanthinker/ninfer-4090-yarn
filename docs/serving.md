@@ -382,10 +382,13 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
 
 Text and media requests use one complete-prompt context contract. After chat-template rendering and
-media-token expansion, the result must fit Engine `--max-context`. The current Vision runtime also
-has a 32,768 merged-token envelope (131,072 raw patches); the effective Vision limit is therefore
-`min(--max-context, 32768)`. There is no fixed image/video item-count limit: item count is admitted
-through aggregate source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
+media-token expansion, the result must fit Engine `--max-context`; Vision tokens count toward prompt
+length, so the context/KV capacity bounds the aggregate Vision load of a prompt and there is no
+separate per-prompt Vision token budget. One media item must fit the Vision execution capacity,
+`min(--max-context, --vision-max-tokens)` merged tokens (default 8192, hard bound 16384). There is
+no fixed image/video item-count limit: item count is admitted through source-byte, decoded-pixel,
+and live-memory budgets. Items already covered by a reused prefix are never re-encoded, so a warm
+request pays Vision preparation only for its new suffix.
 
 Media cache misses run as independent decode → resize → BF16-pack tasks on a bounded host worker
 pool. Prepared payloads are keyed by SHA-256 of the acquired bytes plus modality, so repeated media
@@ -397,8 +400,10 @@ released. A request-level preparation gate derived from the live limit prevents 
 builds from deadlocking the memory account.
 
 An expanded prompt beyond `--max-context` returns HTTP 400 `context_length_exceeded`, including
-the prepared token count and configured context ceiling. A media preprocessing resource rejection
-returns HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is reserved for a raw request
+the prepared token count and configured context ceiling. A single media item above the Vision item
+budget, a prompt whose staged media exceeds `--media-live-mib`, or one prepared payload that cannot
+fit that live budget returns HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is
+reserved for a raw request
 body that exceeds `--max-request-mib` before JSON parsing; it is not used for model-context or media
 resource errors.
 

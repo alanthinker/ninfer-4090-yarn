@@ -211,8 +211,7 @@ void append_vision_workspace_json(std::ostringstream& out,
     if (!vision) {
         out << "null";
     } else {
-        out << "{\"aggregate_prompt_tokens\": " << vision->aggregate_prompt_tokens
-            << ", \"max_item_tokens\": " << vision->max_item_tokens
+        out << "{\"max_item_tokens\": " << vision->max_item_tokens
             << ", \"general_capacity_bytes\": " << vision->general_capacity_bytes
             << ", \"encode_peak_bytes\": " << vision->encode_peak_bytes
             << ", \"handoff_offset_bytes\": " << vision->handoff_offset_bytes

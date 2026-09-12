@@ -561,8 +561,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                   out.dflash_context, out.dflash_round, out.causal_score});
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
-        // The workspace only needs to cover this fork's configured vision budget; the
-        // frontend rejects larger media before it reaches the encoder.
+        // The workspace and handoff only need to cover ONE item: the executor encodes suffix
+        // items just-in-time one at a time and retires the handoff after each, and the frontend
+        // rejects any single item above this extent. Prompt-level Vision load is bounded by KV
+        // capacity, not by this scratchpad.
         const std::uint32_t frontend_limit =
             plan.features.vision_max_tokens > 0 ? plan.features.vision_max_tokens : 8192;
         const std::uint32_t merged = static_cast<std::uint32_t>(std::min<std::uint64_t>(

@@ -263,7 +263,6 @@ qb::BenchEnvironment sample_environment() {
     env.memory.sequence          = {2000000000ULL, 1900000000ULL, 1900000000ULL};
     env.memory.workspace         = {100000000ULL, 0, 0};
     env.memory.vision_workspace  = ninfer::VisionWorkspaceMemorySummary{
-         .aggregate_prompt_tokens = 4096,
          .max_item_tokens         = 4096,
          .general_capacity_bytes  = 75000000ULL,
          .encode_peak_bytes       = 90000000ULL,

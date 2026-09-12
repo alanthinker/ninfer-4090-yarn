@@ -199,6 +199,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
+| `--vision-max-tokens N` | per-item Vision scratchpad token capacity (hard bound 16384); aggregate Vision load is bounded by context/KV capacity and the media live-byte budget | `8192` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |
