@@ -369,15 +369,20 @@ int main() {
     failures += check(sent_prompt.options.reasoning_effort ==
                           pinned_prompt.options.reasoning_effort,
                       "sent and pinned effort levels rendered different prompts");
+    // A --default-reasoning-effort level the loaded template cannot express (e.g. on a
+    // thinking-toggle template) is ignored rather than a deployment error: it falls back to
+    // the template's own default, so a misconfigured default cannot take the service down.
     ServeOptions unsupported = defaults;
     unsupported.default_reasoning_effort = ninfer::ReasoningEffort::XHigh;
     prompt_capabilities.reasoning_effort.xhigh = false;
-    bool unsupported_default_effort_rejected = false;
-    try {
-        (void)resolve_prompt_semantics(request, unsupported, prompt_capabilities);
-    } catch (const ApiException&) { unsupported_default_effort_rejected = true; }
-    failures += check(unsupported_default_effort_rejected,
-                      "configured default reasoning effort ignored the template capabilities");
+    const std::optional<ninfer::ReasoningEffort> saved_default =
+        prompt_capabilities.reasoning_effort.default_effort;
+    prompt_capabilities.reasoning_effort.default_effort = std::nullopt;
+    const auto ignored_default = resolve_prompt_semantics(request, unsupported, prompt_capabilities);
+    failures += check(!ignored_default.reasoning_effort &&
+                          !ignored_default.effective_reasoning_effort,
+                      "an unsupported configured default reasoning effort was not ignored");
+    prompt_capabilities.reasoning_effort.default_effort = saved_default;
     prompt_capabilities.reasoning_effort.xhigh = true;
     failures +=
         check(to_request_options(request, defaults, semantics, true).execution.allow_prefix_reuse,

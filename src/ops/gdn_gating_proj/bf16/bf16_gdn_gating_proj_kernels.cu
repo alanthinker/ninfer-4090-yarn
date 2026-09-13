@@ -267,9 +267,13 @@ constexpr std::int32_t cooperative_resident_ctas_per_sm() noexcept {
     } else {
         static_assert(std::is_same_v<Geometry, Bf16Gdn35Geometry>);
         static_assert(SplitK == 32 || SplitK == 16 || SplitK == 8 || SplitK == 4 || SplitK == 2);
-        // BN64 split-32 is register-limited to two resident CTAs per SM. The remaining
-        // specializations admit four. These are kernel facts, not a device-wide SM-count policy.
-        return SplitK == 32 ? 2 : 4;
+        // BN64 residency is a per-SM kernel fact (identical on every sm_89 device): all
+        // specializations use 256 threads and 24-KiB shared memory. split-8/4/2 use 74
+        // registers, which the 64-K register file caps at three resident CTAs per SM (not
+        // four - that overestimate let a 256-CTA grid pass the fit check on a 72-SM device,
+        // where the driver's real limit is 216, and reject the cooperative launch); split-16
+        // uses 56 registers and admits four; split-32 is register-limited to two.
+        return SplitK == 32 ? 2 : (SplitK == 16 ? 4 : 3);
     }
 }
 

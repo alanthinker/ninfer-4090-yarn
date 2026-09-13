@@ -128,21 +128,18 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         .preserve_thinking          = request.preserve_thinking.value_or(server.preserve_thinking),
     };
     // The level an omitted request level resolves to: the server's explicit
-    // --default-reasoning-effort when set, else the loaded template's own default. The level is
-    // rendered into the prompt's leading block, so a level the template cannot express is a
-    // deployment error rather than a per-request surprise.
+    // --default-reasoning-effort when the template can express it, else the loaded template's own
+    // default. A level the template cannot express is ignored (falls back to the template default)
+    // rather than a deployment error, so both thinking-toggle and effort-capable templates work.
     const auto default_effort = [&]() -> std::optional<ninfer::ReasoningEffort> {
-        if (!server.default_reasoning_effort.has_value()) {
-            return capabilities.reasoning_effort.default_effort;
+        // A level the loaded template cannot express (e.g. --default-reasoning-effort on a
+        // thinking-toggle template) is ignored rather than a deployment error: fall back to
+        // the template's own default (nullopt for a thinking-toggle template).
+        if (server.default_reasoning_effort.has_value() &&
+            capabilities.reasoning_effort.supports(*server.default_reasoning_effort)) {
+            return server.default_reasoning_effort;
         }
-        if (!capabilities.reasoning_effort.supports(*server.default_reasoning_effort)) {
-            invalid_prompt_option(
-                "--default-reasoning-effort '" +
-                    std::string(resolved_effort_name(*server.default_reasoning_effort)) +
-                    "' is not supported by the loaded chat template",
-                "reasoning_effort", "reasoning_effort_not_supported");
-        }
-        return server.default_reasoning_effort;
+        return capabilities.reasoning_effort.default_effort;
     };
     const auto complete = [&]() {
         if (request.continuation == ninfer::PromptContinuationMode::ContinueFinalAssistant &&
@@ -171,6 +168,14 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
             invalid_prompt_option("the loaded chat template cannot disable thinking",
                                   "reasoning_effort", "reasoning_effort_not_supported");
         }
+        return complete();
+    }
+
+    // Thinking is enabled. A thinking-toggle template expresses no graded level: honor the
+    // requested level only for its thinking on/off effect (set above) and ignore the level
+    // itself, so clients that always send a reasoning_effort work against both template kinds.
+    if (!(capabilities.reasoning_effort.low || capabilities.reasoning_effort.medium ||
+          capabilities.reasoning_effort.xhigh)) {
         return complete();
     }
 

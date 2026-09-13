@@ -232,8 +232,11 @@ does not match the model-held endpoint and can reuse only an earlier exact check
 At startup, NInfer resolves prompt capabilities from the exact `frontend/chat_template.jinja`
 resource embedded in the loaded artifact. It does not infer them from the request's `model` field,
 the artifact identity, or a target profile. A recognized effort-capable template exposes `low`,
-`medium`, and `xhigh`; omitting effort uses that template's declared default. An explicit effort
-not exposed by the loaded template returns HTTP 400 with code
+`medium`, and `xhigh`; omitting effort uses that template's declared default. A requested level the
+loaded template cannot express is honored only for its thinking on/off effect: a thinking-toggle
+template (no graded levels) ignores the level and proceeds with thinking enabled (`none` disables
+thinking), so a client that always sends `reasoning_effort` works against both template kinds. On an
+effort-capable template, `minimal`, `high`, and `max` still return HTTP 400 with code
 `reasoning_effort_not_supported` before prompt preparation.
 
 `--default-thinking-budget N` sets a positive process default for requests whose final resolved
@@ -250,7 +253,8 @@ tokens for every thinking-enabled request.
 `--default-reasoning-effort low|medium|xhigh` pins the level a request receives when it omits
 `reasoning_effort`. Unset (the default) keeps the loaded chat template's own default, which the
 registered templates declare as `xhigh`. A configured level the loaded template cannot express is
-rejected before prompt preparation with code `reasoning_effort_not_supported`.
+ignored: the request resolves to the template's own default, so a misconfigured default cannot take
+the service down.
 
 The resolved level is rendered INTO the prompt rather than carried beside it: the leading block
 carries a level-specific reasoning directive (`medium` renders none, `xhigh` renders 38 tokens of
@@ -500,7 +504,7 @@ wire response contains typed `output` Items.
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `client_metadata` | Codex client extension; an object or `null`, accepted as opaque tracing metadata with no generation effect |
-| `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
+| `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template (a thinking-toggle template ignores the level and only enables thinking); `minimal`, `high`, and `max` return `reasoning_effort_not_supported` on effort-capable templates |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
