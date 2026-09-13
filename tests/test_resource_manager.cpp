@@ -2804,13 +2804,13 @@ void test_guided_pressure_reaches_deep_retention_before_maximal_fallback() {
                           2000U + owner_id) == program.started_action_ids.end(),
                 "guided pressure search evicted a parked owner");
     }
-    // Planning effort is bounded by the search budget, not by the owner count: the fake charges
-    // 2 ms per assessment and MaterializationPlanner::plan caps the budget at 50 ms (sized against
-    // the plan's own value, so a plan worth minutes of prefill may use it), which leaves room for
-    // the guided closure plus best-first refinement. What this case must never do is walk every
-    // parked owner into a maximal drop, and the assertions above cover that.
-    require(program.pressure_target_assessments <= 32,
-            "guided pressure search assessed far beyond its planning budget");
+    // Planning effort is bounded by the search budget (15 s floor / 90 s cap) and, far before
+    // that wall, by the finite target set: the fake charges 2 ms per assessment, so the budget
+    // is non-binding here and the planner explores the reachable closure to queue exhaustion.
+    // What this case must never do is walk every parked owner into a maximal drop (covered
+    // above); the loose bound below only catches a runaway re-assessment loop.
+    require(program.pressure_target_assessments <= 512,
+            "guided pressure search assessed far beyond the reachable target set");
 }
 
 void test_combined_target_reprices_cancelled_pressure_copy() {

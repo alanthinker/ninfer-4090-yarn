@@ -334,11 +334,16 @@ public:
         // assessment time. Planning time is charged against the prefill it is trying to
         // avoid, so a budget worth a fraction of that recompute is a favorable trade; the
         // cap bounds the worst case at two minutes of planning latency.
-        const std::uint64_t per_candidate_assessment_ns = 500'000ULL;
+        // All budget terms are nanoseconds (the elapsed comparison below and the diagnostics
+        // display both assume ns). An earlier revision wrote the per-candidate/floor/cap
+        // constants in microseconds, silently capping the effective budget at 90 ms and
+        // reproducing the 2026-09-12 time_budget failures on 100k+ prompts (observed
+        // 2026-09-13: 115 candidates, spurious fair-share release, 0% reuse).
+        const std::uint64_t per_candidate_assessment_ns = 500'000'000ULL;
         const std::uint64_t candidate_floor_ns = candidates.size() * per_candidate_assessment_ns;
         const std::uint64_t search_budget_ns =
-            std::min<std::uint64_t>(90'000'000ULL,
-                                    std::max<std::uint64_t>(15'000'000ULL,
+            std::min<std::uint64_t>(90'000'000'000ULL,
+                                    std::max<std::uint64_t>(15'000'000'000ULL,
                                                              std::max(incumbent.cost.total_ns /
                                                                           20U,
                                                                       candidate_floor_ns)));
