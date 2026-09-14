@@ -1,21 +1,21 @@
 # NInfer-YaRN — 长上下文扩展部署说明（RTX 4080S 32 GB）
 
-本目录是**独立于 `deploy/` 的新部署**：二进制来自 `ninfer-4090-yarn/`（一份从 `ninfer-4090/`
-复制出来、加装了 YaRN 线性位置缩放的构建），脚本、日志、PID 全部落在本目录，原版 `deploy/`
-和 `ninfer-4090/` 未被改动。
+本仓库是**一份从 `ninfer-4090/` 复制出来、加装了 YaRN 线性位置缩放的独立 NInfer 构建**：
+部署脚本、日志、PID 全部落在本仓库 `deploy/` 下，二进制在本仓库 `build/` 编译，
+`ninfer-4090/` 原版未被改动。
 
 | 项 | 位置 |
 |---|---|
-| 引擎仓库（YaRN 版） | `ninfer-4090-yarn/` |
-| 编译产物 | `ninfer-4090-yarn/build/apps/{ninfer,ninfer-serve,ninfer-perplexity}` |
-| 模型（与原版共用，未复制） | `ninfer-4090/models/qwen3_8_27b.ninfer` |
-| kernel 数值测试 | `ninfer-4090-yarn/tests/ops/test_scale_positions_yarn.cu` |
-| 本目录脚本 | `start_ninfer.sh` / `stop_ninfer.sh` / `run_bench.sh` / `test_yarn_niah.py` |
+| 引擎仓库（YaRN 版） | 本仓库（`ninfer-4090-yarn/`） |
+| 编译产物 | `build/apps/{ninfer,ninfer-serve,ninfer-perplexity}` |
+| 模型（与原版共用，未复制） | `../ninfer-4090/models/qwen3_8_27b.ninfer` |
+| kernel 数值测试 | `tests/ops/test_scale_positions_yarn.cu` |
+| 部署脚本 | `deploy/ninfer_service.sh`（start/stop/status）/ `deploy/run_bench.sh` / `deploy/test_yarn_niah.py` |
 
 ## 当前生效配置（推荐，已实测）
 
 ```bash
-bash start_ninfer.sh          # 脚本默认即此配置, 无需环境变量
+bash deploy/ninfer_service.sh start    # 脚本默认即此配置, 无需环境变量
 ```
 
 | 参数 | 值 | 说明 |
@@ -46,8 +46,8 @@ active_lanes=4   device_state_slots=4
 
 | 档位 | 启动命令 | 池子 | 含义 |
 |---|---|---|---|
-| **4 路并发（默认）** | `bash start_ninfer.sh` | 658,176 | 单会话活跃时能用满 658,176；4 路同时活跃各约 164,544 |
-| 最大化单会话 | `NINFER_CONCURRENCY=1 NINFER_MAX_CTX=724000 NINFER_YARN_FACTOR=2.76 bash start_ninfer.sh` | 724,032 | 只有一个会话，可用上下文最大 |
+| **4 路并发（默认）** | `bash deploy/ninfer_service.sh start` | 658,176 | 单会话活跃时能用满 658,176；4 路同时活跃各约 164,544 |
+| 最大化单会话 | `NINFER_CONCURRENCY=1 NINFER_MAX_CTX=724000 NINFER_YARN_FACTOR=2.76 bash deploy/ninfer_service.sh start` | 724,032 | 只有一个会话，可用上下文最大 |
 
 档位的选择逻辑见下文「并发度 vs 池子容量」：并发本身不显著缩小池子（每路只多占约 0.38 GiB 的
 device state image），但 `max_context` 的可设上限等于池子大小，所以 4 路的上限比单路低 9%。
@@ -71,7 +71,7 @@ device state image），但 `max_context` 的可设上限等于池子大小，�
 
 对比 gzenz fork 的取值可以看出一条简单规律——**factor ≈ 目标上下文 / 262144**：
 
-| 目标 | 其 factor | 262144 × factor |
+| 目标 | 其 factor | 262144 × factor | 
 |---|---|---|
 | 500k | 1.91 | 500,695 |
 | 555k | 2.12 | 555,745 |
@@ -359,8 +359,8 @@ auto 在 [minimum, maximum] 内选显存允许的最大值
 - 两个硬性限制：`max_concurrency` 上限 8（代码里的 `kMaximumConcurrency`）；
   `max_context` 不得超过显存允许值，否则启动失败。
 
-本目录默认 **N=4 / 658,176**（4 路并发档）。若要 3 路各保证 22 万 token：
-`NINFER_CONCURRENCY=3 NINFER_MAX_CTX=226000 NINFER_YARN_FACTOR=1.86 bash start_ninfer.sh`。
+本部署默认 **N=4 / 658,176**（4 路并发档）。若要 3 路各保证 22 万 token：
+`NINFER_CONCURRENCY=3 NINFER_MAX_CTX=226000 NINFER_YARN_FACTOR=1.86 bash deploy/ninfer_service.sh start`。
 要最大化单会话上下文则用单路档（见上表）。
 
 ## 缺陷归属：移植引入 vs 上游既有
@@ -395,46 +395,48 @@ gzenz 的 `configure_text_card` 会无条件调 `card.set_rope_scaling(execution
 ## 用法
 
 ```bash
-cd /root/ai/large_models/_ninfer_repos/deploy-yarn
+cd /root/ai/large_models/_ninfer_repos/ninfer-4090-yarn
 
 # 启动（默认即推荐配置：658K / factor 2.51 / 4 路 / vision）
-bash start_ninfer.sh
+bash deploy/ninfer_service.sh start
 
 # 最大化单会话上下文（放弃并发）
-NINFER_CONCURRENCY=1 NINFER_MAX_CTX=724000 NINFER_YARN_FACTOR=2.76 bash start_ninfer.sh
+NINFER_CONCURRENCY=1 NINFER_MAX_CTX=724000 NINFER_YARN_FACTOR=2.76 bash deploy/ninfer_service.sh start
 
 # 想回到原生 262144 行为（用于回归对比）
-NINFER_MAX_CTX=262144 NINFER_YARN_FACTOR=1.0 bash start_ninfer.sh
+NINFER_MAX_CTX=262144 NINFER_YARN_FACTOR=1.0 bash deploy/ninfer_service.sh start
 
 # 不需要多模态可省约 0.6 GiB，还能再抬高 max_context（单路档）
-NINFER_CONCURRENCY=1 NINFER_NO_VISION=1 NINFER_MAX_CTX=780000 NINFER_YARN_FACTOR=2.98 bash start_ninfer.sh
+NINFER_CONCURRENCY=1 NINFER_NO_VISION=1 NINFER_MAX_CTX=780000 NINFER_YARN_FACTOR=2.98 bash deploy/ninfer_service.sh start
 
 # 超原生上下文检索验证（这是 YaRN 的核心验收项）
-python3 test_yarn_niah.py 300000 50
-python3 test_yarn_niah.py 700000 10
+python3 deploy/test_yarn_niah.py 300000 50
+python3 deploy/test_yarn_niah.py 700000 10
 
 # 多模态回归（验证 MRoPE 的 [len,3] 路径没被破坏）
-python3 test_yarn_vision.py
+python3 deploy/test_yarn_vision.py
 
 # 并发度 ↔ 池子容量扫描（换端口 30001，不打扰生产）
-bash sweep_concurrency.sh
+bash deploy/sweep_concurrency.sh
 
 # 性能 bench（已内置 1800s 单请求超时，256K fixture 需要 6-10 分钟 prefill）
-bash run_bench.sh niah
-bash run_bench.sh scenario
-bash run_bench.sh decode
+bash deploy/run_bench.sh niah
+bash deploy/run_bench.sh scenario
+bash deploy/run_bench.sh decode
 
 # 停止
-bash stop_ninfer.sh
+bash deploy/ninfer_service.sh stop
 ```
 
 环境变量一览（全部可选）：`NINFER_PORT`、`NINFER_MAX_CTX`、`NINFER_YARN_FACTOR`、
 `NINFER_YARN_ORIG`、`NINFER_CONCURRENCY`、`NINFER_KV_DTYPE`、`NINFER_NO_VISION`、`NINFER_MODEL`、
-`NINFER_DUMP_REQUESTS`（设为目录则把每个请求的原始 body 落盘，用于诊断前缀缓存）、
-`NINFER_DUMP_REQUESTS_LIMIT`（最多保留几个 body，默认 100，0=不限）、
+`NINFER_DUMP_REQUESTS`（请求体落盘目录，默认 `./reqdump` 每次启动自动开启，设为 0 或空关闭；诊断前缀缓存用）、
+`NINFER_DUMP_REQUESTS_LIMIT`（最多保留几个 body，启动脚本默认 2000（二进制内置 100），0=不限）、
 `NINFER_DUMP_REQUESTS_MAX_AGE_HOURS`（超过多少小时删除，默认 24，0=不限）、
+`NINFER_REUSE_DIAG`（前缀复用诊断，启动脚本默认 1 自动开启，设为 0 或空关闭；每个请求把前缀索引里每个 checkpoint 的拒绝原因逐条打到日志，只读不改行为，用于区分 0% 命中是"字节变了"还是"长上下文规划器超时放弃"）、
 `NINFER_AUTO_LONG_ANCHORS` / `NINFER_MAX_LONG_ANCHORS`（长锚点窗口与保留上限，默认 32，见前缀缓存一节）、
-`NINFER_MAX_SHARED_PREFIXES`（共享前缀目录容量，默认 4）。
+`NINFER_MAX_SHARED_PREFIXES`（共享前缀目录容量，默认 4）、
+`NINFER_LOG_LEVEL`（日志级别，启动脚本默认 debug，比 info 只多启动内存台账/每 prompt 上下文成本等 4 个日志点）。
 
 ## 前缀缓存：跨会话复用与三次连续会话交替 miss
 
@@ -488,8 +490,7 @@ system prompt 版本数: 5     ← 系统提示词有 5 个不同版本
 致命；(b) 这两个变体前缀是**自上次服务启动以来第一次出现**，任何首次出现的前缀都必然 miss。
 要区分只能把同一个变体**连续发两次**，看第二次是否命中——当时没有做这个对照。
 
-能把结论钉死的是另一条更硬的事实：**每次重启服务都会清空内存里的 checkpoint 缓存**（本目录
-`ninfer_serve.log` 里 7 次 YaRN 重启都带着新的启动行）。所以「A 会话没命中、B 会话命中」如果
+能把结论钉死的是另一条更硬的事实：**每次重启服务都会清空内存里的 checkpoint 缓存**（`deploy/ninfer_serve.log` 里 7 次 YaRN 重启都带着新的启动行）。所以「A 会话没命中、B 会话命中」如果
 跨越了一次重启，就与提示词差异无关。
 
 ### 已查清：历史会话（回一句 OK）为什么一条都没命中
@@ -524,7 +525,7 @@ N=32, 21 条消息:最浅检查点 = 8669                  ← 含
 | 32（现值） | ✅ | ✅ 1.4 s | ✅ 1.7 s | ✅ 2.6 s |
 
 **已改的默认值**：`--auto-long-anchors 32`、`--max-long-anchors-per-continuation 32`
-（`start_ninfer.sh`），可用 `NINFER_AUTO_LONG_ANCHORS` / `NINFER_MAX_LONG_ANCHORS` 调。
+（`deploy/ninfer_service.sh`），可用 `NINFER_AUTO_LONG_ANCHORS` / `NINFER_MAX_LONG_ANCHORS` 调。
 
 **代价实测为 0**：锚点复用已预留的 snapshot arena，进程 RSS 36.57 GiB、显存 30,966 MiB 在
 N=4 / 8 / 32 / 64 下**完全相同**（同一 21 消息负载下逐项对比），所以默认给足更划算。
@@ -559,7 +560,7 @@ req#9  cache 8,669 (90.9%, long anchor)  TTFT 1.4s
 req#11 cache 0     (0.0%)  TTFT 8.2s
 ```
 
-加请求体落盘后（`NINFER_DUMP_REQUESTS=<目录> ./start_ninfer.sh`，文件名
+加请求体落盘后（`NINFER_DUMP_REQUESTS=<目录> ./deploy/ninfer_service.sh start`，文件名
 `req-<毫秒>-<序号>-<chat|responses|messages>.json`，两次请求的 body 可逐字节 diff；**默认自动清理：
 最多保留 100 个、超过 24 小时删除**，可用 `NINFER_DUMP_REQUESTS_LIMIT` /
 `NINFER_DUMP_REQUESTS_MAX_AGE_HOURS` 调整，0 表示不限；只删本服务写的 `req-*.json`，目录里其他文件
@@ -654,7 +655,7 @@ Failed to initialize NVML: Driver/library version mismatch   (exit 18)
   且换 vLLM/llama.cpp/sglang 也一样——这是宿主驱动层的问题，与应用无关。
 
 **解决办法：重启机器。** 磁盘上的模块已经是与库匹配的 595.91.07，重启就会加载它，之后
-正常执行 `start_ninfer.sh` 即可。**不需要改任何系统配置，也不需要重装驱动。**
+正常执行 `deploy/ninfer_service.sh` 即可。**不需要改任何系统配置，也不需要重装驱动。**
 
 系统自己会提示：出事后 `/var/run/reboot-required` 及 `/var/run/reboot-required.pkgs` 存在。
 （本次是先手动重载模块恢复的，见下；重启效果等价。）
@@ -665,11 +666,11 @@ Failed to initialize NVML: Driver/library version mismatch   (exit 18)
 前提是磁盘上已有匹配的新模块。会短暂中断服务：
 
 ```bash
-bash deploy-yarn/stop_ninfer.sh                              # 必须释放 /dev/nvidia*（本机只有它在用）
+bash deploy/ninfer_service.sh stop                              # 必须释放 /dev/nvidia*（本机只有它在用）
 rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia            # 卸载旧模块
 modprobe nvidia nvidia_uvm nvidia_modeset nvidia_drm         # 加载新模块
 nvidia-smi                                                   # 验证三层版本一致
-bash deploy-yarn/start_ninfer.sh
+bash deploy/ninfer_service.sh start
 ```
 
 风险：重载失败则 GPU 到重启前都不可用。所以只在「服务反正已经停了 / 方便重启」时才值得做。
@@ -694,7 +695,7 @@ bash deploy-yarn/start_ninfer.sh
 2. 整个停掉 `unattended-upgrades`，全手动。
 3. 保留自动更新但设 `Unattended-Upgrade::Automatic-Reboot "true"` +
    `Automatic-Reboot-Time "04:00"`，让它自己在维护窗口重启。代价是会打断服务，且本服务目前
-   没有开机自启（重启后需手动 `start_ninfer.sh`）。
+   没有开机自启（重启后需手动 `deploy/ninfer_service.sh start`）。
 
 **为什么"复制一份 / 自己编译一份"解决不了这个问题**：本仓库确实已经是独立副本
 （`ninfer-4090-yarn/` + 独立编译的二进制），但故障点在**宿主 NVIDIA 驱动**这一层——用户态
