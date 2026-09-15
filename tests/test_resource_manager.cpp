@@ -2088,7 +2088,7 @@ void test_equal_lower_bound_does_not_short_circuit_tie_break() {
         };
     };
     auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
-                               pressure_inputs, logical_goal, Planner::Clock::now());
+                               pressure_inputs, logical_goal, 1'000'000U, Planner::Clock::now());
 
     require(result && result->candidate == PlanningCandidateId{.value = 1} &&
                 program.pressure_planning_sessions == 1,
@@ -2134,7 +2134,7 @@ void test_machine_cost_changes_selection_without_changing_physical_assessment() 
     Planner first_planner;
     const auto first =
         first_planner.plan(program, FakePreparedPrompt{}, prefill_expensive, candidates, 0,
-                           pressure_inputs, logical_goal, Planner::Clock::now());
+                           pressure_inputs, logical_goal, 1'000'000U, Planner::Clock::now());
 
     auto transfer_expensive                 = test_cost_model();
     transfer_expensive.prefill.token_ns_q32 = ninfer::runtime::kContextCostQ32One;
@@ -2144,7 +2144,7 @@ void test_machine_cost_changes_selection_without_changing_physical_assessment() 
     Planner second_planner;
     const auto second =
         second_planner.plan(program, FakePreparedPrompt{}, transfer_expensive, candidates, 0,
-                            pressure_inputs, logical_goal, Planner::Clock::now());
+                            pressure_inputs, logical_goal, 1'000'000U, Planner::Clock::now());
 
     require(first && first->candidate == PlanningCandidateId{.value = 1} && second &&
                 second->candidate == PlanningCandidateId{.value = 0} &&
@@ -2251,7 +2251,7 @@ void test_candidate_search_prefers_deep_reuse_without_eviction() {
         return Planner::LogicalGoal{.publication_slot = 0};
     };
     auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
-                               pressure_inputs, logical_goal, Planner::Clock::now());
+                               pressure_inputs, logical_goal, 1'000'000U, Planner::Clock::now());
 
     require(result && result->plan && result->candidate == PlanningCandidateId{.value = 1},
             "shallow Root pressure path starved the cheaper reuse candidate");
@@ -2317,7 +2317,7 @@ void test_feasible_identity_expands_when_pressure_can_remove_copy() {
         return Planner::LogicalGoal{.publication_slot = 0};
     };
     auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
-                               pressure_inputs, logical_goal, Planner::Clock::now());
+                               pressure_inputs, logical_goal, 1'000'000U, Planner::Clock::now());
 
     require(result && result->diagnostics.predicted_now_ns == 100'000'000 &&
                 result->diagnostics.selected_degradation_units == 1 &&
@@ -2355,7 +2355,7 @@ void test_dominating_identity_does_not_build_pressure_graph() {
 
     Planner planner;
     auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
-                               pressure_inputs, logical_goal, Planner::Clock::now());
+                               pressure_inputs, logical_goal, 1'000'000U, Planner::Clock::now());
     require(result &&
                 result->diagnostics.stop_reason == ninfer::MaterializationStopReason::NoPressure &&
                 !pressure_inputs_built && program.pressure_planning_sessions == 0,

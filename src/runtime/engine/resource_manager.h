@@ -2416,7 +2416,7 @@ private:
 
             planned = planner_.plan(program, prompt, cost_model_, candidate_inputs, 0,
                                     build_pressure_inputs, logical_goal, final_schedule,
-                                    planning_started);
+                                    base.summary().prompt_tokens, planning_started);
             if (planned || protected_limit == 0) { break; }
             // No feasible target while this attempt's buckets are closed: the shared pool and
             // every unprotected owner are exhausted, so the oldest bucket is released and the

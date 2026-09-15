@@ -134,7 +134,7 @@ public:
          const ContextMachineCostModel& machine_cost, std::span<const CandidateInput> candidates,
          std::uint32_t root_candidate_index, PressureInputsFn&& pressure_inputs,
          LogicalGoalFn&& logical_goal, FinalScheduleFn&& final_schedule,
-         Clock::time_point planning_started) {
+         std::uint32_t prompt_tokens, Clock::time_point planning_started) {
         if (candidates.empty() || root_candidate_index >= candidates.size()) {
             throw std::invalid_argument("materialization planning problem has no root candidate");
         }
@@ -341,9 +341,34 @@ public:
         // 2026-09-13: 115 candidates, spurious fair-share release, 0% reuse).
         const std::uint64_t per_candidate_assessment_ns = 500'000'000ULL;
         const std::uint64_t candidate_floor_ns = candidates.size() * per_candidate_assessment_ns;
+        // The planning floor scales with this request's prompt size instead of the historical
+        // flat 15 s. That flat floor exists so a large prompt (100k+ tokens, many indexed
+        // candidates) gets enough window to seed every candidate's retention closure - the
+        // 2026-09-12 regression was a budget that starved those assessments. But the same flat
+        // 15 s forced a 14-token cold prompt to spend 15-28 s of host-CPU planning to avoid a
+        // prefill that costs a fraction of a second: once the trivially-eligible candidates were
+        // pruned there was nothing left for the search to find. So keep the full 15 s floor for
+        // prompts at/above kPlanningFloorFullTokens (bit-identical to the previous behavior for
+        // the cases that actually need it) and taper it toward a small constant for tiny
+        // prompts, whose prefill a 15 s search could never be worth avoiding. Larger prompts
+        // keep their window through the incumbent-cost/20 term, which grows with prompt size.
+        // The root-maximal fallback and any feasible reuse incumbent are seeded before the
+        // budgeted search, so a smaller floor only trims eviction refinement - it can never turn
+        // a reuse hit into a miss or a runnable request into a blocked one.
+        constexpr std::uint64_t kPlanningFloorMinNs      = 250'000'000ULL;    // 0.25 s
+        constexpr std::uint64_t kPlanningFloorMaxNs      = 15'000'000'000ULL; // 15 s
+        constexpr std::uint64_t kPlanningFloorFullTokens = 8192U;
+        // 10-bit fixed-point taper: proportional below the full floor, saturating at 15 s.
+        const std::uint64_t size_floor_ns =
+            kPlanningFloorMinNs +
+            (kPlanningFloorMaxNs - kPlanningFloorMinNs) *
+                (std::min<std::uint64_t>(prompt_tokens, kPlanningFloorFullTokens) *
+                 1024U /
+                kPlanningFloorFullTokens) /
+                1024U;
         const std::uint64_t search_budget_ns =
             std::min<std::uint64_t>(90'000'000'000ULL,
-                                    std::max<std::uint64_t>(15'000'000'000ULL,
+                                    std::max<std::uint64_t>(size_floor_ns,
                                                              std::max(incumbent.cost.total_ns /
                                                                           20U,
                                                                       candidate_floor_ns)));
@@ -721,13 +746,14 @@ public:
     plan(Program& program, const PreparedPrompt& prompt,
          const ContextMachineCostModel& machine_cost, std::span<const CandidateInput> candidates,
          std::uint32_t root_candidate_index, PressureInputsFn&& pressure_inputs,
-         LogicalGoalFn&& logical_goal, Clock::time_point planning_started) {
+         LogicalGoalFn&& logical_goal, std::uint32_t prompt_tokens,
+          Clock::time_point planning_started) {
         const auto no_optional_schedule = [](PlanningCandidateId, const RequestPlanSummary&,
                                              const auto&) { return std::vector<std::uint32_t>{}; };
         return plan(program, prompt, machine_cost, candidates, root_candidate_index,
                     std::forward<PressureInputsFn>(pressure_inputs),
                     std::forward<LogicalGoalFn>(logical_goal), no_optional_schedule,
-                    planning_started);
+                    prompt_tokens, planning_started);
     }
 
 private:
