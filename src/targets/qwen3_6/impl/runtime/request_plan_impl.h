@@ -1273,6 +1273,30 @@ void ProgramImplCore::select_shared_captures(AdmissionCandidate& candidate,
                          std::tie(right.frontier, right.input_order);
               });
 
+    // Coalesce checkpoints that are too close to add reuse value. A checkpoint exists so a later
+    // request can resume from it instead of re-prefilling; when two checkpoints are only a few
+    // tokens apart, re-prefilling that gap is cheap, so the nearer one buys no reuse value yet
+    // still forces a prefill chunk boundary (a full device sync + workspace reset in
+    // prefill_impl). Keep a checkpoint only when it is at least one prefill_chunk beyond the
+    // last kept one (always keeping the first and the final). This bounds prefill splits by
+    // prompt length / prefill_chunk rather than by turn count, so many short-turn conversations
+    // prefill at full rate while reuse granularity degrades by at most one chunk.
+    if (prefill_chunk > 0 && plan.capture_groups.size() > 2) {
+        const auto& groups = plan.capture_groups;
+        std::vector<CaptureGroup> kept;
+        kept.reserve(groups.size());
+        std::uint32_t last = 0;
+        for (std::size_t i = 0; i < groups.size(); ++i) {
+            const bool first       = kept.empty();
+            const bool final_point = (i + 1 == groups.size());
+            if (first || final_point || groups[i].frontier >= last + prefill_chunk) {
+                kept.push_back(groups[i]);
+                last = groups[i].frontier;
+            }
+        }
+        plan.capture_groups = std::move(kept);
+    }
+
     const std::size_t prefill_splits = plan.vision ? plan.vision->uses.size() : 0ULL;
     plan.summary.service_work_quanta =
         projected_service_work(plan.summary, plan.reuse_base, prefill_chunk, prefill_splits,

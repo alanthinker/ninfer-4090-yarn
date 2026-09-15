@@ -11731,14 +11731,15 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                         ? std::optional<std::uint32_t>(
                               staged.capture_groups[staged.next_capture].frontier)
                         : std::nullopt;
+                // Split only at planned capture (cache-publication) frontiers, never at every
+                // rewrite_execution_frontier. The chunk used to be truncated at each turn
+                // boundary too; for long multi-message prompts that degraded prefill to one chunk
+                // per turn, and every chunk pays a full device sync + workspace reset in
+                // prefill_impl (measured ~80ms/turn: a 60-message prompt ran ~61 chunks at 516
+                // tok/s vs 1326 tok/s for the same tokens in a single message). rewrite_execution_
+                // frontiers still drive host-side prefix-identity and reuse-base matching, so
+                // prefix reuse is unaffected by dropping the device-side truncation.
                 std::optional<std::uint32_t> split_frontier = capture_frontier;
-                const auto rewrite_split                    = std::upper_bound(
-                    staged.prompt.identity.rewrite_execution_frontiers.begin(),
-                    staged.prompt.identity.rewrite_execution_frontiers.end(), staged.cursor);
-                if (rewrite_split != staged.prompt.identity.rewrite_execution_frontiers.end() &&
-                    (!split_frontier || *rewrite_split < *split_frontier)) {
-                    split_frontier = *rewrite_split;
-                }
                 schedule::PrefillChunkResult result;
                 timing.pause();
                 if (staged.vision) {
