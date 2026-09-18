@@ -329,6 +329,42 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
         base->prefix_digests.assign(prompt);
         base->prefix_identity_tag =
             capture_identity_tag(speculative_backend, proposal_head, kv_storage);
+        // TEMP-DEBUG: log input fingerprint for digest-mismatch diagnosis
+        {
+            const auto tokens = base->summary.prompt_tokens;
+            const auto media  = prompt.vision_items.size();
+            std::fprintf(stderr,
+                "reuse-diag:   FINGERPRINT tokens=%u media=%zu "
+                "media_spans=[",
+                tokens, media);
+            for (std::size_t vi = 0; vi < prompt.vision_items.size(); ++vi) {
+                if (vi) std::fprintf(stderr, ",");
+                const auto& item = prompt.vision_items[vi];
+                if (!item.token_spans.empty()) {
+                    std::fprintf(stderr, "b=%u,e=%u",
+                        item.token_spans.front().begin,
+                        item.token_spans.back().begin + item.token_spans.back().count);
+                } else {
+                    std::fprintf(stderr, "empty");
+                }
+            }
+            std::fprintf(stderr, "] rewrite_frontiers=[");
+            for (std::size_t ri = 0; ri < prompt.identity.rewrite_execution_frontiers.size(); ++ri) {
+                if (ri) std::fprintf(stderr, ",");
+                std::fprintf(stderr, "%u", prompt.identity.rewrite_execution_frontiers[ri]);
+            }
+            const auto sz = base->prefix_digests.size();
+            const auto v  = [&](std::size_t pos, int lane) -> unsigned long long {
+                return pos <= sz ? (unsigned long long)base->prefix_digests.at(pos)[lane] : 0ULL;
+            };
+            std::fprintf(stderr, "] tag=%u sz=%zu "
+                "d1k=(%llu,%llu) d10k=(%llu,%llu) dend=%u=(%llu,%llu)\n",
+                base->prefix_identity_tag, sz,
+                v(1000, 0), v(1000, 1),
+                v(10000, 0), v(10000, 1),
+                tokens,
+                v(tokens, 0), v(tokens, 1));
+        }
     }
     if (options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled) {
         const auto add_capture = [&](std::uint32_t frontier, std::uint32_t input_order,
@@ -555,12 +591,21 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             decoder->mtp_cache() != nullptr && plan->reuse_base != 0 &&
             ((source != nullptr && source->mtp_kv_valid >= plan->reuse_base - 1) ||
              (shared_source != nullptr && shared_source->backend_frontier >= plan->reuse_base - 1));
-        if (plan->reuse != ReusePath::Root && !append_ready && !checkpoint_ready) {
-            // A catalogued checkpoint can lose the backend KV or boundary hidden that this reuse
-            // path needs - the planner demotes and drops replicas under pressure, and the catalog
-            // does not promise the deployed backend's bridge. That makes this candidate
-            // unusable, not the request invalid: skip it and let the search fall back to a
-            // shallower checkpoint or the root, exactly as a failed exact match does.
+        // MTP state (tail hidden, draft KV) is a per-lane optimization that can be lost
+        // when the lane is freed after a request completes. The GDN state and KV cache
+        // remain sufficient for reuse on all private paths (endpoint, long anchor,
+        // rewrite); MTP draft state is rebuilt naturally during suffix prefill.
+        // Only SharedStablePrefix retains a hard gate: its source is a different
+        // continuation whose backend KV may genuinely be evicted (not just MTP).
+        if (plan->reuse == ReusePath::PrivateEndpoint ||
+            plan->reuse == ReusePath::PrivateLongAnchor ||
+            is_rewrite_checkpoint_restore(plan->reuse)) {
+            // No hard gate for private paths: when MTP state is unavailable,
+            // mtp_bridge is set to None below and MTP rebuilds naturally.
+        } else if (plan->reuse == ReusePath::SharedStablePrefix &&
+                   plan->reuse != ReusePath::Root && !checkpoint_ready) {
+            // A shared prefix from another continuation can lose its backend KV under
+            // pressure. If the data is gone, the prefix is truly unusable.
             return std::nullopt;
         }
     }
@@ -698,16 +743,40 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             plan->prepare_mtp = true;
         } else if (plan->reuse == ReusePath::PrivateEndpoint) {
             plan->prepare_mtp = true;
-            plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
-                                    ? MtpBridgeMode::BeforeSuffix
-                                    : MtpBridgeMode::AfterExactHit;
+            // When MTP state is available (tail hidden valid, MTP KV extends to the
+            // reuse point), use the fast bridge path. When it was lost (e.g., per-lane
+            // tail hidden freed after the previous request's lane release), fall back
+            // to natural MTP building during suffix prefill: set mtp_bridge to None so
+            // the execution skips the bridge and rebuilds MTP incrementally.
+            const bool mtp_state_available =
+                source != nullptr && source->tail_hidden_valid &&
+                decoder->mtp_cache() != nullptr &&
+                (plan->reuse_base == 0 || source->mtp_kv_valid >= plan->reuse_base - 1);
+            if (!mtp_state_available) {
+                plan->mtp_bridge = MtpBridgeMode::None;
+            } else {
+                plan->mtp_bridge = plan->reuse_base < plan->summary.prompt_tokens
+                                       ? MtpBridgeMode::BeforeSuffix
+                                       : MtpBridgeMode::AfterExactHit;
+            }
         } else if (is_rewrite_checkpoint_restore(plan->reuse) ||
                    plan->reuse == ReusePath::PrivateLongAnchor ||
                    plan->reuse == ReusePath::SharedStablePrefix) {
             plan->prepare_mtp = true;
-            plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
-                                    ? MtpBridgeMode::BeforeSuffix
-                                    : MtpBridgeMode::AfterExactHit;
+            // Same MTP availability check as PrivateEndpoint: when MTP state is lost,
+            // set bridge to None so MTP rebuilds naturally during prefill.
+            const bool mtp_available =
+                decoder->mtp_cache() != nullptr &&
+                ((source != nullptr && source->mtp_kv_valid >= plan->reuse_base - 1) ||
+                 (shared_source != nullptr &&
+                  shared_source->backend_frontier >= plan->reuse_base - 1));
+            if (!mtp_available) {
+                plan->mtp_bridge = MtpBridgeMode::None;
+            } else {
+                plan->mtp_bridge = plan->reuse_base < plan->summary.prompt_tokens
+                                       ? MtpBridgeMode::BeforeSuffix
+                                       : MtpBridgeMode::AfterExactHit;
+            }
         }
     }
 

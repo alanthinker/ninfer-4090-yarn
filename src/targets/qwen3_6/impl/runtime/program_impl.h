@@ -10068,10 +10068,22 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             }
             if (speculative_backend == SpeculativeBackend::Mtp) {
                 const std::uint32_t mtp_base = base == 0 ? 0 : base - 1;
-                if (!request_plan.prepare_mtp || sequence.mtp_kv_valid < mtp_base) {
-                    throw std::logic_error("resident MTP KV is shorter than the bridge frontier");
+                if (!request_plan.prepare_mtp) {
+                    throw std::logic_error("MTP backend active but prepare_mtp is not set");
                 }
-                sequence.mtp_kv_valid = mtp_base;
+                if (sequence.mtp_kv_valid < mtp_base) {
+                    // MTP state was lost (e.g., per-lane tail hidden and draft KV freed
+                    // after the previous request's lane release). When the bridge mode is
+                    // None, MTP will be rebuilt naturally during suffix prefill. Only
+                    // throw when the bridge mode requires MTP to be pre-existing.
+                    if (request_plan.mtp_bridge != MtpBridgeMode::None) {
+                        throw std::logic_error("resident MTP KV is shorter than the bridge frontier");
+                    }
+                    // MtpBridgeMode::None: accept the gap; MTP rebuilds during prefill.
+                    sequence.mtp_kv_valid = 0;
+                } else {
+                    sequence.mtp_kv_valid = mtp_base;
+                }
             } else if (speculative_backend == SpeculativeBackend::DFlash &&
                        sequence.dflash_context_frontier != base) {
                 throw std::logic_error("resident DFlash context is not at the append frontier");

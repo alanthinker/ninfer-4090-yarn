@@ -67,11 +67,11 @@ std::uint64_t read_count_option(const char* name, std::uint64_t fallback) {
     return parsed;
 }
 
-// A dump file is named req-<unix_ms>-<sequence>-<route>.json. Anything else in the directory is
-// left alone: the directory belongs to the operator, not to this diagnostic.
+// A dump file is named req-<number>-<route>.json. The number is the engine request id after
+// finalization, or the unix-ms timestamp while pending. Anything else in the directory is left
+// alone: the directory belongs to the operator, not to this diagnostic.
 struct DumpFile {
-    std::int64_t stamp = 0;
-    std::uint64_t sequence = 0;
+    std::int64_t number = 0;
     std::filesystem::path path;
 };
 
@@ -81,15 +81,8 @@ bool parse_dump_file_name(const std::string& name, DumpFile& out) {
     if (!name.starts_with(prefix) || !name.ends_with(suffix)) { return false; }
     const char* cursor = name.data() + prefix.size();
     const char* end    = name.data() + name.size() - suffix.size();
-    std::int64_t stamp = 0;
-    std::uint64_t sequence = 0;
-    auto result = std::from_chars(cursor, end, stamp);
+    auto result = std::from_chars(cursor, end, out.number);
     if (result.ec != std::errc() || result.ptr == end || *result.ptr != '-') { return false; }
-    cursor = result.ptr + 1;
-    result = std::from_chars(cursor, end, sequence);
-    if (result.ec != std::errc() || result.ptr == end || *result.ptr != '-') { return false; }
-    out.stamp    = stamp;
-    out.sequence = sequence;
     return true;
 }
 
@@ -112,14 +105,12 @@ void prune_dump_directory(const std::string& directory, std::int64_t now_ms) {
             files.push_back(std::move(file));
         }
     }
-    std::sort(files.begin(), files.end(), [](const DumpFile& left, const DumpFile& right) {
-        return left.stamp != right.stamp ? left.stamp < right.stamp
-                                         : left.sequence < right.sequence;
-    });
+    std::sort(files.begin(), files.end(),
+              [](const DumpFile& left, const DumpFile& right) { return left.number < right.number; });
 
     std::size_t keep_from = 0;
     if (max_age_ms > 0) {
-        while (keep_from < files.size() && now_ms - files[keep_from].stamp > max_age_ms) {
+        while (keep_from < files.size() && now_ms - files[keep_from].number > max_age_ms) {
             ++keep_from;
         }
     }
@@ -132,26 +123,46 @@ void prune_dump_directory(const std::string& directory, std::int64_t now_ms) {
     }
 }
 
-void dump_request_body(const httplib::Request& request, const char* route) {
+std::int64_t dump_request_body(const httplib::Request& request, const char* route) {
+    static const std::string directory = [] {
+        const char* value = std::getenv("NINFER_DUMP_REQUESTS");
+        return value == nullptr ? std::string() : std::string(value);
+    }();
+    if (directory.empty()) { return 0; }
+    try {
+        static std::mutex mutex;
+        std::lock_guard lock(mutex);
+        const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+        const std::string path = directory + "/req-" + std::to_string(stamp) + "-" +
+                                 route + ".json";
+        std::FILE* file = std::fopen(path.c_str(), "wb");
+        if (file == nullptr) { return 0; }
+        (void)std::fwrite(request.body.data(), 1, request.body.size(), file);
+        (void)std::fclose(file);
+        prune_dump_directory(directory, stamp);
+        return stamp;
+    } catch (...) {
+        // A diagnostic failure must never affect serving.
+        return 0;
+    }
+}
+
+void finalize_dump_file(std::int64_t timestamp, std::uint64_t request_id, const char* route) {
+    if (timestamp <= 0) { return; }
     static const std::string directory = [] {
         const char* value = std::getenv("NINFER_DUMP_REQUESTS");
         return value == nullptr ? std::string() : std::string(value);
     }();
     if (directory.empty()) { return; }
     try {
-        static std::mutex mutex;
-        static std::uint64_t sequence = 0;
-        std::lock_guard lock(mutex);
-        const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               std::chrono::system_clock::now().time_since_epoch())
-                               .count();
-        const std::string path = directory + "/req-" + std::to_string(stamp) + "-" +
-                                 std::to_string(sequence++) + "-" + route + ".json";
-        std::FILE* file = std::fopen(path.c_str(), "wb");
-        if (file == nullptr) { return; }
-        (void)std::fwrite(request.body.data(), 1, request.body.size(), file);
-        (void)std::fclose(file);
-        prune_dump_directory(directory, stamp);
+        const std::string old_path = directory + "/req-" + std::to_string(timestamp) + "-" +
+                                     route + ".json";
+        const std::string new_path = directory + "/req-" + std::to_string(request_id) + "-" +
+                                     route + ".json";
+        std::error_code error;
+        std::filesystem::rename(old_path, new_path, error);
     } catch (...) {
         // A diagnostic failure must never affect serving.
     }
@@ -638,12 +649,14 @@ void HttpServer::register_routes() {
     });
     server_.Post("/v1/chat/completions",
                  [this](const httplib::Request& req, httplib::Response& res) {
-                     dump_request_body(req, "chat");
+                     const std::int64_t ts = dump_request_body(req, "chat");
                      handle_chat_completions(req, res);
+                     finalize_dump_file(ts, request_seq_.load(), "chat");
                  });
     server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
-        dump_request_body(req, "responses");
+        const std::int64_t ts = dump_request_body(req, "responses");
         handle_responses(req, res);
+        finalize_dump_file(ts, request_seq_.load(), "responses");
     });
     server_.Post("/v1/responses/input_tokens",
                  [this](const httplib::Request& req, httplib::Response& res) {
@@ -674,8 +687,9 @@ void HttpServer::register_routes() {
                      handle_count_tokens(req, res);
                  });
     server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
-        dump_request_body(req, "messages");
+        const std::int64_t ts = dump_request_body(req, "messages");
         handle_messages(req, res);
+        finalize_dump_file(ts, request_seq_.load(), "messages");
     });
 }
 
