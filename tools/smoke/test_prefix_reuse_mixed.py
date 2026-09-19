@@ -126,55 +126,77 @@ def main():
     parser = argparse.ArgumentParser(description="Mixed-workload prefix cache reuse test")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--conversations", type=int, default=4,
+                        help="Number of conversations (default 4: S/M/L/XL)")
+    parser.add_argument("--base-words", type=int, default=200,
+                        help="Base words for shortest conversation (default 200)")
+    parser.add_argument("--scale", type=float, default=3.0,
+                        help="Size multiplier between consecutive conversations (default 3x)")
+    parser.add_argument("--min-rounds", type=int, default=2,
+                        help="Minimum rounds for the smallest conversation (default 2)")
+    parser.add_argument("--max-rounds", type=int, default=8,
+                        help="Maximum rounds for the largest conversation (default 8)")
     args = parser.parse_args()
 
     base_url = f"http://127.0.0.1:{args.port}/v1/chat/completions"
+    n_conv = args.conversations
     print("=== Mixed-Workload Prefix Cache Reuse Test ===")
     print(f"  Service: http://127.0.0.1:{args.port}")
+    print(f"  Conversations: {n_conv}")
+    print(f"  Size range: {args.base_words}w - {int(args.base_words * args.scale**(n_conv-1))}w")
+    print(f"  Round range: {args.min_rounds} - {args.max_rounds}")
     print()
 
-    # Define conversations with very different sizes and activity levels
-    # SHORT: ~200 words (~800 tokens), 2 rounds
-    # MEDIUM: ~600 words (~2400 tokens), 5 rounds
-    # LONG: ~1200 words (~4800 tokens), 8 rounds
-    # VERY-LONG: ~2000 words (~8000 tokens), 3 rounds (large but few rounds)
-    convs = {
-        "S": Conversation("SHORT", 200),
-        "M": Conversation("MEDIUM", 600),
-        "L": Conversation("LONG", 1200),
-        "XL": Conversation("VERYLONG", 2000),
-    }
+    # Generate conversation sizes: geometric progression
+    # e.g. base=200, scale=3, n=4: [200, 600, 1800, 5400]
+    names = ["S", "M", "L", "XL", "XXL", "XXXL", "A", "B"]
+    convs = {}
+    for i in range(n_conv):
+        words = int(args.base_words * (args.scale ** i))
+        name = names[i] if i < len(names) else f"C{i}"
+        convs[name] = Conversation(name, words)
+
+    # Distribute rounds: smallest gets min_rounds, largest gets max_rounds
+    rounds_for = {}
+    for i, name in enumerate(convs):
+        if n_conv == 1:
+            rounds_for[name] = args.max_rounds
+        else:
+            t = i / (n_conv - 1)
+            rounds_for[name] = round(args.min_rounds + t * (args.max_rounds - args.min_rounds))
 
     print("--- Phase 1: Create conversations (varying sizes) ---")
     for key, conv in convs.items():
         cached, prompt, elapsed = send_request(base_url, conv.messages, max_tokens=20,
                                                 timeout=args.timeout)
-        print(f"  {key:3s} ({conv.initial_words:4d}w): prompt={prompt:5d} time={elapsed:.1f}s")
+        print(f"  {key:4s} ({conv.initial_words:5d}w): prompt={prompt:5d} time={elapsed:.1f}s")
         conv.messages.append({"role": "assistant", "content": f"{conv.name} ack."})
         conv.rounds = 0
 
     print()
-    print("--- Phase 2: Activity bursts (different rounds per conversation) ---")
+    print("--- Phase 2: Activity bursts (largest/most-active first for device pressure) ---")
     all_rounds_hit = True
-    # Very-long gets the most device pressure (large prompts, multiple rounds)
-    all_rounds_hit &= run_conversation_rounds(base_url, convs["XL"], 3, label="XL")
-    all_rounds_hit &= run_conversation_rounds(base_url, convs["L"], 5, label="L")
-    all_rounds_hit &= run_conversation_rounds(base_url, convs["M"], 3, label="M")
-    all_rounds_hit &= run_conversation_rounds(base_url, convs["S"], 2, label="S")
+    # Process in reverse order (largest/most-active first) to maximize device pressure
+    for key in reversed(list(convs.keys())):
+        conv = convs[key]
+        n_rounds = rounds_for[key]
+        all_rounds_hit &= run_conversation_rounds(base_url, conv, n_rounds, label=key)
 
     print()
     print("--- Phase 3: Repeated non-sequential switching ---")
-    # Switch pattern: L → S → XL → M → L → S → XL
-    # Each switch should hit the cache (state preserved in host or device)
-    switch_sequence = [
-        ("L", "LONG: what did we discuss earlier?"),
-        ("S", "SHORT: back again, any updates?"),
-        ("XL", "VERYLONG: continuing our long discussion"),
-        ("M", "MEDIUM: checking in on this thread"),
-        ("L", "LONG: another follow-up question"),
-        ("S", "SHORT: quick final check"),
-        ("XL", "VERYLONG: wrapping up this conversation"),
-    ]
+    # Zigzag pattern: largest → smallest → 2nd-largest → 2nd-smallest → ...
+    # Maximizes device/host state movement
+    keys = list(convs.keys())
+    switch_count = max(4, n_conv * 2)
+    switch_sequence = []
+    for i in range(switch_count):
+        idx = i % (2 * n_conv)
+        if idx < n_conv:
+            key = keys[n_conv - 1 - idx]  # reverse order
+        else:
+            key = keys[idx - n_conv]       # forward order
+        extra_msg = f"{convs[key].name}: switch-back {i+1}"
+        switch_sequence.append((key, extra_msg))
 
     all_switches_hit = True
     for i, (key, extra_msg) in enumerate(switch_sequence):
@@ -184,21 +206,21 @@ def main():
         status = "HIT " if pct > 50 else "MISS"
         if pct <= 50:
             all_switches_hit = False
-        print(f"  Switch {i+1} → {key:3s}: prompt={prompt:5d} cached={cached:5d} "
+        print(f"  Switch {i+1:2d} → {key:4s}: prompt={prompt:5d} cached={cached:5d} "
               f"({pct:3d}%) {elapsed:.2f}s {status}")
 
-    # Phase 4: Go back to the FIRST switch target to test repeated return
+    # Phase 4: Return to all conversations one final time
     print()
-    print("--- Phase 4: Return to previously-visited conversations ---")
-    for key in ["L", "S", "XL"]:
+    print("--- Phase 4: Final return to all conversations ---")
+    for key in keys:
         conv = convs[key]
-        extra = f"{conv.name}: returning after multiple other conversations"
+        extra = f"{conv.name}: final check after full switch cycle"
         cached, prompt, elapsed, pct = switch_to(base_url, conv, extra_user=extra,
                                                   timeout=args.timeout)
         status = "HIT " if pct > 50 else "MISS"
         if pct <= 50:
             all_switches_hit = False
-        print(f"  Return → {key:3s}: prompt={prompt:5d} cached={cached:5d} "
+        print(f"  Return → {key:4s}: prompt={prompt:5d} cached={cached:5d} "
               f"({pct:3d}%) {elapsed:.2f}s {status}")
 
     # Summary

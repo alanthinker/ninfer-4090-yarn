@@ -249,6 +249,8 @@ public:
         }
         if (best == std::numeric_limits<std::uint32_t>::max()) { return false; }
         Object& obj = objects_[best];
+        std::fprintf(stderr, "state-store: LRU evict (D2H demote) handle=%u device_slot=%d -> host_only\n",
+                     static_cast<std::uint32_t>(best), *obj.device_slot);
         return_device_slot(*obj.device_slot);
         obj.device_slot.reset();
         return true;
@@ -347,6 +349,8 @@ public:
             has_pending_replica(object)) {
             return false;
         }
+        std::fprintf(stderr, "state-store: D2H demote handle=%u device_slot=%d -> host_only\n",
+                     handle.index_, *object.device_slot);
         return_device_slot(*object.device_slot);
         object.device_slot.reset();
         return true;
@@ -587,6 +591,10 @@ public:
             abort_transfer(std::move(*transfer));
             throw;
         }
+        Object& object = require(source);
+        std::fprintf(stderr, "state-store: D2H copy handle=%u device_slot=%d -> host_slot=%u\n",
+                     source.index_, object.device_slot ? *object.device_slot : -1,
+                     object.pending_host_slot ? object.pending_host_slot->index : 0);
         return transfer;
     }
 
@@ -600,6 +608,8 @@ public:
         }
         const std::optional<std::int32_t> target = take_device_slot();
         if (!target) { return std::nullopt; }
+        std::fprintf(stderr, "state-store: H2D load handle=%u host_slot=%u -> device_slot=%d\n",
+                     source.index_, object.host_slot->index, *target);
         const std::uint64_t transfer = next_transfer();
         object.pending_device_slot   = *target;
         object.transfer_id           = transfer;
