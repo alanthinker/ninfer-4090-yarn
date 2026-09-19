@@ -28,6 +28,8 @@
 #include <utility>
 #include <vector>
 
+#include <sys/stat.h>
+
 namespace ninfer::serve {
 namespace {
 
@@ -72,6 +74,7 @@ std::uint64_t read_count_option(const char* name, std::uint64_t fallback) {
 // alone: the directory belongs to the operator, not to this diagnostic.
 struct DumpFile {
     std::int64_t number = 0;
+    std::int64_t mtime_ms = 0;  // file last-modification time (ms since epoch)
     std::filesystem::path path;
 };
 
@@ -81,8 +84,12 @@ bool parse_dump_file_name(const std::string& name, DumpFile& out) {
     if (!name.starts_with(prefix) || !name.ends_with(suffix)) { return false; }
     const char* cursor = name.data() + prefix.size();
     const char* end    = name.data() + name.size() - suffix.size();
+    // Format: {number}[-{timestamp}]-{route}
+    // Parse the first number (request sequence or legacy timestamp) as the sort key.
     auto result = std::from_chars(cursor, end, out.number);
-    if (result.ec != std::errc() || result.ptr == end || *result.ptr != '-') { return false; }
+    if (result.ec != std::errc() || result.ptr == end) { return false; }
+    // Expect a dash after the first number (separating it from the route or timestamp).
+    if (*result.ptr != '-') { return false; }
     return true;
 }
 
@@ -102,6 +109,19 @@ void prune_dump_directory(const std::string& directory, std::int64_t now_ms) {
         DumpFile file;
         file.path = entry.path();
         if (parse_dump_file_name(file.path.filename().string(), file)) {
+            // Wall-clock mtime for the age calculation (works for both timestamp-based and
+            // sequence-number-based filenames). std::filesystem::last_write_time must NOT be
+            // used here: since C++20 it is file_clock-based, and libstdc++'s file_clock
+            // epoch is not the Unix epoch, so its time_since_epoch() is incomparable with
+            // the system_clock now_ms and makes every fresh file look "too old" — the
+            // prune then deleted every dump file immediately after it was written.
+            struct stat st{};
+            if (::stat(file.path.c_str(), &st) == 0) {
+                file.mtime_ms = st.st_mtim.tv_sec * 1000 + st.st_mtim.tv_nsec / 1000000;
+            } else {
+                // Unknown age: treat as fresh instead of deleting it on the spot.
+                file.mtime_ms = now_ms;
+            }
             files.push_back(std::move(file));
         }
     }
@@ -110,7 +130,7 @@ void prune_dump_directory(const std::string& directory, std::int64_t now_ms) {
 
     std::size_t keep_from = 0;
     if (max_age_ms > 0) {
-        while (keep_from < files.size() && now_ms - files[keep_from].number > max_age_ms) {
+        while (keep_from < files.size() && now_ms - files[keep_from].mtime_ms > max_age_ms) {
             ++keep_from;
         }
     }
@@ -159,8 +179,14 @@ void finalize_dump_file(std::int64_t timestamp, std::uint64_t request_id, const 
     try {
         const std::string old_path = directory + "/req-" + std::to_string(timestamp) + "-" +
                                      route + ".json";
+        // Format timestamp as ISO 8601 (YYYY-MM-DDTHH:MM:SS) for human readability.
+        const std::time_t seconds = static_cast<std::time_t>(timestamp / 1000);
+        std::tm tm{};
+        gmtime_r(&seconds, &tm);
+        char date_buf[32];
+        std::strftime(date_buf, sizeof(date_buf), "%Y-%m-%dT%H:%M:%S", &tm);
         const std::string new_path = directory + "/req-" + std::to_string(request_id) + "-" +
-                                     route + ".json";
+                                     date_buf + "-" + route + ".json";
         std::error_code error;
         std::filesystem::rename(old_path, new_path, error);
     } catch (...) {
