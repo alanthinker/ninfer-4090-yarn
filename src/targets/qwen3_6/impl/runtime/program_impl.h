@@ -9994,6 +9994,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 if (state_store->role(destination) != StateImageRole::ActiveMutable) {
                     throw std::logic_error("restored StateImage Fork destination is unavailable");
                 }
+                state_store->touch(destination);
                 sequence.state = ActiveStateBinding{.read = destination, .write = destination};
             } else {
                 const std::uint32_t references = state_store->checkpoint_references(selected);
@@ -10029,6 +10030,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             sequence.text_kv_valid = 0;
             sequence.mtp_kv_valid  = 0;
         } else if (preserving_source) {
+            if (sequence.state.read.valid()) { state_store->touch(sequence.state.read); }
             const SequenceState* private_source =
                 transaction.has_source ? &continuation_states[transaction.source_index] : nullptr;
             SharedPrefixState* shared_source =
