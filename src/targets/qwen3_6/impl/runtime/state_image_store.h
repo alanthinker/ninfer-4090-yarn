@@ -206,7 +206,7 @@ public:
 
     // Mark a state as recently touched (for LRU eviction ordering). Called when the state is
     // used as a reuse source, published as a new endpoint, or loaded from host to device.
-    void touch(StateImageHandle handle) noexcept {
+    void touch(StateImageHandle handle) {
         Object& object = require(handle);
         object.last_touched_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                      std::chrono::steady_clock::now().time_since_epoch())
@@ -214,7 +214,7 @@ public:
     }
 
     // Mark this state as an endpoint (vs. anchor) for eviction priority purposes.
-    void mark_endpoint(StateImageHandle handle) noexcept {
+    void mark_endpoint(StateImageHandle handle) {
         require(handle).is_endpoint = true;
     }
 

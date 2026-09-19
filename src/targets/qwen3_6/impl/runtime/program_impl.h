@@ -5060,13 +5060,25 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
     }
     if (host_state_restore) {
         start_context_transfer_timer(runtime::ContextResourceClass::State);
-        std::optional<StateImageTransfer> restore =
-            host_state_fork_destination
-                ? state_store->begin_host_fork(*host_state_restore, *host_state_fork_destination,
-                                               device.transfer_stream)
-                : state_store->begin_host_to_device(*host_state_restore, device.transfer_stream);
-        if (!restore) { throw std::bad_alloc(); }
-        transaction.state_restore.emplace(std::move(*restore));
+        auto attempt_restore = [&]() -> bool {
+            if (host_state_fork_destination) {
+                auto t = state_store->begin_host_fork(*host_state_restore,
+                                                      *host_state_fork_destination,
+                                                      device.transfer_stream);
+                if (!t) { return false; }
+                transaction.state_restore.emplace(std::move(*t));
+            } else {
+                auto t = state_store->begin_host_to_device(*host_state_restore, device.transfer_stream);
+                if (!t) { return false; }
+                transaction.state_restore.emplace(std::move(*t));
+            }
+            return true;
+        };
+        if (!attempt_restore()) {
+            // No free device slot: evict the LRU state to make room, then retry.
+            (void)state_store->evict_lru([](const auto&) { return false; });
+            if (!attempt_restore()) { throw std::bad_alloc(); }
+        }
         stop_context_transfer_timer(runtime::ContextResourceClass::State);
         transaction.transfer_timer_mask |=
             1U << context_resource_index(runtime::ContextResourceClass::State);
@@ -8191,7 +8203,9 @@ void ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
 
     state_store->freeze(transaction.source_state);
     state_store->touch(transaction.source_state);
-    state_store->mark_endpoint(transaction.source_state);
+    if (!transaction.group.long_anchor) {
+        state_store->mark_endpoint(transaction.source_state);
+    }
     if (transaction.state_placement == qwen3_6::CaptureStatePlacement::DeviceFork) {
         (void)state_store->begin_fork(transaction.source_state, transaction.destination_state);
         sequence.state = ActiveStateBinding{.read         = transaction.source_state,
@@ -9993,6 +10007,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                                                      : StateReadOwnership::ExternalOwner;
                 const StateImageSelectors selectors =
                     state_store->begin_fork(selected, destination);
+                state_store->touch(selected);
                 if (speculative_backend == SpeculativeBackend::DFlash) {
                     state_images->copy_dflash_local(selectors.source, selectors.destination,
                                                     device.stream);
