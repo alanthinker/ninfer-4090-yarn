@@ -2,8 +2,10 @@
 
 #include <ninfer/targets/qwen3_6/state_image.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -200,6 +202,56 @@ public:
 
     [[nodiscard]] std::uint64_t content_epoch(StateImageHandle handle) const {
         return require(handle).content_epoch;
+    }
+
+    // Mark a state as recently touched (for LRU eviction ordering). Called when the state is
+    // used as a reuse source, published as a new endpoint, or loaded from host to device.
+    void touch(StateImageHandle handle) noexcept {
+        Object& object = require(handle);
+        object.last_touched_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count();
+    }
+
+    // Mark this state as an endpoint (vs. anchor) for eviction priority purposes.
+    void mark_endpoint(StateImageHandle handle) noexcept {
+        require(handle).is_endpoint = true;
+    }
+
+    // Evict the least-recently-touched state that has both device and host replicas, is a
+    // CheckpointImmutable, and is not pinned/referenced. Frees one device slot (the evicted
+    // state survives as HostOnly). Anchors are preferred over endpoints; among the same
+    // class the least-recently-touched is evicted. The exclude callback (template parameter
+    // to avoid the incomplete-type issue with Object) can veto specific states.
+    // Returns true if a state was evicted.
+    template <class ExcludeFn>
+    [[nodiscard]] bool evict_lru(ExcludeFn&& exclude) noexcept {
+        std::uint32_t best = std::numeric_limits<std::uint32_t>::max();
+        std::uint64_t best_touched = std::numeric_limits<std::uint64_t>::max();
+        bool best_is_anchor = true;
+        for (std::uint32_t i = 0; i < objects_.size(); ++i) {
+            const Object& obj = objects_[i];
+            if (obj.role != StateImageRole::CheckpointImmutable) { continue; }
+            if (!obj.device_slot) { continue; }
+            if (!obj.host_slot) { continue; }
+            if (obj.source_pins != 0 || obj.destination_pinned || has_pending_replica(obj)) {
+                continue;
+            }
+            if (exclude(obj)) { continue; }
+            const bool is_anchor = !obj.is_endpoint;
+            if (best == std::numeric_limits<std::uint32_t>::max() ||
+                (is_anchor && !best_is_anchor) ||
+                (is_anchor == best_is_anchor && obj.last_touched_ns < best_touched)) {
+                best = i;
+                best_touched = obj.last_touched_ns;
+                best_is_anchor = is_anchor;
+            }
+        }
+        if (best == std::numeric_limits<std::uint32_t>::max()) { return false; }
+        Object& obj = objects_[best];
+        return_device_slot(*obj.device_slot);
+        obj.device_slot.reset();
+        return true;
     }
 
     [[nodiscard]] std::uint32_t source_pins(StateImageHandle handle) const {
@@ -730,6 +782,15 @@ private:
         std::uint32_t source_pins           = 0;
         bool destination_pinned             = false;
         StateImageRole role                 = StateImageRole::Free;
+        // LRU eviction metadata: last time this state was touched (used as a reuse source,
+        // published as a new endpoint, or loaded from host to device). Used by evict_lru()
+        // to select the least-recently-used state for eviction when device slots are full.
+        std::uint64_t last_touched_ns = 0;
+        // True if this state is a session endpoint or rewrite checkpoint (a reuse target for
+        // the next request in the same session). False for long anchors (fallback reuse
+        // points at intermediate positions). Endpoints are lower-priority eviction targets
+        // than anchors because they are more likely to be reused next.
+        bool is_endpoint = false;
     };
 
     [[nodiscard]] static bool has_pending_replica(const Object& object) noexcept {

@@ -4903,7 +4903,14 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
     }
     for (std::uint32_t index = 0; index < state_count; ++index) {
         std::optional<StateImageHandle> state = state_store->reserve_destination();
-        if (!state) { throw std::bad_alloc(); }
+        if (!state) {
+            // No free device slot: evict the LRU state (anchor preferred over endpoint,
+            // oldest first) to make room. This ensures the active request always gets
+            // the device slots it needs, even when idle sessions' states fill the pool.
+            (void)state_store->evict_lru([](const auto&) { return false; });
+            state = state_store->reserve_destination();
+            if (!state) { throw std::bad_alloc(); }
+        }
         transaction.reserved_states[transaction.reserved_state_count++] = *state;
     }
     if (!transaction.has_source && !transaction.has_shared_source) {
@@ -8183,6 +8190,8 @@ void ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
     }
 
     state_store->freeze(transaction.source_state);
+    state_store->touch(transaction.source_state);
+    state_store->mark_endpoint(transaction.source_state);
     if (transaction.state_placement == qwen3_6::CaptureStatePlacement::DeviceFork) {
         (void)state_store->begin_fork(transaction.source_state, transaction.destination_state);
         sequence.state = ActiveStateBinding{.read         = transaction.source_state,
@@ -9957,6 +9966,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     throw std::logic_error("planned StateImage Move is no longer valid");
                 }
                 state_store->move_checkpoint_to_active(selected);
+                state_store->touch(selected);
+                state_store->mark_endpoint(selected);
                 sequence.state = ActiveStateBinding{.read = selected, .write = selected};
                 return;
             }
