@@ -366,12 +366,20 @@ public:
                  1024U /
                 kPlanningFloorFullTokens) /
                 1024U;
+        // Cap the planning budget by the cost of the root prefill it is trying to avoid.
+        // A 45-token prompt costs ~150 ms to prefill; spending 12.5 s of host-CPU
+        // searching for a reuse hit that saves 45 tokens is never worth it. For large
+        // prompts (100k+ tokens) the root cost is hundreds of seconds, so the cap is
+        // far above the 90 s hard limit and has no effect.
+        const std::uint64_t root_prefill_ns =
+            machine_cost.prefill_ns(PrefillWork{.chunks = 1, .tokens = prompt_tokens});
+        const std::uint64_t root_cost_cap_ns =
+            root_prefill_ns > UINT64_MAX / 10U ? UINT64_MAX : root_prefill_ns * 10U;
+        const std::uint64_t floors_max = std::max<std::uint64_t>(
+            size_floor_ns, std::max(incumbent.cost.total_ns / 20U, candidate_floor_ns));
+        const std::uint64_t capped_by_root = std::min(root_cost_cap_ns, floors_max);
         const std::uint64_t search_budget_ns =
-            std::min<std::uint64_t>(90'000'000'000ULL,
-                                    std::max<std::uint64_t>(size_floor_ns,
-                                                             std::max(incumbent.cost.total_ns /
-                                                                          20U,
-                                                                      candidate_floor_ns)));
+            std::min<std::uint64_t>(90'000'000'000ULL, capped_by_root);
         // The directed pass seeds each candidate's own retention closure, one candidate per
         // iteration, so its window scales per candidate at the same rate; after it spends the
         // window, the best-first phase evaluates whatever remains within the full budget.
@@ -658,6 +666,12 @@ public:
             if (elapsed >= search_budget_ns) {
                 stop_reason      = MaterializationStopReason::TimeBudget;
                 budget_exhausted = true;
+                break;
+            }
+            // A* dominance: if the cheapest remaining node's lower bound is >= the incumbent's
+            // total cost, no remaining node can improve the solution. Stop immediately.
+            if (next_bound >= incumbent.cost.total_ns) {
+                stop_reason = MaterializationStopReason::QueueExhausted;
                 break;
             }
             const std::uint64_t possible_improvement =

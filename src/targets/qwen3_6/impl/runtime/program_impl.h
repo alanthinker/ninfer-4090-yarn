@@ -1277,13 +1277,17 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_admission(
             ? runtime::MaterializationPhysicalStatus::Feasible
             : runtime::MaterializationPhysicalStatus::Infeasible;
     plan->impl_->identity_assessment.source_mode = plan->impl_->source_mode;
+    // Only HostToDevice transfers (state loading from host RAM, potentially seconds) warrant a
+    // pressure search: evicting the destination to avoid the load might save real time.
+    // DeviceToDevice transfers (state between GPU slots, ~15 ms for 147 MB) are never worth
+    // searching — no eviction strategy beats a 15 ms in-memory copy.
     plan->impl_->identity_assessment.pressure_may_change_machine_work =
         plan->impl_->has_source &&
         plan->impl_->source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
         std::any_of(
             plan->impl_->transfer_requirements.begin(), plan->impl_->transfer_requirements.end(),
             [](const runtime::ContextTransferRequirement& requirement) {
-                return requirement.direction == runtime::ContextTransferDirection::DeviceToDevice;
+                return requirement.direction == runtime::ContextTransferDirection::HostToDevice;
             });
     plan->impl_->identity_assessment.expandable =
         identity_status != runtime::PreflightStatus::Ready;
