@@ -816,9 +816,15 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (!plan.context_cache.max_private_continuations || !plan.context_cache.max_shared_prefixes) {
         throw std::logic_error("Qwen3.6 context cache options are not normalized");
     }
+    // The recovery index needs descriptors of its own. An address space is cheap bookkeeping (one
+    // membership entry per logical KV page); what a retained address actually holds is bounded by
+    // the Device page pool and the Host KV arena, not by this count. Sizing the pool for the
+    // catalog alone leaves no free descriptor once the catalog saturates, so no evicted
+    // conversation could keep its KV and adoption could never match on both halves.
+    constexpr std::uint64_t kRecoveryAddressBudget = 32;
     const std::uint64_t address_capacity64 =
         static_cast<std::uint64_t>(*plan.context_cache.max_private_continuations) +
-        *plan.context_cache.max_shared_prefixes;
+        *plan.context_cache.max_shared_prefixes + kRecoveryAddressBudget;
     if (address_capacity64 == 0 || address_capacity64 > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("Qwen3.6 KV address-space capacity exceeds uint32");
     }
@@ -6589,6 +6595,50 @@ std::optional<std::uint32_t> ProgramImplCore::allocate_continuation_slot() noexc
     return std::nullopt;
 }
 
+bool ProgramImplCore::demote_address_kv_to_host(KVAddressSpaceStore& addresses,
+                                               LogicalKVPageStore& pages,
+                                               KVAddressSpaceHandle address) {
+    if (!host_kv_extents) { return false; }
+    const std::uint32_t mapped = addresses.mapped_pages(address);
+    if (mapped == 0) { return false; }
+    std::vector<LogicalKVPageHandle> copy;    // Device-only pages: copy to Host first
+    std::vector<LogicalKVPageHandle> drop;    // already Host-resident: only the Device copy goes
+    copy.reserve(mapped);
+    drop.reserve(mapped);
+    for (std::uint32_t index = 0; index < mapped; ++index) {
+        const LogicalKVPageHandle logical = addresses.logical_page(address, index);
+        if (!pages.device_resident(logical)) { continue; }
+        if (pages.host_replica_current(logical)) {
+            // The Host copy is already current, so only the Device copy has to go.
+            if (pages.can_drop_device_replica(logical)) { drop.push_back(logical); }
+            continue;
+        }
+        // DeviceOnly page: it has to be copied first, so the copy candidate is gated on being
+        // pinnable as a Host source rather than on an existing Host replica.
+        if (pages.can_pin_source(logical)) { copy.push_back(logical); }
+    }
+    if (!copy.empty()) {
+        std::optional<HostKVExtentReservation> reserved = host_kv_extents->prepare(pages, copy);
+        if (!reserved) { return false; }
+        const std::vector<DeviceKVPageHandle> sources = host_kv_extents->device_sources(*reserved);
+        if (sources.size() != copy.size()) { return false; }
+        pages.physical_pool().copy_to_host(sources, host_kv_extents->writable_view(*reserved),
+                                           device.transfer_stream);
+        // The Device copies may only be dropped once the transfer has read them.
+        if (device.transfer_stream != nullptr) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
+        }
+        (void)host_kv_extents->publish(std::move(*reserved));
+    }
+    for (const LogicalKVPageHandle page : drop) {
+        if (!pages.drop_device_replica(page)) { return false; }
+    }
+    for (const LogicalKVPageHandle page : copy) {
+        if (!pages.drop_device_replica(page)) { return false; }
+    }
+    return true;
+}
+
 bool ProgramImplCore::release_state_capacity_step() {
     if (release_one_device_state_slot()) { return true; }
     if (release_oldest_unbound_index_entry()) { return true; }
@@ -6827,6 +6877,10 @@ void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index) noex
                  state_store ? state_store->debug_index(sequence.state.read) : 0,
                  state_store ? state_store->debug_generation(sequence.state.read) : 0,
                  text_kv_addresses ? text_kv_addresses->free_count() : 0);
+    if (sequence.ledger.size() >= 4) {
+        std::fprintf(stderr, "[evict]   tokens=%u,%u,%u,%u\n", sequence.ledger[0],
+                     sequence.ledger[1], sequence.ledger[2], sequence.ledger[3]);
+    }
     std::fflush(stderr);
     // Register in StateIndex/KVIndex before releasing, so data survives catalog eviction
     // and can be recovered via adopt.
@@ -6857,9 +6911,28 @@ void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index) noex
     if (kv_index && sequence.kv && text_kv_addresses) {
         const auto& digests = sequence.prefix_digests;
         const std::uint32_t frontier = sequence.text_kv_valid;
-        // Guard: only pin if enough free address slots remain for capture + next request.
-        if (frontier > 0 && digests.size() > frontier &&
-            text_kv_addresses->free_count() >= 2) {
+        // Two conditions have to hold before a conversation may keep its KV for recovery: an
+        // address descriptor must remain free for the capture and the next request, and the Host
+        // arena must be able to take every Device replica. Otherwise the KV is released with the
+        // catalog entry, which is the intended drop when nothing can take the data.
+        const bool has_address_budget = frontier > 0 && digests.size() > frontier &&
+                                        text_kv_addresses->free_count() >= 2;
+        bool demoted = false;
+        if (has_address_budget) {
+            demoted = demote_address_kv_to_host(*text_kv_addresses, *text_kv_pages,
+                                                sequence.kv->text);
+            if (demoted && sequence.kv->backend && backend_kv_addresses && backend_kv_pages) {
+                demoted = demote_address_kv_to_host(*backend_kv_addresses, *backend_kv_pages,
+                                                    *sequence.kv->backend);
+            }
+        }
+        if (has_address_budget && !demoted) {
+            std::fprintf(stderr,
+                         "[kvindex] SKIP frontier=%u: Host arena refused the replicas (free=%u)\n",
+                         frontier, text_kv_addresses->free_count());
+            std::fflush(stderr);
+        }
+        if (has_address_budget && demoted) {
             const auto evicted = kv_index->insert(
                 digests.at(frontier), sequence.kv->text,
                 sequence.kv->backend ? std::optional<KVAddressSpaceHandle>(*sequence.kv->backend)
@@ -6875,6 +6948,11 @@ void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index) noex
                     (void)backend_kv_addresses->release(*evicted->backend_address);
                 }
             }
+            std::fprintf(stderr,
+                         "[kvindex] RETAIN frontier=%u free_before=%u occupied=%zu cap=%zu\n",
+                         frontier, text_kv_addresses->free_count(), kv_index->occupied(),
+                         kv_index->capacity());
+            std::fflush(stderr);
             text_kv_addresses->retain_pin(sequence.kv->text);
             if (sequence.kv->backend && backend_kv_addresses) {
                 backend_kv_addresses->retain_pin(*sequence.kv->backend);
@@ -6897,9 +6975,28 @@ void ProgramImplCore::release_continuation_slot_best_effort(std::uint32_t index)
     if (kv_index && sequence.kv && text_kv_addresses) {
         const auto& digests = sequence.prefix_digests;
         const std::uint32_t frontier = sequence.text_kv_valid;
-        // Guard: only pin if enough free address slots remain for capture + next request.
-        if (frontier > 0 && digests.size() > frontier &&
-            text_kv_addresses->free_count() >= 2) {
+        // Two conditions have to hold before a conversation may keep its KV for recovery: an
+        // address descriptor must remain free for the capture and the next request, and the Host
+        // arena must be able to take every Device replica. Otherwise the KV is released with the
+        // catalog entry, which is the intended drop when nothing can take the data.
+        const bool has_address_budget = frontier > 0 && digests.size() > frontier &&
+                                        text_kv_addresses->free_count() >= 2;
+        bool demoted = false;
+        if (has_address_budget) {
+            demoted = demote_address_kv_to_host(*text_kv_addresses, *text_kv_pages,
+                                                sequence.kv->text);
+            if (demoted && sequence.kv->backend && backend_kv_addresses && backend_kv_pages) {
+                demoted = demote_address_kv_to_host(*backend_kv_addresses, *backend_kv_pages,
+                                                    *sequence.kv->backend);
+            }
+        }
+        if (has_address_budget && !demoted) {
+            std::fprintf(stderr,
+                         "[kvindex] SKIP frontier=%u: Host arena refused the replicas (free=%u)\n",
+                         frontier, text_kv_addresses->free_count());
+            std::fflush(stderr);
+        }
+        if (has_address_budget && demoted) {
             const auto evicted = kv_index->insert(
                 digests.at(frontier), sequence.kv->text,
                 sequence.kv->backend ? std::optional<KVAddressSpaceHandle>(*sequence.kv->backend)
@@ -6917,6 +7014,11 @@ void ProgramImplCore::release_continuation_slot_best_effort(std::uint32_t index)
                 }
             }
             // Pin the new entry.
+            std::fprintf(stderr,
+                         "[kvindex] RETAIN frontier=%u free_before=%u occupied=%zu cap=%zu\n",
+                         frontier, text_kv_addresses->free_count(), kv_index->occupied(),
+                         kv_index->capacity());
+            std::fflush(stderr);
             text_kv_addresses->retain_pin(sequence.kv->text);
             if (sequence.kv->backend && backend_kv_addresses) {
                 backend_kv_addresses->retain_pin(*sequence.kv->backend);
@@ -9771,7 +9873,43 @@ ProgramImplCore::try_adopt_from_index(const PreparedPromptData& prompt,
         best_state = entry;
         best_kv    = kv_hit;
     });
-    if (!best_state || !best_kv) { return std::nullopt; }
+    if (!best_state || !best_kv) {
+        std::size_t entries = 0;
+        std::size_t digest_hits = 0;
+        std::size_t state_hits = 0;
+        std::size_t kv_misses = 0;
+        state_index->for_each([&](const StateIndex::Entry& entry) {
+            ++entries;
+            if (entry.frontier == 0 || entry.frontier > digests.size()) { return; }
+            if (digests.at(entry.frontier) != entry.digest) { return; }
+            ++digest_hits;
+            if (!state_store->valid(entry.state)) { return; }
+            ++state_hits;
+            if (!kv_index->lookup(entry.digest)) { ++kv_misses; }
+        });
+        std::fprintf(stderr,
+                     "[adopt] MISS detail: state_entries=%zu digest_hits=%zu state_hits=%zu "
+                     "kv_missing=%zu kv_entries=%zu prompt_tokens=%zu\n",
+                     entries, digest_hits, state_hits, kv_misses, kv_index->occupied(),
+                     digests.size());
+        if (prompt.token_ids.size() >= 4) {
+            std::fprintf(stderr, "[adopt]   prompt tokens=%u,%u,%u,%u\n", prompt.token_ids[0],
+                         prompt.token_ids[1], prompt.token_ids[2], prompt.token_ids[3]);
+        }
+        std::size_t shown = 0;
+        state_index->for_each([&](const StateIndex::Entry& entry) {
+            if (shown >= 2) { return; }
+            ++shown;
+            const bool in_range = entry.frontier != 0 && entry.frontier <= digests.size();
+            std::fprintf(stderr,
+                         "[adopt]   entry state=%u/%u frontier=%u kv_hit=%d digest_match=%d\n",
+                         state_store->debug_index(entry.state),
+                         state_store->debug_generation(entry.state), entry.frontier,
+                         kv_index->lookup(entry.digest) ? 1 : 0,
+                         (in_range && digests.at(entry.frontier) == entry.digest) ? 1 : 0);
+        });
+        return std::nullopt;
+    }
     {
         const std::uint32_t frontier = best_state->frontier;
         const StateImageHandle state = best_state->state;

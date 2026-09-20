@@ -1234,6 +1234,13 @@ private:
     // demote a retained state to Host, then drop the oldest unbound recovery entry, then retire the
     // oldest idle continuation. Returns false when no further step can free anything.
     [[nodiscard]] bool release_state_capacity_step();
+    // Move every Device replica of a retained KV address into the Host KV arena. A retained
+    // address outlives its catalog entry, so holding Device pages for it would exhaust the Device
+    // page pool; adoption restores the pages through the existing Host-to-Device path. Returns
+    // false when the Host arena cannot take the replicas, and the caller then drops the KV.
+    [[nodiscard]] bool demote_address_kv_to_host(KVAddressSpaceStore& addresses,
+                                                 LogicalKVPageStore& pages,
+                                                 KVAddressSpaceHandle address);
     // Reserve a private StateImage destination, releasing capacity step by step until it succeeds.
     [[nodiscard]] std::optional<StateImageHandle> reserve_state_destination_with_release();
     // The same, for a logical (Host-replica) destination, which consumes a StateImage object but no
