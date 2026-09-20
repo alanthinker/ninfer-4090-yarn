@@ -154,6 +154,11 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
     std::optional<std::uint32_t> max_long_anchors_per_continuation;
+    // Offer the recovery index (StateIndex/KVIndex) as a normal materialization candidate instead
+    // of only when no catalog candidate matched. A conversation that kept its state and KV across
+    // catalog eviction is then compared against the catalog instead of being ignored whenever some
+    // shorter catalog prefix happens to match. Diagnostic and test knob.
+    bool prefer_index_adopt = false;
     // Fair-share checkpoint retention: the most recently active N private sessions are
     // victim-protected (their checkpoints are excluded from pressure victim domains and from
     // shared-capture pressure) until a request that fits no other way forces the engine to

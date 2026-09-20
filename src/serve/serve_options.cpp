@@ -141,6 +141,7 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --prefer-index-adopt offers the recovery index as a normal reuse candidate\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
@@ -377,6 +378,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--prefer-index-adopt") {
+            options.context_cache.prefer_index_adopt = true;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {

@@ -76,7 +76,8 @@ public:
                      options.context_cache.max_shared_prefixes.value(),
                      options.context_cache.enabled,
                      options.context_cache.max_long_anchors_per_continuation.value_or(0),
-                     options.context_cache.fair_share_buckets, std::move(context_cost)) {
+                     options.context_cache.fair_share_buckets,
+                     options.context_cache.prefer_index_adopt, std::move(context_cost)) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");

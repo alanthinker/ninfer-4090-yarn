@@ -6949,9 +6949,9 @@ void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index) noex
                 }
             }
             std::fprintf(stderr,
-                         "[kvindex] RETAIN frontier=%u free_before=%u occupied=%zu cap=%zu\n",
-                         frontier, text_kv_addresses->free_count(), kv_index->occupied(),
-                         kv_index->capacity());
+                         "[kvindex] RETAIN path=%s frontier=%u free_before=%u occupied=%zu cap=%zu\n",
+                         __func__, frontier, text_kv_addresses->free_count(),
+                         kv_index->occupied(), kv_index->capacity());
             std::fflush(stderr);
             text_kv_addresses->retain_pin(sequence.kv->text);
             if (sequence.kv->backend && backend_kv_addresses) {
@@ -7015,9 +7015,9 @@ void ProgramImplCore::release_continuation_slot_best_effort(std::uint32_t index)
             }
             // Pin the new entry.
             std::fprintf(stderr,
-                         "[kvindex] RETAIN frontier=%u free_before=%u occupied=%zu cap=%zu\n",
-                         frontier, text_kv_addresses->free_count(), kv_index->occupied(),
-                         kv_index->capacity());
+                         "[kvindex] RETAIN path=%s frontier=%u free_before=%u occupied=%zu cap=%zu\n",
+                         __func__, frontier, text_kv_addresses->free_count(),
+                         kv_index->occupied(), kv_index->capacity());
             std::fflush(stderr);
             text_kv_addresses->retain_pin(sequence.kv->text);
             if (sequence.kv->backend && backend_kv_addresses) {
@@ -9852,7 +9852,13 @@ ProgramImplCore::try_adopt_from_index(const PreparedPromptData& prompt,
             break;
         }
     }
-    if (free_slot >= continuation_capacity) { return std::nullopt; }
+    if (free_slot >= continuation_capacity) {
+        std::fprintf(stderr,
+                     "[adopt] MISS: no free catalog slot (capacity=%u occupied), entries=%zu/%zu\n",
+                     continuation_capacity, state_index->occupied(), kv_index->occupied());
+        std::fflush(stderr);
+        return std::nullopt;
+    }
 
     // Recovery is keyed by the frontier each index entry was stored at. An evicted conversation
     // comes back as its own prefix plus new tokens, so its stored frontier is not aligned to any
