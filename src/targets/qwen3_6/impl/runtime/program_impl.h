@@ -6592,6 +6592,14 @@ std::optional<std::uint32_t> ProgramImplCore::allocate_continuation_slot() noexc
 // it computes for the same text can differ and the stored digest never matches. The recovery index
 // only has to find a candidate: correctness is still enforced by the exact prefix comparison during
 // inspection, so its key is content-only and reproducible by any request that resends those tokens.
+std::uint32_t ProgramImplCore::occupied_catalog_slots() const noexcept {
+    std::uint32_t count = 0;
+    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
+        if (continuation_slots[index].role != ContinuationSlotRole::Free) { ++count; }
+    }
+    return count;
+}
+
 bool ProgramImplCore::state_bound_by_live_sequence(StateImageHandle state) const {
     if (!state.valid()) { return false; }
     const auto binds = [state](const SequenceState& sequence) {
@@ -6793,11 +6801,18 @@ void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index) noex
     SequenceState& sequence = continuation_states[index];
     std::fprintf(stderr,
                  "[evict] slot=%u frontier=%u text_kv_valid=%u ledger=%zu anchors=%zu "
-                 "endpoint=%d state_valid=%d\n",
+                 "endpoint=%d state_valid=%d | host_state=%u/%u device_state=%u/%u "
+                 "host_kv=%zuMiB catalog=%u/%u\n",
                  index, sequence.execution_frontier, sequence.text_kv_valid,
                  sequence.ledger.size(), sequence.long_anchors.size(),
                  sequence.endpoint_valid ? 1 : 0,
-                 (state_store && state_store->valid(sequence.state.read)) ? 1 : 0);
+                 (state_store && state_store->valid(sequence.state.read)) ? 1 : 0,
+                 state_store ? state_store->host_occupied() : 0,
+                 host_state_images ? host_state_images->capacity() : 0,
+                 state_store ? state_store->device_occupied() : 0,
+                 state_store ? state_store->device_capacity() : 0,
+                 host_kv_arena ? host_kv_arena->occupied_bytes() / (1024U * 1024U) : 0,
+                 occupied_catalog_slots(), continuation_capacity);
     if (sequence.ledger.size() >= 4) {
         std::fprintf(stderr, "[evict]   tokens=%u,%u,%u,%u\n", sequence.ledger[0],
                      sequence.ledger[1], sequence.ledger[2], sequence.ledger[3]);

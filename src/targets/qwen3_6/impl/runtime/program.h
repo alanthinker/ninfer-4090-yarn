@@ -1205,6 +1205,8 @@ private:
     // frozen endpoint is bound directly and therefore carries no checkpoint_references, so the
     // reference count alone does not prove that nobody is using it.
     [[nodiscard]] bool state_bound_by_live_sequence(StateImageHandle state) const;
+    // Number of continuation catalog slots currently occupied (any non-Free role).
+    [[nodiscard]] std::uint32_t occupied_catalog_slots() const noexcept;
     // Last-resort release when the StateImage pools are exhausted and every remaining state is
     // bound by a live continuation: retire the idle (catalogued) continuation whose state was
     // touched longest ago, and with it the state object it owns. Returns false when no idle
