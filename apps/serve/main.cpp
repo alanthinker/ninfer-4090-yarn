@@ -11,6 +11,7 @@
 #include <chrono>
 #include <filesystem>
 #include <csignal>
+#include <execinfo.h>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -132,6 +133,22 @@ void log_engine_capacity(const std::shared_ptr<spdlog::logger>& logger,
 } // namespace
 
 int main(int argc, char** argv) {
+    std::set_terminate([]() {
+        std::fprintf(stderr, "[FATAL] std::terminate called. Stack:\n");
+        void* frames[32];
+        const int n = backtrace(frames, 32);
+        backtrace_symbols_fd(frames, n, 2);
+        std::fflush(stderr);
+        std::abort();
+    });
+    // Log failed allocations to diagnose bad_alloc
+    std::set_new_handler([]() {
+        std::fprintf(stderr, "[mem-diag] new_handler: allocation FAILED (bad_alloc about to throw)\n");
+        void* frames[32];
+        const int n = backtrace(frames, 32);
+        backtrace_symbols_fd(frames, n, 2);
+        std::fflush(stderr);
+    });
     ninfer::serve::ServeOptions options;
     try {
         options = ninfer::serve::parse_serve_options(argc, argv);

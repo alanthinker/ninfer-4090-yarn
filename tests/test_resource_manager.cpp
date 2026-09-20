@@ -647,6 +647,15 @@ public:
         return base.isolated_feasible;
     }
 
+    struct FakeAdoptedSource {
+        FakeContinuationHandle handle;
+        std::uint32_t frontier = 0;
+    };
+    [[nodiscard]] std::optional<FakeAdoptedSource>
+    try_adopt_from_index(const FakePreparedPrompt&, const FakeRequestBasePlan&) {
+        return std::nullopt;
+    }
+
     [[nodiscard]] std::optional<FakeAdmissionCandidate>
     inspect_admission(const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base, LaneId,
                       const FakeContinuationHandle* source,

@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/host_kv_arena.h"
+#include "core/site_bad_alloc.h"
 
 #include <algorithm>
 #include <limits>
@@ -280,7 +281,9 @@ bool DeviceKVPagePool::can_resize_reservation(const DeviceKVPageReservation& res
 
 void DeviceKVPagePool::resize_reservation(DeviceKVPageReservation& reservation,
                                           std::uint32_t new_reserved_pages) {
-    if (!can_resize_reservation(reservation, new_reserved_pages)) { throw std::bad_alloc(); }
+    if (!can_resize_reservation(reservation, new_reserved_pages)) {
+        NINFER_SITE_BAD_ALLOC("paged_kv_cache: DeviceKVPagePool resize_reservation");
+    }
     reserved_pages_    = reserved_pages_ - reservation.pages_ + new_reserved_pages;
     reservation.pages_ = new_reserved_pages;
 }

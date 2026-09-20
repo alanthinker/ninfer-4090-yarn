@@ -78,6 +78,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             write_openai_error(res, exception.error());
             return;
         } catch (const std::exception& exception) {
+            std::fprintf(stderr, "[serve] EXCEPTION during generation: %s\n", exception.what());
+            std::fflush(stderr);
             const RequestFailure failure =
                 make_internal_request_failure(RequestFailurePhase::Generation, exception.what());
             lifecycle->failure(failure);

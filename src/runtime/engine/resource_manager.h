@@ -1819,7 +1819,7 @@ private:
         int rejected = 0;
         const std::vector<std::uint32_t> protected_slots = fair_share_protected_slots();
         std::fprintf(stderr,
-                     "reuse-diag: prompt=%u index=%zu catalog=%zu shared=%zu fair=%zu\n",
+                     "reuse-diag: prompt=%u index=%zu catalog=%u shared=%u fair=%zu\n",
                      base.summary().prompt_tokens, prefix_index_.size(), catalog_count_,
                      shared_catalog_count_, protected_slots.size());
         for (const PrefixIndexEntry& index : prefix_index_) {
@@ -1859,24 +1859,6 @@ private:
                 verdict = "REJECT frontier-beyond-prompt";
             } else if (*incoming != index.key) {
                 verdict = "REJECT digest-mismatch";
-                // TEMP-DEBUG: dump raw key bytes to identify which field differs
-                const auto& in  = *incoming;
-                const auto& st  = index.key;
-                const auto* in_bytes = reinterpret_cast<const unsigned char*>(&in);
-                const auto* st_bytes = reinterpret_cast<const unsigned char*>(&st);
-                std::fprintf(stderr,
-                    "reuse-diag:     MISMATCH@%u incoming=", index.key.frontier);
-                for (std::size_t bi = 0; bi < sizeof(in); ++bi) {
-                    std::fprintf(stderr, "%02x", in_bytes[bi]);
-                    if (in_bytes[bi] != st_bytes[bi]) {
-                        std::fprintf(stderr, "*", std::size_t{});
-                    }
-                }
-                std::fprintf(stderr, " stored=");
-                for (std::size_t bi = 0; bi < sizeof(st); ++bi) {
-                    std::fprintf(stderr, "%02x", st_bytes[bi]);
-                }
-                std::fprintf(stderr, "\n");
             } else {
                 verdict = "CANDIDATE";
                 ++accepted;
