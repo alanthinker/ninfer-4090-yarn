@@ -248,7 +248,7 @@ public:
             if (kind == SlotReleaseKind::DropDeviceReplica && !obj.host_slot) { continue; }
             if (kind != SlotReleaseKind::DropDeviceReplica && obj.host_slot) { continue; }
             if (kind == SlotReleaseKind::Drop &&
-                (obj.checkpoint_references != 0 || obj.index_pin != 0)) {
+                obj.checkpoint_references != 0) {
                 continue;
             }
             if (obj.source_pins != 0 || obj.destination_pinned || has_pending_replica(obj)) {
@@ -292,25 +292,6 @@ public:
         --object.checkpoint_references;
     }
 
-    // Index pin: keeps a StateImage alive for an external lookup table (StateIndex) without
-    // affecting ownership/exclusivity accounting. Unlike checkpoint_references, an index_pin
-    // does NOT make the state non-exclusive to its owning sequence.
-    void retain_index_pin(StateImageHandle handle) {
-        Object& object = require(handle);
-        if (object.index_pin == std::numeric_limits<std::uint32_t>::max()) {
-            throw std::logic_error("StateImage index pin overflow");
-        }
-        ++object.index_pin;
-    }
-
-    void release_index_pin(StateImageHandle handle) {
-        Object& object = require(handle);
-        if (object.index_pin == 0) {
-            throw std::logic_error("StateImage index pin underflow");
-        }
-        --object.index_pin;
-    }
-
     // Diagnostic accessors: the object slot and generation behind a handle, for correlating
     // lifecycle logs across a reused slot.
     [[nodiscard]] std::uint32_t debug_index(StateImageHandle handle) const noexcept {
@@ -326,11 +307,6 @@ public:
     [[nodiscard]] std::uint64_t last_touched(StateImageHandle handle) const noexcept {
         return valid(handle) ? objects_[handle.index_].last_touched_ns
                              : std::numeric_limits<std::uint64_t>::max();
-    }
-
-    [[nodiscard]] std::uint32_t index_pin(StateImageHandle handle) const noexcept {
-        if (!valid(handle)) { return 0; }
-        return objects_[handle.index_].index_pin;
     }
 
     [[nodiscard]] std::int32_t physical_slot(StateImageHandle handle) const {
@@ -799,11 +775,11 @@ public:
         Object& object = objects_[handle.index_];
         std::fprintf(stderr,
                      "[state-store] release handle=%u gen=%u role=%d dev=%d host=%d "
-                     "ckpt_refs=%u index_pin=%u\n",
+                     "ckpt_refs=%u\n",
                      handle.index_, handle.generation_, static_cast<int>(object.role),
                      object.device_slot ? *object.device_slot : -1,
                      object.host_slot ? static_cast<int>(object.host_slot->index) : -1,
-                     object.checkpoint_references, object.index_pin);
+                     object.checkpoint_references);
         std::fflush(stderr);
         if (object.host_slot) {
             if (host_ == nullptr || !host_->release(*object.host_slot)) { return false; }
@@ -823,7 +799,7 @@ public:
     [[nodiscard]] bool can_release(StateImageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Object& object = objects_[handle.index_];
-        return object.checkpoint_references == 0 && object.index_pin == 0 &&
+        return object.checkpoint_references == 0 &&
                object.source_pins == 0 && !object.destination_pinned &&
                !has_pending_replica(object);
     }
@@ -834,8 +810,6 @@ public:
         const Object& object = require(handle);
         if (released_references > object.checkpoint_references) { return false; }
         if (object.checkpoint_references != released_references) { return true; }
-        // Note: index_pin intentionally NOT checked here. index_pin prevents full release
-        // (can_release) but must not block D2H demotion (materialization victim eviction).
         if (object.source_pins != 0 || object.destination_pinned ||
             has_pending_replica(object)) {
             return false;
@@ -857,7 +831,6 @@ private:
         std::optional<qwen3_6::HostStateSlotHandle> pending_host_slot;
         std::uint64_t transfer_id           = 0;
         std::uint32_t checkpoint_references = 0;
-        std::uint32_t index_pin             = 0;
         std::uint32_t source_pins           = 0;
         bool destination_pinned             = false;
         StateImageRole role                 = StateImageRole::Free;
@@ -916,7 +889,7 @@ private:
             if (obj.role == StateImageRole::Free) { continue; }
             std::fprintf(stderr,
                          "[state-store]   #%zu role=%d dev=%d host=%d pend_dev=%d pend_host=%d "
-                         "xfer=%llu ckpt_refs=%u index_pin=%u src_pins=%u dst_pinned=%d "
+                         "xfer=%llu ckpt_refs=%u src_pins=%u dst_pinned=%d "
                          "endpoint=%d evictable=%d\n",
                          i, static_cast<int>(obj.role),
                          obj.device_slot ? *obj.device_slot : -1,
@@ -925,7 +898,7 @@ private:
                          obj.pending_host_slot ? static_cast<int>(obj.pending_host_slot->index)
                                                : -1,
                          static_cast<unsigned long long>(obj.transfer_id),
-                         obj.checkpoint_references, obj.index_pin, obj.source_pins,
+                         obj.checkpoint_references, obj.source_pins,
                          obj.destination_pinned ? 1 : 0, obj.is_endpoint ? 1 : 0,
                          (obj.role == StateImageRole::CheckpointImmutable && obj.device_slot &&
                           obj.host_slot && obj.source_pins == 0 && !obj.destination_pinned &&

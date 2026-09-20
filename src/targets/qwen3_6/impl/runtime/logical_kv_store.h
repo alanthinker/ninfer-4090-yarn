@@ -857,8 +857,6 @@ public:
         return static_cast<std::uint32_t>(addresses_.size());
     }
 
-    [[nodiscard]] std::uint32_t free_count() const noexcept { return free_count_; }
-
     [[nodiscard]] std::uint32_t occupied() const noexcept { return capacity() - free_count_; }
 
     [[nodiscard]] std::optional<KVAddressSpaceHandle> create_active(std::uint32_t entitlement,
@@ -1685,32 +1683,10 @@ public:
         if (!valid(handle)) { return false; }
         const Address& address = addresses_[handle.index_];
         if (address.active || address.row || address.reservation.valid()) { return false; }
-        if (address.pin_count != 0) { return false; }
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             if (!pages_->can_release_reference(membership(address, page), false)) { return false; }
         }
         return true;
-    }
-
-    // Pin: prevent release while KVIndex holds a reference.
-    void retain_pin(KVAddressSpaceHandle handle) {
-        Address& address = require(handle);
-        if (address.pin_count == std::numeric_limits<std::uint32_t>::max()) {
-            throw std::logic_error("KVAddressSpace pin count overflow");
-        }
-        ++address.pin_count;
-    }
-
-    void release_pin(KVAddressSpaceHandle handle) {
-        Address& address = require(handle);
-        if (address.pin_count == 0) {
-            throw std::logic_error("KVAddressSpace pin underflow");
-        }
-        --address.pin_count;
-    }
-
-    [[nodiscard]] std::uint32_t pin_count(KVAddressSpaceHandle handle) const noexcept {
-        return require(handle).pin_count;
     }
 
     [[nodiscard]] bool can_release_after_deactivate(KVAddressSpaceHandle handle) const noexcept {
@@ -1722,19 +1698,6 @@ public:
             if (!pages_->can_release_reference_after_active_reference(membership(address, page))) {
                 return false;
             }
-        }
-        return true;
-    }
-
-    // Like can_release but ignores pin_count. Used by can_release_continuation_slot_strict
-    // where the materialization victim only needs to deactivate the address space (free the
-    // slot); pinned pages stay allocated even after the slot is freed.
-    [[nodiscard]] bool can_release_ignoring_pin(KVAddressSpaceHandle handle) const noexcept {
-        if (!valid(handle)) { return false; }
-        const Address& address = addresses_[handle.index_];
-        if (address.active || address.row || address.reservation.valid()) { return false; }
-        for (std::uint32_t page = 0; page < address.page_count; ++page) {
-            if (!pages_->can_release_reference(membership(address, page), false)) { return false; }
         }
         return true;
     }
@@ -1774,9 +1737,6 @@ private:
         std::optional<KVExecutionRowLease> row;
         bool occupied = false;
         bool active   = false;
-        // Pin count: while > 0, the address space cannot be released even if inactive.
-        // Used by KVIndex to keep evicted catalog entries' KV pages alive in the pool.
-        std::uint32_t pin_count = 0;
     };
 
     [[nodiscard]] static std::size_t checked_membership_cells(std::uint32_t addresses,

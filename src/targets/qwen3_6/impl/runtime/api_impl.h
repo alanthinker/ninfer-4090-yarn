@@ -319,21 +319,6 @@ std::optional<AdmissionCandidate<Variant>> Program<Variant>::inspect_admission(
 }
 
 template <>
-std::optional<typename Program<Variant>::AdoptedSource>
-Program<Variant>::try_adopt_from_index(const PreparedPrompt& prompt,
-                                       const RequestBasePlan<Variant>& base) {
-    (void)base;
-    auto view = PreparedPromptAccess::view(prompt);
-    qwen3_6::detail::PrefixShortlistDigests digests;
-    digests.assign(view);
-    auto result = impl_->try_adopt_from_index(view, digests);
-    if (!result) { return std::nullopt; }
-    return typename Program<Variant>::AdoptedSource{.handle = std::move(result->handle),
-                                                    .frontier = result->frontier};
-}
-
-
-template <>
 std::optional<ResourcePlan<Variant>>
 Program<Variant>::seal_identity(const AdmissionCandidate<Variant>& admission,
                                 const PreparedPrompt& prompt, runtime::FinalScheduleIntent intent) {

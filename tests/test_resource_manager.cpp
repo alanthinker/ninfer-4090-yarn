@@ -1809,10 +1809,9 @@ using FakeManager = ninfer::runtime::ResourceManager<FakePackage>;
 
 FakeManager make_manager(std::uint32_t lanes = 1, std::uint32_t private_capacity = 4,
                          std::uint32_t shared_capacity = 0, bool cache_enabled = true,
-                         std::uint32_t fair_share_buckets = 8,
-                         bool prefer_index_adopt = false) {
+                         std::uint32_t fair_share_buckets = 8) {
     return FakeManager(lanes, private_capacity, shared_capacity, cache_enabled, 2,
-                       fair_share_buckets, prefer_index_adopt, test_cost_model());
+                       fair_share_buckets, test_cost_model());
 }
 
 struct ActiveRequest {

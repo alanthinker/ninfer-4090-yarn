@@ -816,15 +816,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (!plan.context_cache.max_private_continuations || !plan.context_cache.max_shared_prefixes) {
         throw std::logic_error("Qwen3.6 context cache options are not normalized");
     }
-    // The recovery index needs descriptors of its own. An address space is cheap bookkeeping (one
-    // membership entry per logical KV page); what a retained address actually holds is bounded by
-    // the Device page pool and the Host KV arena, not by this count. Sizing the pool for the
-    // catalog alone leaves no free descriptor once the catalog saturates, so no evicted
-    // conversation could keep its KV and adoption could never match on both halves.
-    constexpr std::uint64_t kRecoveryAddressBudget = 32;
     const std::uint64_t address_capacity64 =
         static_cast<std::uint64_t>(*plan.context_cache.max_private_continuations) +
-        *plan.context_cache.max_shared_prefixes + kRecoveryAddressBudget;
+        *plan.context_cache.max_shared_prefixes;
     if (address_capacity64 == 0 || address_capacity64 > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("Qwen3.6 KV address-space capacity exceeds uint32");
     }
@@ -875,10 +869,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     state_store = std::make_unique<StateImageStore>(
         *state_images, host_state_images.get(), static_cast<std::uint32_t>(logical_state_capacity));
-    if (plan.context_cache.host_state_slots != 0) {
-        state_index = std::make_unique<StateIndex>(plan.context_cache.host_state_slots);
-        kv_index = std::make_unique<KVIndex>(plan.context_cache.host_state_slots);
-    }
     pressure_private_owner_scratch_.resize(continuation_capacity);
     pressure_shared_owner_scratch_.resize(shared_prefix_capacity);
     pressure_private_drop_scratch_.resize(continuation_capacity);
@@ -2872,7 +2862,7 @@ void ProgramImplCore::publish_checkpoint_drop(SequenceState& sequence,
                                      return anchor.state == dropped_state;
                                  });
     if (!retained_state && state_store->checkpoint_references(dropped_state) == 0 &&
-        state_store->index_pin(dropped_state) == 0 && !state_store->release(dropped_state)) {
+        !state_store->release(dropped_state)) {
         throw std::logic_error("dropped checkpoint StateImage remained pinned");
     }
 
@@ -4692,8 +4682,7 @@ void ProgramImplCore::prepare_consumed_source(MaterializationTransaction& transa
     };
     const auto release_if_unreferenced = [&](StateImageHandle handle) {
         if (!state_store->valid(handle) || retained_state(handle) ||
-            state_store->checkpoint_references(handle) != 0 ||
-            state_store->index_pin(handle) != 0) {
+            state_store->checkpoint_references(handle) != 0) {
             return;
         }
         if (!state_store->release(handle)) {
@@ -6595,50 +6584,6 @@ std::optional<std::uint32_t> ProgramImplCore::allocate_continuation_slot() noexc
     return std::nullopt;
 }
 
-bool ProgramImplCore::demote_address_kv_to_host(KVAddressSpaceStore& addresses,
-                                               LogicalKVPageStore& pages,
-                                               KVAddressSpaceHandle address) {
-    if (!host_kv_extents) { return false; }
-    const std::uint32_t mapped = addresses.mapped_pages(address);
-    if (mapped == 0) { return false; }
-    std::vector<LogicalKVPageHandle> copy;    // Device-only pages: copy to Host first
-    std::vector<LogicalKVPageHandle> drop;    // already Host-resident: only the Device copy goes
-    copy.reserve(mapped);
-    drop.reserve(mapped);
-    for (std::uint32_t index = 0; index < mapped; ++index) {
-        const LogicalKVPageHandle logical = addresses.logical_page(address, index);
-        if (!pages.device_resident(logical)) { continue; }
-        if (pages.host_replica_current(logical)) {
-            // The Host copy is already current, so only the Device copy has to go.
-            if (pages.can_drop_device_replica(logical)) { drop.push_back(logical); }
-            continue;
-        }
-        // DeviceOnly page: it has to be copied first, so the copy candidate is gated on being
-        // pinnable as a Host source rather than on an existing Host replica.
-        if (pages.can_pin_source(logical)) { copy.push_back(logical); }
-    }
-    if (!copy.empty()) {
-        std::optional<HostKVExtentReservation> reserved = host_kv_extents->prepare(pages, copy);
-        if (!reserved) { return false; }
-        const std::vector<DeviceKVPageHandle> sources = host_kv_extents->device_sources(*reserved);
-        if (sources.size() != copy.size()) { return false; }
-        pages.physical_pool().copy_to_host(sources, host_kv_extents->writable_view(*reserved),
-                                           device.transfer_stream);
-        // The Device copies may only be dropped once the transfer has read them.
-        if (device.transfer_stream != nullptr) {
-            (void)cudaStreamSynchronize(device.transfer_stream);
-        }
-        (void)host_kv_extents->publish(std::move(*reserved));
-    }
-    for (const LogicalKVPageHandle page : drop) {
-        if (!pages.drop_device_replica(page)) { return false; }
-    }
-    for (const LogicalKVPageHandle page : copy) {
-        if (!pages.drop_device_replica(page)) { return false; }
-    }
-    return true;
-}
-
 // Recovery-index key: a digest over the token sequence alone.
 //
 // The rolling prefix digest mixes each token's MRoPE position, which the engine derives from its own
@@ -6647,24 +6592,32 @@ bool ProgramImplCore::demote_address_kv_to_host(KVAddressSpaceStore& addresses,
 // it computes for the same text can differ and the stored digest never matches. The recovery index
 // only has to find a candidate: correctness is still enforced by the exact prefix comparison during
 // inspection, so its key is content-only and reproducible by any request that resends those tokens.
-[[nodiscard]] DigestPair recovery_digest(std::span<const TokenId> tokens) noexcept {
-    std::uint64_t lane0 = 1469598103934665603ULL;
-    std::uint64_t lane1 = 1099511628211ULL;
-    for (const TokenId token : tokens) {
-        lane0 ^= static_cast<std::uint64_t>(token);
-        lane0 *= 1099511628211ULL;
-        lane1 += static_cast<std::uint64_t>(token);
-        lane1 *= 1099511628211ULL;
-        lane1 ^= lane1 >> 29;
+bool ProgramImplCore::state_bound_by_live_sequence(StateImageHandle state) const {
+    if (!state.valid()) { return false; }
+    const auto binds = [state](const SequenceState& sequence) {
+        if (sequence.state.read == state || sequence.state.write == state) { return true; }
+        if (sequence.reserved_state && *sequence.reserved_state == state) { return true; }
+        if (sequence.rewrite_state && *sequence.rewrite_state == state) { return true; }
+        return std::any_of(sequence.long_anchors.begin(), sequence.long_anchors.end(),
+                           [state](const LongAnchorCheckpoint& anchor) {
+                               return anchor.state == state;
+                           });
+    };
+    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
+        if (continuation_slots[index].role == ContinuationSlotRole::Free) { continue; }
+        if (binds(continuation_states[index])) { return true; }
     }
-    if (lane0 == 0) { lane0 = 1; }
-    if (lane1 == 0) { lane1 = 1; }
-    return DigestPair{lane0, lane1};
+    // A catalogued shared prefix owns its state as well: a later request materializes from it and
+    // then republishes that same state as its own endpoint.
+    for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
+        if (shared_prefix_slots[index].role == SharedPrefixSlotRole::Free) { continue; }
+        if (shared_prefix_states[index].state == state) { return true; }
+    }
+    return false;
 }
 
 bool ProgramImplCore::release_state_capacity_step() {
     if (release_one_device_state_slot()) { return true; }
-    if (release_oldest_unbound_index_entry()) { return true; }
     return retire_oldest_idle_continuation();
 }
 
@@ -6686,35 +6639,6 @@ std::optional<StateImageHandle> ProgramImplCore::reserve_logical_destination_wit
         if (state) { return state; }
         if (!release_state_capacity_step()) { return state_store->reserve_logical_destination(); }
     }
-}
-
-bool ProgramImplCore::release_oldest_unbound_index_entry() {
-    if (!state_index || !state_store) { return false; }
-    std::optional<StateIndex::Entry> best;
-    state_index->for_each([&](const StateIndex::Entry& entry) {
-        if (!state_store->valid(entry.state)) { return; }
-        if (state_bound_by_live_sequence(entry.state)) { return; }
-        if (!best || entry.last_access_ns < best->last_access_ns) { best = entry; }
-    });
-    if (!best) { return false; }
-    std::fprintf(stderr, "[exhaust] drop index entry state=%u/%u frontier=%u\n",
-                 state_store->debug_index(best->state),
-                 state_store->debug_generation(best->state), best->frontier);
-    std::fflush(stderr);
-    (void)state_index->erase(best->digest);
-    state_store->release_index_pin(best->state);
-    if (kv_index) {
-        const auto kv_hit = kv_index->lookup(best->digest);
-        if (kv_hit) {
-            (void)kv_index->erase(best->digest);
-            text_kv_addresses->release_pin(kv_hit->text_address);
-            if (kv_hit->backend_address && backend_kv_addresses) {
-                backend_kv_addresses->release_pin(*kv_hit->backend_address);
-            }
-        }
-    }
-    if (state_store->can_release(best->state)) { (void)state_store->release(best->state); }
-    return true;
 }
 
 bool ProgramImplCore::retire_oldest_idle_continuation() {
@@ -6768,30 +6692,6 @@ bool ProgramImplCore::retire_oldest_idle_continuation() {
     return false;
 }
 
-bool ProgramImplCore::state_bound_by_live_sequence(StateImageHandle state) const {
-    if (!state.valid()) { return false; }
-    const auto binds = [state](const SequenceState& sequence) {
-        if (sequence.state.read == state || sequence.state.write == state) { return true; }
-        if (sequence.reserved_state && *sequence.reserved_state == state) { return true; }
-        if (sequence.rewrite_state && *sequence.rewrite_state == state) { return true; }
-        return std::any_of(sequence.long_anchors.begin(), sequence.long_anchors.end(),
-                           [state](const LongAnchorCheckpoint& anchor) {
-                               return anchor.state == state;
-                           });
-    };
-    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
-        if (continuation_slots[index].role == ContinuationSlotRole::Free) { continue; }
-        if (binds(continuation_states[index])) { return true; }
-    }
-    // A catalogued shared prefix owns its state as well: a later request materializes from it and
-    // then republishes that same state as its own endpoint.
-    for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
-        if (shared_prefix_slots[index].role == SharedPrefixSlotRole::Free) { continue; }
-        if (shared_prefix_states[index].state == state) { return true; }
-    }
-    return false;
-}
-
 bool ProgramImplCore::can_release_continuation_slot_strict(std::uint32_t index) const {
     if (index >= continuation_capacity || !state_store || !text_kv_addresses || !text_kv_pages ||
         continuation_slots[index].role != ContinuationSlotRole::Catalogued) {
@@ -6799,7 +6699,7 @@ bool ProgramImplCore::can_release_continuation_slot_strict(std::uint32_t index) 
     }
     const SequenceState& sequence = continuation_states[index];
     if (sequence.state.fork_pending || !sequence.shared_prefix_references.empty() || !sequence.kv ||
-        !text_kv_addresses->can_release_ignoring_pin(sequence.kv->text)) {
+        !text_kv_addresses->can_release(sequence.kv->text)) {
         std::fprintf(stderr, "[can_release_strict] FAIL slot=%u: fork=%d shared=%zu kv=%d\n",
                      index, (int)sequence.state.fork_pending, sequence.shared_prefix_references.size(),
                      (int)sequence.kv.has_value());
@@ -6808,7 +6708,7 @@ bool ProgramImplCore::can_release_continuation_slot_strict(std::uint32_t index) 
     }
     if (sequence.kv->backend) {
         if (!backend_kv_addresses || !backend_kv_pages ||
-            !backend_kv_addresses->can_release_ignoring_pin(*sequence.kv->backend)) {
+            !backend_kv_addresses->can_release(*sequence.kv->backend)) {
             return false;
         }
     }
@@ -6893,126 +6793,16 @@ void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index) noex
     SequenceState& sequence = continuation_states[index];
     std::fprintf(stderr,
                  "[evict] slot=%u frontier=%u text_kv_valid=%u ledger=%zu anchors=%zu "
-                 "endpoint=%d state_valid=%d state=%u/%u addr_free=%u\n",
+                 "endpoint=%d state_valid=%d\n",
                  index, sequence.execution_frontier, sequence.text_kv_valid,
                  sequence.ledger.size(), sequence.long_anchors.size(),
                  sequence.endpoint_valid ? 1 : 0,
-                 (state_store && state_store->valid(sequence.state.read)) ? 1 : 0,
-                 state_store ? state_store->debug_index(sequence.state.read) : 0,
-                 state_store ? state_store->debug_generation(sequence.state.read) : 0,
-                 text_kv_addresses ? text_kv_addresses->free_count() : 0);
+                 (state_store && state_store->valid(sequence.state.read)) ? 1 : 0);
     if (sequence.ledger.size() >= 4) {
         std::fprintf(stderr, "[evict]   tokens=%u,%u,%u,%u\n", sequence.ledger[0],
                      sequence.ledger[1], sequence.ledger[2], sequence.ledger[3]);
     }
     std::fflush(stderr);
-    // Register in StateIndex/KVIndex before releasing, so data survives catalog eviction
-    // and can be recovered via adopt.
-    // Recovery target: prefer a checkpoint inside the client-visible prompt.
-    //
-    // A conversation that comes back resends its own prompt, never the model's hidden thinking
-    // tokens, so an endpoint frontier can only ever be matched by an exact replay of the generated
-    // text. A long anchor lies inside the prompt, so any client that resends that prompt reproduces
-    // it. The KV half shares the state's frontier, and the KV must cover it.
-    std::uint32_t recovery_frontier = 0;
-    StateImageHandle recovery_state;
-    if (state_store) {
-        for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) {
-            if (anchor.frontier == 0 || anchor.frontier > sequence.text_kv_valid) { continue; }
-            if (!state_store->valid(anchor.state)) { continue; }
-            if (anchor.frontier > recovery_frontier) {
-                recovery_frontier = anchor.frontier;
-                recovery_state    = anchor.state;
-            }
-        }
-        if (recovery_frontier == 0 && sequence.endpoint_valid) {
-            recovery_frontier = sequence.execution_frontier;
-            recovery_state    = sequence.state.read;
-        }
-    }
-    const bool recovery_pairable = recovery_frontier != 0 && state_store &&
-                                   sequence.text_kv_valid >= recovery_frontier &&
-                                   sequence.ledger.size() >= recovery_frontier &&
-                                   state_store->valid(recovery_state);
-    if (state_index && state_store) {
-        if (recovery_pairable) {
-            const std::uint32_t state_frontier = recovery_frontier;
-            const StateImageHandle state       = recovery_state;
-            {
-                const auto evicted = state_index->insert(
-                    recovery_digest(
-                        std::span<const TokenId>(sequence.ledger.data(), state_frontier)),
-                    state, state_frontier);
-                if (evicted.has_value()) {
-                    state_store->release_index_pin(evicted->state);
-                    if (state_bound_by_live_sequence(evicted->state)) {
-                        std::fprintf(stderr,
-                                     "[index] keep state=%u/%u: still bound by a live "
-                                     "continuation\n",
-                                     state_store->debug_index(evicted->state),
-                                     state_store->debug_generation(evicted->state));
-                        std::fflush(stderr);
-                    } else if (state_store->can_release(evicted->state)) {
-                        (void)state_store->release(evicted->state);
-                    }
-                }
-                state_store->retain_index_pin(state);
-            }
-        }
-    }
-    if (kv_index && sequence.kv && text_kv_addresses) {
-        // The KV half shares the state's frontier, so both halves carry one content-only digest.
-        const std::uint32_t frontier = recovery_frontier;
-        const bool key_ready         = recovery_pairable;
-        const DigestPair recovery_key =
-            key_ready ? recovery_digest(std::span<const TokenId>(sequence.ledger.data(), frontier))
-                      : DigestPair{};
-        // An address descriptor must remain free for the capture and the next request, and the Host
-        // arena must be able to take every Device replica. Otherwise the KV is released with the
-        // catalog entry, which is the intended drop when nothing can take the data.
-        const bool has_address_budget = key_ready && text_kv_addresses->free_count() >= 2;
-        bool demoted = false;
-        if (has_address_budget) {
-            demoted = demote_address_kv_to_host(*text_kv_addresses, *text_kv_pages,
-                                                sequence.kv->text);
-            if (demoted && sequence.kv->backend && backend_kv_addresses && backend_kv_pages) {
-                demoted = demote_address_kv_to_host(*backend_kv_addresses, *backend_kv_pages,
-                                                    *sequence.kv->backend);
-            }
-        }
-        if (has_address_budget && !demoted) {
-            std::fprintf(stderr,
-                         "[kvindex] SKIP frontier=%u: Host arena refused the replicas (free=%u)\n",
-                         frontier, text_kv_addresses->free_count());
-            std::fflush(stderr);
-        }
-        if (has_address_budget && demoted) {
-            const auto evicted = kv_index->insert(
-                recovery_key, sequence.kv->text,
-                sequence.kv->backend ? std::optional<KVAddressSpaceHandle>(*sequence.kv->backend)
-                                     : std::nullopt,
-                frontier);
-            if (evicted.has_value()) {
-                text_kv_addresses->release_pin(evicted->text_address);
-                if (evicted->backend_address && backend_kv_addresses) {
-                    backend_kv_addresses->release_pin(*evicted->backend_address);
-                }
-                (void)text_kv_addresses->release(evicted->text_address);
-                if (evicted->backend_address && backend_kv_addresses) {
-                    (void)backend_kv_addresses->release(*evicted->backend_address);
-                }
-            }
-            std::fprintf(stderr,
-                         "[kvindex] RETAIN path=%s frontier=%u free_before=%u occupied=%zu cap=%zu\n",
-                         __func__, frontier, text_kv_addresses->free_count(),
-                         kv_index->occupied(), kv_index->capacity());
-            std::fflush(stderr);
-            text_kv_addresses->retain_pin(sequence.kv->text);
-            if (sequence.kv->backend && backend_kv_addresses) {
-                backend_kv_addresses->retain_pin(*sequence.kv->backend);
-            }
-        }
-    }
     release_sequence_kv_strict(sequence);
     release_sequence_state_strict(sequence);
     retire_continuation_slot(index);
@@ -7025,17 +6815,6 @@ void ProgramImplCore::release_continuation_slot_best_effort(std::uint32_t index)
     }
     SequenceState& sequence = continuation_states[index];
     release_active_shared_references(sequence);
-    // A recovery entry needs both halves under one digest, and this path cannot register the state
-    // half, so it deliberately registers nothing: a KV-only entry could never pair into an adoption
-    // and would only pin an address and Host KV for nothing. The KV is released with the
-    // continuation, which is the intended drop on the best-effort path.
-    if (kv_index && sequence.kv && text_kv_addresses) {
-        std::fprintf(stderr,
-                     "[kvindex] SKIP path=%s: best-effort eviction keeps no recovery entry "
-                     "(frontier=%u)\n",
-                     __func__, sequence.execution_frontier);
-        std::fflush(stderr);
-    }
     release_sequence_kv(sequence);
     release_sequence_state(sequence);
     retire_continuation_slot(index);
@@ -8013,11 +7792,6 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
             const DroppedReference& drop = drops[index];
             if (!state_store->valid(drop.state) ||
                 state_store->checkpoint_references(drop.state) != drop.count) {
-                continue;
-            }
-            // index_pin prevents physical release (can_release checks it). If pinned,
-            // the slot will NOT be freed even after checkpoint references drop to zero.
-            if (state_store->index_pin(drop.state) != 0) {
                 continue;
             }
             const StateReplicaResidency residency = state_store->residency(drop.state);
@@ -9828,150 +9602,6 @@ FinishResult ProgramImplCore::abandon_prefill(SequenceHandle sequence) noexcept 
     return published;
 }
 
-std::optional<ProgramImplCore::AdoptResult>
-ProgramImplCore::try_adopt_from_index(const PreparedPromptData& prompt,
-                                      const PrefixShortlistDigests& digests) {
-    if (!state_index || !kv_index || digests.size() == 0) { return std::nullopt; }
-
-    const auto find_free_slot = [&]() {
-        for (std::uint32_t i = 0; i < continuation_capacity; ++i) {
-            if (continuation_slots[i].role == ContinuationSlotRole::Free) { return i; }
-        }
-        return continuation_capacity;
-    };
-
-    // Recovery is keyed by the frontier each index entry was stored at. An evicted conversation
-    // comes back as its own prefix plus new tokens, so its stored frontier is not aligned to any
-    // fixed stride of the incoming prompt and cannot be found by scanning that prompt: the stored
-    // frontier has to be re-hashed against the incoming prompt instead. Take the longest match.
-    std::optional<StateIndex::Entry> best_state;
-    std::optional<KVIndex::Entry> best_kv;
-    state_index->for_each([&](const StateIndex::Entry& entry) {
-        if (entry.frontier == 0 || entry.frontier > digests.size() ||
-            (best_state && entry.frontier <= best_state->frontier)) {
-            return;
-        }
-        if (recovery_digest(std::span<const TokenId>(prompt.token_ids.data(), entry.frontier)) !=
-            entry.digest) {
-            return;
-        }
-        if (!state_store->valid(entry.state)) { return; }
-        const auto kv_hit = kv_index->lookup(entry.digest);
-        if (!kv_hit) { return; }
-        if (!text_kv_addresses || !text_kv_addresses->valid(kv_hit->text_address)) { return; }
-        best_state = entry;
-        best_kv    = kv_hit;
-    });
-    if (!best_state || !best_kv) {
-        std::size_t entries = 0;
-        std::size_t digest_hits = 0;
-        std::size_t state_hits = 0;
-        std::size_t kv_misses = 0;
-        state_index->for_each([&](const StateIndex::Entry& entry) {
-            ++entries;
-            if (entry.frontier == 0 || entry.frontier > digests.size()) { return; }
-            if (recovery_digest(std::span<const TokenId>(prompt.token_ids.data(), entry.frontier)) !=
-                entry.digest) {
-                return;
-            }
-            ++digest_hits;
-            if (!state_store->valid(entry.state)) { return; }
-            ++state_hits;
-            if (!kv_index->lookup(entry.digest)) { ++kv_misses; }
-        });
-        std::fprintf(stderr,
-                     "[adopt] MISS detail: state_entries=%zu digest_hits=%zu state_hits=%zu "
-                     "kv_missing=%zu kv_entries=%zu prompt_tokens=%zu\n",
-                     entries, digest_hits, state_hits, kv_misses, kv_index->occupied(),
-                     digests.size());
-        if (prompt.token_ids.size() >= 4) {
-            std::fprintf(stderr, "[adopt]   prompt tokens=%u,%u,%u,%u\n", prompt.token_ids[0],
-                         prompt.token_ids[1], prompt.token_ids[2], prompt.token_ids[3]);
-        }
-        std::size_t shown = 0;
-        state_index->for_each([&](const StateIndex::Entry& entry) {
-            if (shown >= 2) { return; }
-            ++shown;
-            const bool in_range = entry.frontier != 0 && entry.frontier <= digests.size();
-            std::fprintf(stderr,
-                         "[adopt]   entry state=%u/%u frontier=%u kv_hit=%d digest_match=%d\n",
-                         state_store->debug_index(entry.state),
-                         state_store->debug_generation(entry.state), entry.frontier,
-                         kv_index->lookup(entry.digest) ? 1 : 0,
-                         (in_range && recovery_digest(std::span<const TokenId>(
-                                                        prompt.token_ids.data(), entry.frontier)) ==
-                          entry.digest)
-                             ? 1
-                             : 0);
-        });
-        return std::nullopt;
-    }
-    // The catalog is full exactly when conversations were evicted, so the recovery this index holds
-    // is needed at the moment there is no free slot to install it. Make room the way every other
-    // capacity decision does: retire the oldest idle continuation, which registers its own state and
-    // KV for recovery before releasing the slot.
-    std::uint32_t free_slot = find_free_slot();
-    if (free_slot >= continuation_capacity) {
-        if (!retire_oldest_idle_continuation()) {
-            std::fprintf(stderr,
-                         "[adopt] MISS: no free catalog slot and no idle continuation to retire "
-                         "(capacity=%u), entries=%zu/%zu\n",
-                         continuation_capacity, state_index->occupied(), kv_index->occupied());
-            std::fflush(stderr);
-            return std::nullopt;
-        }
-        free_slot = find_free_slot();
-        if (free_slot >= continuation_capacity) {
-            std::fprintf(stderr, "[adopt] MISS: retiring an idle continuation freed no slot\n");
-            std::fflush(stderr);
-            return std::nullopt;
-        }
-    }
-    {
-        const std::uint32_t frontier = best_state->frontier;
-        const StateImageHandle state = best_state->state;
-        const KVIndex::Entry& kv_hit = *best_kv;
-
-        // Both hit: adopt into the free slot.
-        SequenceState& seq = continuation_states[free_slot];
-        seq.kv = std::make_optional<SequenceKVBundle>(SequenceKVBundle{
-            .text    = kv_hit.text_address,
-            .backend = kv_hit.backend_address
-                           ? std::optional<KVAddressSpaceHandle>(*kv_hit.backend_address)
-                           : std::nullopt});
-        seq.state = ActiveStateBinding{.read = state, .write = state};
-        seq.ledger.assign(prompt.token_ids.begin(),
-                          prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(frontier));
-        seq.ledger_frontier    = static_cast<std::uint32_t>(frontier);
-        seq.prefix_identity.assign(prompt);
-        seq.prefix_digests     = digests;
-        seq.text_kv_valid      = static_cast<std::uint32_t>(frontier);
-        seq.execution_frontier = 0;
-        seq.long_anchors.push_back(LongAnchorCheckpoint{
-            .state    = state,
-            .frontier = static_cast<std::uint32_t>(frontier),
-            .ordinal  = 0,
-        });
-        // Release index pins (resources now owned by catalog entry).
-        (void)state_index->erase(best_state->digest);
-        state_store->release_index_pin(state);
-        (void)kv_index->erase(best_state->digest);
-        text_kv_addresses->release_pin(kv_hit.text_address);
-        if (kv_hit.backend_address && backend_kv_addresses) {
-            backend_kv_addresses->release_pin(*kv_hit.backend_address);
-        }
-
-        ContinuationSlot& slot = continuation_slots[free_slot];
-        slot.role              = ContinuationSlotRole::Catalogued;
-        if (++slot.generation == 0) { ++slot.generation; }
-
-        std::fprintf(stderr, "[adopt] HIT: frontier=%u slot=%u\n", frontier, free_slot);
-        std::fflush(stderr);
-        return AdoptResult{.handle = ContractAccess::make_continuation(this, free_slot, slot.generation),
-                           .frontier = static_cast<std::uint32_t>(frontier)};
-    }
-}
-
 FinishResult ProgramImplCore::publish_continuation(
     SequenceHandle sequence, std::optional<std::uint32_t> abandoned_frontier,
     bool cancelled_active) noexcept {
@@ -10145,15 +9775,15 @@ ProgramImplCore::release_shared_prefix_state_strict(std::uint32_t index,
         const bool last_state_reference = state_store->checkpoint_references(shared.state) == 1;
         if (shared.kv->backend) {
             if (!backend_kv_addresses->release(*shared.kv->backend)) {
-                (void)backend_kv_addresses;  // pinned, skip
+                (void)backend_kv_addresses;  // still referenced elsewhere: outlives this entry
             }
         }
         if (!text_kv_addresses->release(shared.kv->text)) {
-            // Pinned by KVIndex: pages stay allocated, index will release later.
+            // Still referenced by a sequence that materialized from this prefix.
         }
         state_store->release_checkpoint_reference(shared.state);
         if (last_state_reference && !state_store->release(shared.state)) {
-            // Pinned by StateIndex: state stays alive, index will release later.
+            // Still bound by a sequence that materialized from this prefix.
         }
 
         shared    = SharedPrefixState{};
@@ -10683,7 +10313,6 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 sequence.rewrite_checkpoint = {};
                 if (dropped != sequence.state.read &&
                     state_store->checkpoint_references(dropped) == 0 &&
-                    state_store->index_pin(dropped) == 0 &&
                     !state_store->release(dropped)) {
                     throw std::logic_error("dropped rewrite StateImage could not be released");
                 }
@@ -11312,7 +10941,7 @@ void ProgramImplCore::settle_state_fork(SequenceState& sequence) {
     state_store->commit_fork(source, destination);
     sequence.state = ActiveStateBinding{.read = destination, .write = destination};
     if (!external_source && state_store->checkpoint_references(source) == 0 &&
-        state_store->index_pin(source) == 0 && !state_store->release(source)) {
+        !state_store->release(source)) {
         throw std::logic_error("unreferenced StateImage fork source could not be released");
     }
     refresh_state_views(sequence);
@@ -11681,18 +11310,20 @@ void ProgramImplCore::release_sequence_growth_entitlement(SequenceState& sequenc
 
 void ProgramImplCore::release_active_sequence_kv_strict(SequenceState& sequence) noexcept {
     if (!sequence.kv || !text_kv_addresses) { std::terminate(); }
-    // Tolerate pinned KV: if release fails due to pin, pages stay allocated.
     if (!text_kv_addresses->release_after_deactivate(sequence.kv->text)) {
-        if (!text_kv_addresses->can_release_ignoring_pin(sequence.kv->text)) {
-            std::terminate();  // genuinely unreleasable
-        }
+        std::fprintf(stderr,
+                     "[FATAL] release_active_sequence_kv_strict: Text KV is not releasable\n");
+        std::fflush(stderr);
+        std::terminate();
     }
     if (sequence.kv->backend) {
         if (!backend_kv_addresses) { std::terminate(); }
         if (!backend_kv_addresses->release_after_deactivate(*sequence.kv->backend)) {
-            if (!backend_kv_addresses->can_release_ignoring_pin(*sequence.kv->backend)) {
-                std::terminate();
-            }
+            std::fprintf(stderr,
+                         "[FATAL] release_active_sequence_kv_strict: Backend KV is not "
+                         "releasable\n");
+            std::fflush(stderr);
+            std::terminate();
         }
     }
     sequence.kv.reset();
@@ -11701,20 +11332,17 @@ void ProgramImplCore::release_active_sequence_kv_strict(SequenceState& sequence)
 
 void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexcept {
     if (!sequence.kv || !text_kv_addresses) { std::terminate(); }
-    // If KV is pinned (held by KVIndex), skip release: pages stay allocated,
-    // the index will release them when its entry is evicted.
     if (!text_kv_addresses->release(sequence.kv->text)) {
-        if (!text_kv_addresses->can_release_ignoring_pin(sequence.kv->text)) {
-            std::terminate();  // genuinely unreleasable (not just pinned)
-        }
-        // Pinned: pages stay, just clear our reference.
+        std::fprintf(stderr, "[FATAL] release_sequence_kv_strict: Text KV is not releasable\n");
+        std::fflush(stderr);
+        std::terminate();
     }
     if (sequence.kv->backend) {
         if (!backend_kv_addresses) { std::terminate(); }
         if (!backend_kv_addresses->release(*sequence.kv->backend)) {
-            if (!backend_kv_addresses->can_release_ignoring_pin(*sequence.kv->backend)) {
-                std::terminate();
-            }
+            std::fprintf(stderr, "[FATAL] release_sequence_kv_strict: Backend KV is not releasable\n");
+            std::fflush(stderr);
+            std::terminate();
         }
     }
     sequence.kv.reset();

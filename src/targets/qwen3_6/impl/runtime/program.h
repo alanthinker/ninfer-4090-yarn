@@ -15,8 +15,6 @@
 #include "targets/qwen3_6/impl/runtime/host_kv_extent_store.h"
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
 #include "targets/qwen3_6/impl/runtime/state_image_store.h"
-#include "targets/qwen3_6/impl/runtime/state_index.h"
-#include "targets/qwen3_6/impl/runtime/kv_index.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/resource_projection.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
@@ -629,17 +627,6 @@ public:
     // that retries the same prompt resumes from that frontier instead of prefilling from zero.
     // Declines (Released) when the prefix cannot be resumed; `abandon_outcome` names the case.
     [[nodiscard]] FinishResult abandon_prefill(SequenceHandle sequence) noexcept;
-    // Attempt to adopt pinned state+KV from StateIndex/KVIndex into a free catalog slot.
-    // Returns a valid ContinuationHandle + frontier if adopt succeeded (caller can use it as
-    // source with ReusePath::PrivateLongAnchor and the returned frontier as checkpoint).
-    // Returns nullopt if no match or no free slot.
-    struct AdoptResult {
-        ContinuationHandle handle;
-        std::uint32_t frontier = 0;
-    };
-    [[nodiscard]] std::optional<AdoptResult>
-    try_adopt_from_index(const PreparedPromptData& prompt,
-                         const PrefixShortlistDigests& digests);
     // Publishes a cancelled request's executed prefix as the continuation endpoint. A client that
     // aborts a turn and then acts on that turn - a summarization whose replay deliberately drops
     // the answer - has no other checkpoint to resume from, so discarding the lane forces a full
@@ -707,8 +694,6 @@ public:
     std::unique_ptr<qwen3_6::StateImageDevicePool> state_images;
     std::unique_ptr<qwen3_6::HostStatePool> host_state_images;
     std::unique_ptr<StateImageStore> state_store;
-    std::unique_ptr<StateIndex> state_index;
-    std::unique_ptr<KVIndex> kv_index;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<DFlashPersistentState> dflash;
@@ -1216,31 +1201,19 @@ private:
     [[nodiscard]] std::optional<std::uint32_t> allocate_continuation_slot() noexcept;
     [[nodiscard]] bool can_release_continuation_slot_strict(std::uint32_t index) const;
     // True when a live continuation still binds this state as its own replica, reserved
-    // destination, rewrite checkpoint, or long anchor. The StateIndex may outlive a catalog entry
-    // but must never release a state a live sequence still binds: an index pin is not ownership,
-    // and checkpoint_references counts only shared checkpoint retention.
+    // destination, rewrite checkpoint, or long anchor. Such a state must never be released: a
+    // frozen endpoint is bound directly and therefore carries no checkpoint_references, so the
+    // reference count alone does not prove that nobody is using it.
     [[nodiscard]] bool state_bound_by_live_sequence(StateImageHandle state) const;
     // Last-resort release when the StateImage pools are exhausted and every remaining state is
     // bound by a live continuation: retire the idle (catalogued) continuation whose state was
     // touched longest ago, and with it the state object it owns. Returns false when no idle
     // continuation can be retired.
     [[nodiscard]] bool retire_oldest_idle_continuation();
-    // Free the StateImage object behind the least-recently-used StateIndex entry that no live
-    // continuation binds. Recovery entries are a cache: once the pools are exhausted they hold
-    // memory that only dropping the oldest entry can reclaim. Returns false when every entry is
-    // still bound by a live continuation.
-    [[nodiscard]] bool release_oldest_unbound_index_entry();
-    // One step of Device/Host StateImage capacity release, cheapest and least destructive first:
-    // demote a retained state to Host, then drop the oldest unbound recovery entry, then retire the
-    // oldest idle continuation. Returns false when no further step can free anything.
+    // One step of Device/Host StateImage capacity release, least destructive first: demote a
+    // retained state to Host, then retire the oldest idle continuation. Returns false when no
+    // further step can free anything.
     [[nodiscard]] bool release_state_capacity_step();
-    // Move every Device replica of a retained KV address into the Host KV arena. A retained
-    // address outlives its catalog entry, so holding Device pages for it would exhaust the Device
-    // page pool; adoption restores the pages through the existing Host-to-Device path. Returns
-    // false when the Host arena cannot take the replicas, and the caller then drops the KV.
-    [[nodiscard]] bool demote_address_kv_to_host(KVAddressSpaceStore& addresses,
-                                                 LogicalKVPageStore& pages,
-                                                 KVAddressSpaceHandle address);
     // Reserve a private StateImage destination, releasing capacity step by step until it succeeds.
     [[nodiscard]] std::optional<StateImageHandle> reserve_state_destination_with_release();
     // The same, for a logical (Host-replica) destination, which consumes a StateImage object but no

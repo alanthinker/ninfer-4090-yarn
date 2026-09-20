@@ -250,7 +250,7 @@ public:
     ResourceManager(std::uint32_t lane_count, std::uint32_t private_catalog_capacity,
                     std::uint32_t shared_catalog_capacity, bool cache_enabled,
                     std::uint32_t max_long_anchors, std::uint32_t fair_share_buckets,
-                    bool prefer_index_adopt, ContextMachineCostModel cost_model)
+                    ContextMachineCostModel cost_model)
         : lane_count_(lane_count), catalog_count_(private_catalog_capacity),
           shared_catalog_count_(shared_catalog_capacity), cache_enabled_(cache_enabled),
           catalog_(private_catalog_capacity), shared_catalog_(shared_catalog_capacity),
@@ -259,7 +259,6 @@ public:
                                                       shared_catalog_capacity, max_long_anchors)),
           max_long_anchors_(max_long_anchors),
           fair_share_buckets_(cache_enabled ? fair_share_buckets : 0),
-          prefer_index_adopt_(cache_enabled && prefer_index_adopt),
           cost_model_(std::move(cost_model)) {
         if (lane_count == 0 || lane_count > kMaximumConcurrency ||
             private_catalog_capacity < lane_count) {
@@ -398,40 +397,6 @@ public:
                         },
                     .source_key = index.key,
                 });
-            }
-        }
-
-        // Recovery index: normally a fallback for the case where no catalog candidate matched, and
-        // with prefer_index_adopt_ also offered alongside catalog candidates so the planner can
-        // compare the two. A conversation that kept its state and KV across catalog eviction is
-        // then usable even when some shorter catalog prefix happens to match.
-        if (cache_enabled_ && !prefer_index_adopt_ && candidates.size() > 1) {
-            std::fprintf(stderr, "[adopt] SKIPPED: candidates.size()=%zu (need ==1)\n", candidates.size());
-            std::fflush(stderr);
-        }
-        if (cache_enabled_ && (prefer_index_adopt_ || candidates.size() == 1)) {
-            auto adopted = program.try_adopt_from_index(prompt, base);
-            if (!adopted) {
-                std::fprintf(stderr, "[adopt] MISS (try_adopt_from_index returned nullopt)\n");
-                std::fflush(stderr);
-            }
-            if (adopted) {
-                try {
-                    auto checkpoint = runtime::CheckpointRef{
-                        .kind     = runtime::CheckpointKind::LongAnchor,
-                        .frontier = adopted->frontier,
-                        .ordinal  = 0,
-                    };
-                    std::optional<AdmissionCandidate> plan = program.inspect_admission(
-                        prompt, base, *destination, &adopted->handle, nullptr,
-                        checkpoint, false);
-                    if (plan && plan->summary().reusable_prompt_tokens > 0) {
-                        candidates.push_back(Candidate{.plan = std::move(*plan)});
-                    }
-                } catch (const std::exception& e) {
-                    std::fprintf(stderr, "[adopt] inspect_admission threw: %s\n", e.what());
-                    std::fflush(stderr);
-                }
             }
         }
 
@@ -3782,7 +3747,6 @@ private:
     // Number of most-recently-active private sessions whose checkpoints are victim-protected;
     // 0 disables fair-share protection. Force-zeroed when the cache is disabled.
     std::uint32_t fair_share_buckets_ = 0;
-    bool prefer_index_adopt_          = false;
     std::array<ActiveEntry, kMaximumConcurrency> active_{};
     using ContextTransaction =
         std::variant<std::monostate, MaterializationRecord, ActiveCaptureRecord>;

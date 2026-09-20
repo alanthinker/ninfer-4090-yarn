@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Test StateIndex: 20 different 8K short conversations, then re-query the first 5.
+"""Test prefix reuse: 20 different 8K short conversations, then re-query the first 5.
 
 Each conversation is a unique 8K-token prompt with one request.
 After all 20 complete, we send a second request to conversations 0-4.
-If the StateIndex (or 8K first anchor + catalog) works, those should get
-significant cache hits (TTFT much lower than the initial request).
+Those should get significant cache hits (TTFT much lower than the initial request),
+from the catalog's own checkpoints when their data is Host-resident.
 
 Usage:
     python3 test_state_index_short.py --base-url http://127.0.0.1:8123/v1
@@ -139,11 +139,11 @@ def main():
     hits = sum(1 for i in range(args.verify) if results_followup[i] < results_initial[i] * 0.5)
     print(f"=== RESULT: {hits}/{args.verify} cache hits ===")
     if hits == args.verify:
-        print("All verified conversations got cache hits. StateIndex working.")
+        print("All verified conversations got cache hits. Context cache working.")
     elif hits > 0:
         print(f"Partial: {hits}/{args.verify} hits. Some states were not found.")
     else:
-        print("No cache hits. States were not preserved (expected without StateIndex/8K anchor).")
+        print("No cache hits: no resident checkpoint covered the returned prefix.")
 
     return 0 if hits == args.verify else 1
 
