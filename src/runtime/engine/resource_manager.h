@@ -401,9 +401,16 @@ public:
         }
 
         // Fallback: if no catalog candidate matched, try StateIndex/KVIndex adopt.
-        // TEMPORARILY DISABLED for 500 diagnosis.
-        if (false && cache_enabled_ && candidates.size() == 1) {
+        if (cache_enabled_ && candidates.size() > 1) {
+            std::fprintf(stderr, "[adopt] SKIPPED: candidates.size()=%zu (need ==1)\n", candidates.size());
+            std::fflush(stderr);
+        }
+        if (cache_enabled_ && candidates.size() == 1) {
             auto adopted = program.try_adopt_from_index(prompt, base);
+            if (!adopted) {
+                std::fprintf(stderr, "[adopt] MISS (try_adopt_from_index returned nullopt)\n");
+                std::fflush(stderr);
+            }
             if (adopted) {
                 try {
                     auto checkpoint = runtime::CheckpointRef{

@@ -218,42 +218,52 @@ public:
         require(handle).is_endpoint = true;
     }
 
-    // Evict the least-recently-touched state that has both device and host replicas, is a
-    // CheckpointImmutable, and is not pinned/referenced. Frees one device slot (the evicted
-    // state survives as HostOnly). Anchors are preferred over endpoints; among the same
-    // class the least-recently-touched is evicted. The exclude callback (template parameter
-    // to avoid the incomplete-type issue with Object) can veto specific states.
-    // Returns true if a state was evicted.
-    template <class ExcludeFn>
-    [[nodiscard]] bool evict_lru(ExcludeFn&& exclude) noexcept {
-        std::uint32_t best = std::numeric_limits<std::uint32_t>::max();
+    // How a retained checkpoint gives up one Device StateImage slot. Retention keeps a checkpoint
+    // DeviceOnly (fast reuse) or HostOnly (slow reuse); an object holding both replicas exists only
+    // while a transfer is in flight and is excluded as a victim, because its Device slot is already
+    // committed to that transfer. A DeviceOnly checkpoint must therefore be copied to Host before
+    // its slot can be reused, which the caller performs with begin_device_to_host and
+    // publish_transfer.
+    enum class SlotReleaseKind {
+        DropDeviceReplica,  // victim already holds a Host replica: only the Device slot is freed
+        CopyToHost,         // victim is DeviceOnly: copy to Host, then free the Device slot
+        Drop,               // victim is unreferenced and unpinned: release it entirely
+    };
+
+    // Select the least-valuable retained checkpoint that can release its Device slot at the given
+    // cost. Anchors are preferred over endpoints, because endpoints are likelier to be reused by
+    // the next request in their session; among one class the least-recently-touched wins. The veto
+    // callback receives the candidate handle so the caller can apply ownership rules the store
+    // cannot see (a state a live sequence still binds must never be released). Returns nullopt when
+    // no checkpoint can release its slot that way.
+    template <class VetoFn>
+    [[nodiscard]] std::optional<StateImageHandle>
+    select_slot_release_victim(SlotReleaseKind kind, VetoFn&& veto) const noexcept {
+        std::optional<StateImageHandle> best;
         std::uint64_t best_touched = std::numeric_limits<std::uint64_t>::max();
-        bool best_is_anchor = true;
+        bool best_is_anchor        = true;
         for (std::uint32_t i = 0; i < objects_.size(); ++i) {
             const Object& obj = objects_[i];
-            if (obj.role != StateImageRole::CheckpointImmutable) { continue; }
-            if (!obj.device_slot) { continue; }
-            if (!obj.host_slot) { continue; }
+            if (obj.role != StateImageRole::CheckpointImmutable || !obj.device_slot) { continue; }
+            if (kind == SlotReleaseKind::DropDeviceReplica && !obj.host_slot) { continue; }
+            if (kind != SlotReleaseKind::DropDeviceReplica && obj.host_slot) { continue; }
+            if (kind == SlotReleaseKind::Drop &&
+                (obj.checkpoint_references != 0 || obj.index_pin != 0)) {
+                continue;
+            }
             if (obj.source_pins != 0 || obj.destination_pinned || has_pending_replica(obj)) {
                 continue;
             }
-            if (exclude(obj)) { continue; }
+            if (veto(StateImageHandle(this, i, obj.generation))) { continue; }
             const bool is_anchor = !obj.is_endpoint;
-            if (best == std::numeric_limits<std::uint32_t>::max() ||
-                (is_anchor && !best_is_anchor) ||
+            if (!best || (is_anchor && !best_is_anchor) ||
                 (is_anchor == best_is_anchor && obj.last_touched_ns < best_touched)) {
-                best = i;
-                best_touched = obj.last_touched_ns;
+                best           = StateImageHandle(this, i, obj.generation);
+                best_touched   = obj.last_touched_ns;
                 best_is_anchor = is_anchor;
             }
         }
-        if (best == std::numeric_limits<std::uint32_t>::max()) { return false; }
-        Object& obj = objects_[best];
-        std::fprintf(stderr, "state-store: LRU evict (D2H demote) handle=%u device_slot=%d -> host_only\n",
-                     static_cast<std::uint32_t>(best), *obj.device_slot);
-        return_device_slot(*obj.device_slot);
-        obj.device_slot.reset();
-        return true;
+        return best;
     }
 
     [[nodiscard]] std::uint32_t source_pins(StateImageHandle handle) const {
@@ -299,6 +309,23 @@ public:
             throw std::logic_error("StateImage index pin underflow");
         }
         --object.index_pin;
+    }
+
+    // Diagnostic accessors: the object slot and generation behind a handle, for correlating
+    // lifecycle logs across a reused slot.
+    [[nodiscard]] std::uint32_t debug_index(StateImageHandle handle) const noexcept {
+        return handle.index_;
+    }
+
+    [[nodiscard]] std::uint32_t debug_generation(StateImageHandle handle) const noexcept {
+        return handle.generation_;
+    }
+
+    // Last time this state was touched, used to age out the least-valuable retained state when the
+    // pools are exhausted.
+    [[nodiscard]] std::uint64_t last_touched(StateImageHandle handle) const noexcept {
+        return valid(handle) ? objects_[handle.index_].last_touched_ns
+                             : std::numeric_limits<std::uint64_t>::max();
     }
 
     [[nodiscard]] std::uint32_t index_pin(StateImageHandle handle) const noexcept {
@@ -422,6 +449,11 @@ public:
         }
         object.content_epoch = next_epoch();
         object.role          = StateImageRole::CheckpointImmutable;
+        // A newly published checkpoint is the most recent state in the pool, so it must sort after
+        // every older one when the pools run out and the oldest entry has to be dropped.
+        object.last_touched_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count();
     }
 
     void thaw(StateImageHandle handle) {
@@ -765,6 +797,14 @@ public:
     [[nodiscard]] bool release(StateImageHandle handle) noexcept {
         if (!can_release(handle)) { return false; }
         Object& object = objects_[handle.index_];
+        std::fprintf(stderr,
+                     "[state-store] release handle=%u gen=%u role=%d dev=%d host=%d "
+                     "ckpt_refs=%u index_pin=%u\n",
+                     handle.index_, handle.generation_, static_cast<int>(object.role),
+                     object.device_slot ? *object.device_slot : -1,
+                     object.host_slot ? static_cast<int>(object.host_slot->index) : -1,
+                     object.checkpoint_references, object.index_pin);
+        std::fflush(stderr);
         if (object.host_slot) {
             if (host_ == nullptr || !host_->release(*object.host_slot)) { return false; }
             object.host_slot.reset();
@@ -841,6 +881,13 @@ private:
                                                            bool with_device) noexcept {
         if (free_object_count_ == 0 || role == StateImageRole::Free ||
             (with_device && free_device_count_ == 0)) {
+            std::fprintf(stderr,
+                         "[state-store] allocate FAILED role=%d with_device=%d free_object=%u "
+                         "free_device=%u\n",
+                         static_cast<int>(role), with_device ? 1 : 0, free_object_count_,
+                         free_device_count_);
+            dump_device_slot_occupants();
+            std::fflush(stderr);
             return std::nullopt;
         }
         const std::uint32_t index = free_objects_[--free_object_count_];
@@ -852,11 +899,40 @@ private:
 
     [[nodiscard]] std::optional<std::int32_t> take_device_slot() noexcept {
         if (free_device_count_ == 0) {
-            std::fprintf(stderr, "[state-store] take_device_slot: NONE FREE\n");
+            std::fprintf(stderr, "[state-store] take_device_slot: NONE FREE (dump follows)\n");
+            dump_device_slot_occupants();
             std::fflush(stderr);
             return std::nullopt;
         }
         return free_device_slots_[--free_device_count_];
+    }
+
+    void dump_device_slot_occupants() const noexcept {
+        std::fprintf(stderr,
+                     "[state-store] dump: free_device=%u free_object=%u device_capacity=%zu\n",
+                     free_device_count_, free_object_count_, objects_.size());
+        for (std::size_t i = 0; i < objects_.size(); ++i) {
+            const Object& obj = objects_[i];
+            if (obj.role == StateImageRole::Free) { continue; }
+            std::fprintf(stderr,
+                         "[state-store]   #%zu role=%d dev=%d host=%d pend_dev=%d pend_host=%d "
+                         "xfer=%llu ckpt_refs=%u index_pin=%u src_pins=%u dst_pinned=%d "
+                         "endpoint=%d evictable=%d\n",
+                         i, static_cast<int>(obj.role),
+                         obj.device_slot ? *obj.device_slot : -1,
+                         obj.host_slot ? static_cast<int>(obj.host_slot->index) : -1,
+                         obj.pending_device_slot ? *obj.pending_device_slot : -1,
+                         obj.pending_host_slot ? static_cast<int>(obj.pending_host_slot->index)
+                                               : -1,
+                         static_cast<unsigned long long>(obj.transfer_id),
+                         obj.checkpoint_references, obj.index_pin, obj.source_pins,
+                         obj.destination_pinned ? 1 : 0, obj.is_endpoint ? 1 : 0,
+                         (obj.role == StateImageRole::CheckpointImmutable && obj.device_slot &&
+                          obj.host_slot && obj.source_pins == 0 && !obj.destination_pinned &&
+                          !has_pending_replica(obj))
+                             ? 1
+                             : 0);
+        }
     }
 
     void return_device_slot(std::int32_t slot) noexcept {

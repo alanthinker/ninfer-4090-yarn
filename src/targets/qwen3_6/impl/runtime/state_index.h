@@ -145,6 +145,20 @@ public:
         }
     }
 
+    // Visit every occupied entry in slot order. Recovery needs the frontier each entry was stored
+    // at: an evicted conversation returns as its own prefix plus new tokens, so the stored frontier
+    // is not aligned to any fixed stride of the incoming prompt and cannot be found by scanning it.
+    template <class VisitFn>
+    void for_each(VisitFn&& visit) const {
+        for (const Slot& slot : slots_) {
+            if (slot.state != SlotState::Occupied) { continue; }
+            visit(Entry{.digest         = slot.digest,
+                        .state          = slot.state_handle,
+                        .frontier       = slot.frontier,
+                        .last_access_ns = slot.last_access_ns});
+        }
+    }
+
 private:
     enum class SlotState : std::uint8_t { Empty, Occupied, Tombstone };
 

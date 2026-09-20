@@ -1215,9 +1215,37 @@ private:
     [[nodiscard]] const SequenceState& active_sequence(std::uint32_t lane) const;
     [[nodiscard]] std::optional<std::uint32_t> allocate_continuation_slot() noexcept;
     [[nodiscard]] bool can_release_continuation_slot_strict(std::uint32_t index) const;
+    // True when a live continuation still binds this state as its own replica, reserved
+    // destination, rewrite checkpoint, or long anchor. The StateIndex may outlive a catalog entry
+    // but must never release a state a live sequence still binds: an index pin is not ownership,
+    // and checkpoint_references counts only shared checkpoint retention.
+    [[nodiscard]] bool state_bound_by_live_sequence(StateImageHandle state) const;
+    // Last-resort release when the StateImage pools are exhausted and every remaining state is
+    // bound by a live continuation: retire the idle (catalogued) continuation whose state was
+    // touched longest ago, and with it the state object it owns. Returns false when no idle
+    // continuation can be retired.
+    [[nodiscard]] bool retire_oldest_idle_continuation();
+    // Free the StateImage object behind the least-recently-used StateIndex entry that no live
+    // continuation binds. Recovery entries are a cache: once the pools are exhausted they hold
+    // memory that only dropping the oldest entry can reclaim. Returns false when every entry is
+    // still bound by a live continuation.
+    [[nodiscard]] bool release_oldest_unbound_index_entry();
+    // One step of Device/Host StateImage capacity release, cheapest and least destructive first:
+    // demote a retained state to Host, then drop the oldest unbound recovery entry, then retire the
+    // oldest idle continuation. Returns false when no further step can free anything.
+    [[nodiscard]] bool release_state_capacity_step();
+    // Reserve a private StateImage destination, releasing capacity step by step until it succeeds.
+    [[nodiscard]] std::optional<StateImageHandle> reserve_state_destination_with_release();
+    // The same, for a logical (Host-replica) destination, which consumes a StateImage object but no
+    // Device slot.
+    [[nodiscard]] std::optional<StateImageHandle> reserve_logical_destination_with_release();
     void release_continuation_slot_strict(std::uint32_t index) noexcept;
     void release_continuation_slot_best_effort(std::uint32_t index) noexcept;
     void retire_continuation_slot(std::uint32_t index) noexcept;
+    // Free one Device StateImage slot for an incoming reservation by demoting the least-valuable
+    // retained checkpoint to Host, or by dropping it when it is unreferenced and no Host slot is
+    // available. Returns false when no retained checkpoint can give up its Device slot.
+    [[nodiscard]] bool release_one_device_state_slot();
     void clear_execution_failure_lanes(std::span<const std::uint32_t> lanes) noexcept;
     [[nodiscard]] bool can_clear_lane_strict(const SequenceState& sequence) const;
     [[nodiscard]] bool clear_lane_strict(SequenceState& sequence, RequestControl& request) noexcept;

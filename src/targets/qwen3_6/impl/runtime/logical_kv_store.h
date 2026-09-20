@@ -857,6 +857,8 @@ public:
         return static_cast<std::uint32_t>(addresses_.size());
     }
 
+    [[nodiscard]] std::uint32_t free_count() const noexcept { return free_count_; }
+
     [[nodiscard]] std::uint32_t occupied() const noexcept { return capacity() - free_count_; }
 
     [[nodiscard]] std::optional<KVAddressSpaceHandle> create_active(std::uint32_t entitlement,
