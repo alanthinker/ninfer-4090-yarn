@@ -868,6 +868,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     state_store = std::make_unique<StateImageStore>(
         *state_images, host_state_images.get(), static_cast<std::uint32_t>(logical_state_capacity));
+    if (plan.context_cache.host_state_slots != 0) {
+        state_index = std::make_unique<StateIndex>(plan.context_cache.host_state_slots);
+        kv_index = std::make_unique<KVIndex>(plan.context_cache.host_state_slots);
+    }
     pressure_private_owner_scratch_.resize(continuation_capacity);
     pressure_shared_owner_scratch_.resize(shared_prefix_capacity);
     pressure_private_drop_scratch_.resize(continuation_capacity);
@@ -6656,6 +6660,30 @@ void ProgramImplCore::release_continuation_slot_best_effort(std::uint32_t index)
     }
     SequenceState& sequence = continuation_states[index];
     release_active_shared_references(sequence);
+    // Pin KV and register in KVIndex before releasing, so pages survive catalog eviction.
+    if (kv_index && sequence.kv && text_kv_addresses) {
+        const auto& digests = sequence.prefix_digests;
+        const std::uint32_t frontier = sequence.text_kv_valid;
+        if (frontier > 0 && digests.size() > frontier) {
+            const auto evicted = kv_index->insert(
+                digests.at(frontier), sequence.kv->text,
+                sequence.kv->backend ? std::optional<KVAddressSpaceHandle>(*sequence.kv->backend)
+                                     : std::nullopt,
+                frontier);
+            // Release pins on evicted entry.
+            if (evicted.has_value()) {
+                text_kv_addresses->release_pin(evicted->text_address);
+                if (evicted->backend_address && backend_kv_addresses) {
+                    backend_kv_addresses->release_pin(*evicted->backend_address);
+                }
+            }
+            // Pin the new entry.
+            text_kv_addresses->retain_pin(sequence.kv->text);
+            if (sequence.kv->backend && backend_kv_addresses) {
+                backend_kv_addresses->retain_pin(*sequence.kv->backend);
+            }
+        }
+    }
     release_sequence_kv(sequence);
     release_sequence_state(sequence);
     retire_continuation_slot(index);
@@ -8365,6 +8393,24 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
         sequence.state = ActiveStateBinding{.read  = transaction.destination_state,
                                             .write = transaction.destination_state};
         refresh_state_views(sequence);
+        // Register the HostOnly checkpoint in StateIndex for orphan discovery.
+        if (state_index) {
+            const auto& digests = sequence.prefix_digests;
+            if (digests.size() > transaction.group.frontier) {
+                const auto evicted = state_index->insert(
+                    digests.at(transaction.group.frontier), transaction.source_state,
+                    transaction.group.frontier);
+                // If an old entry was evicted, release its reference.
+                if (evicted.has_value()) {
+                    state_store->release_checkpoint_reference(evicted->state);
+                    if (state_store->can_release(evicted->state)) {
+                        (void)state_store->release(evicted->state);
+                    }
+                }
+                // Retain the new entry's reference (insert succeeded or updated in-place).
+                state_store->retain_checkpoint_reference(transaction.source_state);
+            }
+        }
     }
 
     std::optional<SequenceKVBundle> shared_bundle;
@@ -9394,6 +9440,75 @@ FinishResult ProgramImplCore::abandon_prefill(SequenceHandle sequence) noexcept 
                                     ? runtime::AbandonedPrefixOutcome::Retained
                                     : runtime::AbandonedPrefixOutcome::PublicationDeclined;
     return published;
+}
+
+std::optional<ContinuationHandle>
+ProgramImplCore::try_adopt_from_index(const PreparedPromptData& prompt,
+                                      const PrefixShortlistDigests& digests) {
+    if (!state_index || !kv_index || digests.size() == 0) { return std::nullopt; }
+
+    // Find a free catalog slot.
+    std::uint32_t free_slot = continuation_capacity;
+    for (std::uint32_t i = 0; i < continuation_capacity; ++i) {
+        if (continuation_slots[i].role == ContinuationSlotRole::Free) {
+            free_slot = i;
+            break;
+        }
+    }
+    if (free_slot >= continuation_capacity) { return std::nullopt; }
+
+    // Search candidate frontiers (from longest prefix).
+    const std::size_t prompt_tokens = prompt.token_ids.size();
+    for (std::size_t frontier = prompt_tokens; frontier >= 8192; frontier -= 1024) {
+        if (frontier >= digests.size()) { continue; }
+        const auto digest = digests.at(frontier);
+
+        const auto state_hit = state_index->lookup(digest);
+        if (!state_hit) { continue; }
+        if (!state_store->valid(state_hit->state)) { continue; }
+
+        const auto kv_hit = kv_index->lookup(digest);
+        if (!kv_hit) { continue; }
+        if (!text_kv_addresses || !text_kv_addresses->valid(kv_hit->text_address)) { continue; }
+
+        // Both hit: adopt into the free slot.
+        SequenceState& seq = continuation_states[free_slot];
+        seq.kv = std::make_optional<SequenceKVBundle>(SequenceKVBundle{
+            .text    = kv_hit->text_address,
+            .backend = kv_hit->backend_address
+                           ? std::optional<KVAddressSpaceHandle>(*kv_hit->backend_address)
+                           : std::nullopt});
+        seq.state = ActiveStateBinding{.read = state_hit->state, .write = state_hit->state};
+        seq.ledger.assign(prompt.token_ids.begin(),
+                          prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(frontier));
+        seq.ledger_frontier    = static_cast<std::uint32_t>(frontier);
+        seq.prefix_identity.assign(prompt);
+        seq.prefix_digests     = digests;
+        seq.text_kv_valid      = static_cast<std::uint32_t>(frontier);
+        seq.execution_frontier = 0;
+        seq.long_anchors.push_back(LongAnchorCheckpoint{
+            .state    = state_hit->state,
+            .frontier = static_cast<std::uint32_t>(frontier),
+            .ordinal  = 0,
+        });
+        state_store->retain_checkpoint_reference(state_hit->state);
+
+        // Release index pins (resources now owned by catalog entry).
+        (void)state_index->erase(digest);
+        state_store->release_checkpoint_reference(state_hit->state);
+        (void)kv_index->erase(digest);
+        text_kv_addresses->release_pin(kv_hit->text_address);
+        if (kv_hit->backend_address && backend_kv_addresses) {
+            backend_kv_addresses->release_pin(*kv_hit->backend_address);
+        }
+
+        ContinuationSlot& slot = continuation_slots[free_slot];
+        slot.role              = ContinuationSlotRole::Catalogued;
+        if (++slot.generation == 0) { ++slot.generation; }
+
+        return ContractAccess::make_continuation(this, free_slot, slot.generation);
+    }
+    return std::nullopt;
 }
 
 FinishResult ProgramImplCore::publish_continuation(

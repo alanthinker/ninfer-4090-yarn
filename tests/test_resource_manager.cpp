@@ -647,6 +647,11 @@ public:
         return base.isolated_feasible;
     }
 
+    [[nodiscard]] std::optional<FakeContinuationHandle>
+    try_adopt_from_index(const FakePreparedPrompt&, const FakeRequestBasePlan&) {
+        return std::nullopt;
+    }
+
     [[nodiscard]] std::optional<FakeAdmissionCandidate>
     inspect_admission(const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base, LaneId,
                       const FakeContinuationHandle* source,

@@ -884,6 +884,8 @@ public:
                       const SharedPrefixHandle<Variant>* shared_source,
                       std::optional<runtime::CheckpointRef> checkpoint,
                       bool must_retain_private_source);
+    [[nodiscard]] std::optional<ContinuationHandle<Variant>>
+    try_adopt_from_index(const PreparedPrompt& prompt, const RequestBasePlan<Variant>& base);
     [[nodiscard]] std::optional<ResourcePlan<Variant>>
     seal_identity(const AdmissionCandidate<Variant>& candidate, const PreparedPrompt& prompt,
                   runtime::FinalScheduleIntent intent);

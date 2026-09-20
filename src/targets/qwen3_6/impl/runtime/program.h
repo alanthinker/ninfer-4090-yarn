@@ -15,6 +15,8 @@
 #include "targets/qwen3_6/impl/runtime/host_kv_extent_store.h"
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
 #include "targets/qwen3_6/impl/runtime/state_image_store.h"
+#include "targets/qwen3_6/impl/runtime/state_index.h"
+#include "targets/qwen3_6/impl/runtime/kv_index.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/resource_projection.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
@@ -627,6 +629,12 @@ public:
     // that retries the same prompt resumes from that frontier instead of prefilling from zero.
     // Declines (Released) when the prefix cannot be resumed; `abandon_outcome` names the case.
     [[nodiscard]] FinishResult abandon_prefill(SequenceHandle sequence) noexcept;
+    // Attempt to adopt pinned state+KV from StateIndex/KVIndex into a free catalog slot.
+    // Returns a valid ContinuationHandle if adopt succeeded (caller can use it as source
+    // with ReusePath::PrivateLongAnchor). Returns nullopt if no match or no free slot.
+    [[nodiscard]] std::optional<ContinuationHandle>
+    try_adopt_from_index(const PreparedPromptData& prompt,
+                         const PrefixShortlistDigests& digests);
     // Publishes a cancelled request's executed prefix as the continuation endpoint. A client that
     // aborts a turn and then acts on that turn - a summarization whose replay deliberately drops
     // the answer - has no other checkpoint to resume from, so discarding the lane forces a full
@@ -694,6 +702,8 @@ public:
     std::unique_ptr<qwen3_6::StateImageDevicePool> state_images;
     std::unique_ptr<qwen3_6::HostStatePool> host_state_images;
     std::unique_ptr<StateImageStore> state_store;
+    std::unique_ptr<StateIndex> state_index;
+    std::unique_ptr<KVIndex> kv_index;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<DFlashPersistentState> dflash;

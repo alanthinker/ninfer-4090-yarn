@@ -400,6 +400,19 @@ public:
             }
         }
 
+        // Fallback: if no catalog candidate matched, try StateIndex/KVIndex adopt.
+        if (cache_enabled_ && candidates.size() == 1) {
+            auto adopted = program.try_adopt_from_index(prompt, base);
+            if (adopted) {
+                std::optional<AdmissionCandidate> plan = program.inspect_admission(
+                    prompt, base, *destination, &*adopted, nullptr,
+                    std::nullopt, false);
+                if (plan && plan->summary().reusable_prompt_tokens > 0) {
+                    candidates.push_back(Candidate{.plan = std::move(*plan)});
+                }
+            }
+        }
+
         std::optional<Choice> selected =
             plan_materialization(program, prompt, base, *destination, candidates, publication_order,
                                  planning_started, provisional_demand);
