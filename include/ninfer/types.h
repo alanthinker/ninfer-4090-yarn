@@ -538,6 +538,11 @@ struct ContextCacheHints {
     // 0 (the default) proposes none, so only the last-N window applies. Retention stays bounded by
     // ContextCacheOptions::max_long_anchors_per_continuation, which must be sized for both sets.
     std::uint32_t automatic_anchor_spacing = 0;
+    // Spacing for the first automatic anchor only. Subsequent anchors continue at
+    // automatic_anchor_spacing intervals. A smaller first spacing (e.g. 8192) ensures short
+    // prompts (< 32K tokens) still receive an anchor and therefore a catalog entry, making their
+    // state discoverable and persistable. 0 falls back to automatic_anchor_spacing for all anchors.
+    std::uint32_t automatic_first_anchor_spacing = 0;
 };
 
 struct PromptInput {

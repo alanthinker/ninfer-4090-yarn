@@ -130,6 +130,11 @@ public:
         return automatic_anchor_spacing_;
     }
 
+    // Spacing for the first automatic anchor; see ContextCacheHints::automatic_first_anchor_spacing.
+    [[nodiscard]] std::uint32_t automatic_first_anchor_spacing() const noexcept {
+        return automatic_first_anchor_spacing_;
+    }
+
     [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
 
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
@@ -211,6 +216,7 @@ private:
     std::unique_ptr<ninfer::Engine> engine_;
     std::uint32_t automatic_private_anchors_ = 0;
     std::uint32_t automatic_anchor_spacing_  = 0;
+    std::uint32_t automatic_first_anchor_spacing_ = 0;
     ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
 };

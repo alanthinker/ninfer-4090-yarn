@@ -877,7 +877,13 @@ PreparedContextCache prepare_context_cache(
     // ContextCacheHints::automatic_anchor_spacing for the compaction case that motivates it.
     if (hints.automatic_private_anchors != 0 && hints.automatic_anchor_spacing != 0 &&
         message_count > 1) {
-        std::uint32_t next_frontier = hints.automatic_anchor_spacing;
+        // First anchor at the tighter first-anchor spacing (default 8192) so short prompts
+        // (< 32K tokens) still get a catalog entry. Subsequent anchors at full spacing.
+        const std::uint32_t first_spacing =
+            hints.automatic_first_anchor_spacing != 0
+                ? std::min(hints.automatic_first_anchor_spacing, hints.automatic_anchor_spacing)
+                : hints.automatic_anchor_spacing;
+        std::uint32_t next_frontier = first_spacing;
         for (std::size_t after = 1; after < message_boundaries.size(); ++after) {
             if (!message_boundaries[after] || *message_boundaries[after] >= full_prompt_frontier) {
                 continue;

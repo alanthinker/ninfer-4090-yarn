@@ -84,7 +84,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] [--auto-long-anchors N] "
             "[--fair-share-buckets N] "
-           "[--auto-anchor-spacing N] "
+           "[--auto-anchor-spacing N] [--first-anchor-spacing N] "
            "[--request-log-jsonl FILE] [--slot-save-path DIR] [--auto-save-evicted] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] "
@@ -304,6 +304,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--auto-anchor-spacing") {
             options.auto_anchor_spacing = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--auto-anchor-spacing"), "auto-anchor-spacing"));
+        } else if (arg == "--first-anchor-spacing") {
+            options.auto_first_anchor_spacing = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--first-anchor-spacing"), "first-anchor-spacing"));
         } else if (arg == "--request-log-jsonl") {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {
@@ -489,6 +492,17 @@ std::uint32_t resolve_automatic_private_anchors(const ServeOptions& options,
     if (!resolved.enabled || !options.allow_prefix_reuse) { return 0; }
     const std::uint32_t cap = resolved.max_long_anchors_per_continuation.value_or(0U);
     return std::min(options.auto_long_anchors.value_or(cap), cap);
+}
+
+std::uint32_t resolve_first_anchor_spacing(const ServeOptions& options,
+                                           const ContextCacheOptions& resolved) {
+    if (!resolved.enabled || !options.allow_prefix_reuse) { return 0; }
+    if (resolved.max_long_anchors_per_continuation.value_or(0U) == 0) { return 0; }
+    const std::uint32_t spacing = options.auto_anchor_spacing.value_or(0U);
+    if (spacing == 0) { return 0; }
+    // Default first anchor at 8192 tokens if not explicitly set.
+    const std::uint32_t first = options.auto_first_anchor_spacing.value_or(8192U);
+    return std::min(first, spacing);
 }
 
 } // namespace ninfer::serve

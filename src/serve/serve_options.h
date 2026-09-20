@@ -49,6 +49,10 @@ struct ServeOptions {
     // or after every N tokens of every prompt, so a mid-history divergence resumes nearby instead
     // of from token zero. Unset or 0 disables; see ContextCacheHints::automatic_anchor_spacing.
     std::optional<std::uint32_t> auto_anchor_spacing;
+    // --first-anchor-spacing N: spacing for the first automatic anchor only (default 8192).
+    // Subsequent anchors continue at auto_anchor_spacing intervals. Ensures short prompts
+    // (< 32K tokens) still get a catalog entry. 0 falls back to auto_anchor_spacing.
+    std::optional<std::uint32_t> auto_first_anchor_spacing;
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
@@ -111,6 +115,8 @@ std::uint32_t resolve_automatic_anchor_spacing(const ServeOptions& options,
                                               const ContextCacheOptions& resolved);
 std::uint32_t resolve_automatic_private_anchors(const ServeOptions& options,
                                                 const ContextCacheOptions& resolved);
+std::uint32_t resolve_first_anchor_spacing(const ServeOptions& options,
+                                           const ContextCacheOptions& resolved);
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_id);
 std::string serve_usage_text(const char* argv0);
