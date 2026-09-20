@@ -118,10 +118,11 @@ def main():
     time.sleep(gap_seconds)
     print()
 
-    # Phase 3: Re-query the first N conversations (follow-up)
-    print(f"--- Phase 2: Follow-up requests (first {args.verify} conversations) ---")
+    # Phase 3: Re-query the first N conversations (follow-up, most recent first
+    # to avoid earlier test requests evicting later ones from the cache)
+    print(f"--- Phase 2: Follow-up requests (first {args.verify} conversations, reversed) ---")
     results_followup = []
-    for i in range(args.verify):
+    for i in range(args.verify - 1, -1, -1):
         messages = [
             {"role": "user", "content": prompts[i]},
             {"role": "assistant", "content": f"SITH{i:04d}END"},
