@@ -1724,6 +1724,19 @@ public:
         return true;
     }
 
+    // Like can_release but ignores pin_count. Used by can_release_continuation_slot_strict
+    // where the materialization victim only needs to deactivate the address space (free the
+    // slot); pinned pages stay allocated even after the slot is freed.
+    [[nodiscard]] bool can_release_ignoring_pin(KVAddressSpaceHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Address& address = addresses_[handle.index_];
+        if (address.active || address.row || address.reservation.valid()) { return false; }
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
+            if (!pages_->can_release_reference(membership(address, page), false)) { return false; }
+        }
+        return true;
+    }
+
     [[nodiscard]] bool release_after_deactivate(KVAddressSpaceHandle handle) noexcept {
         if (!can_release_after_deactivate(handle)) { return false; }
         try {

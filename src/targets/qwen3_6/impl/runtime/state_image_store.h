@@ -282,6 +282,30 @@ public:
         --object.checkpoint_references;
     }
 
+    // Index pin: keeps a StateImage alive for an external lookup table (StateIndex) without
+    // affecting ownership/exclusivity accounting. Unlike checkpoint_references, an index_pin
+    // does NOT make the state non-exclusive to its owning sequence.
+    void retain_index_pin(StateImageHandle handle) {
+        Object& object = require(handle);
+        if (object.index_pin == std::numeric_limits<std::uint32_t>::max()) {
+            throw std::logic_error("StateImage index pin overflow");
+        }
+        ++object.index_pin;
+    }
+
+    void release_index_pin(StateImageHandle handle) {
+        Object& object = require(handle);
+        if (object.index_pin == 0) {
+            throw std::logic_error("StateImage index pin underflow");
+        }
+        --object.index_pin;
+    }
+
+    [[nodiscard]] std::uint32_t index_pin(StateImageHandle handle) const noexcept {
+        if (!valid(handle)) { return 0; }
+        return objects_[handle.index_].index_pin;
+    }
+
     [[nodiscard]] std::int32_t physical_slot(StateImageHandle handle) const {
         const Object& object = require(handle);
         if (!object.device_slot) {
@@ -759,8 +783,9 @@ public:
     [[nodiscard]] bool can_release(StateImageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Object& object = objects_[handle.index_];
-        return object.checkpoint_references == 0 && object.source_pins == 0 &&
-               !object.destination_pinned && !has_pending_replica(object);
+        return object.checkpoint_references == 0 && object.index_pin == 0 &&
+               object.source_pins == 0 && !object.destination_pinned &&
+               !has_pending_replica(object);
     }
 
     [[nodiscard]] bool
@@ -769,7 +794,10 @@ public:
         const Object& object = require(handle);
         if (released_references > object.checkpoint_references) { return false; }
         if (object.checkpoint_references != released_references) { return true; }
-        if (object.source_pins != 0 || object.destination_pinned || has_pending_replica(object)) {
+        // Note: index_pin intentionally NOT checked here. index_pin prevents full release
+        // (can_release) but must not block D2H demotion (materialization victim eviction).
+        if (object.source_pins != 0 || object.destination_pinned ||
+            has_pending_replica(object)) {
             return false;
         }
         if (object.host_slot) {
@@ -789,6 +817,7 @@ private:
         std::optional<qwen3_6::HostStateSlotHandle> pending_host_slot;
         std::uint64_t transfer_id           = 0;
         std::uint32_t checkpoint_references = 0;
+        std::uint32_t index_pin             = 0;
         std::uint32_t source_pins           = 0;
         bool destination_pinned             = false;
         StateImageRole role                 = StateImageRole::Free;
@@ -822,7 +851,11 @@ private:
     }
 
     [[nodiscard]] std::optional<std::int32_t> take_device_slot() noexcept {
-        if (free_device_count_ == 0) { return std::nullopt; }
+        if (free_device_count_ == 0) {
+            std::fprintf(stderr, "[state-store] take_device_slot: NONE FREE\n");
+            std::fflush(stderr);
+            return std::nullopt;
+        }
         return free_device_slots_[--free_device_count_];
     }
 

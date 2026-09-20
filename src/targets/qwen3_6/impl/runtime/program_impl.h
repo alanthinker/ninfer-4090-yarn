@@ -2865,7 +2865,7 @@ void ProgramImplCore::publish_checkpoint_drop(SequenceState& sequence,
                                      return anchor.state == dropped_state;
                                  });
     if (!retained_state && state_store->checkpoint_references(dropped_state) == 0 &&
-        !state_store->release(dropped_state)) {
+        state_store->index_pin(dropped_state) == 0 && !state_store->release(dropped_state)) {
         throw std::logic_error("dropped checkpoint StateImage remained pinned");
     }
 
@@ -4685,7 +4685,8 @@ void ProgramImplCore::prepare_consumed_source(MaterializationTransaction& transa
     };
     const auto release_if_unreferenced = [&](StateImageHandle handle) {
         if (!state_store->valid(handle) || retained_state(handle) ||
-            state_store->checkpoint_references(handle) != 0) {
+            state_store->checkpoint_references(handle) != 0 ||
+            state_store->index_pin(handle) != 0) {
             return;
         }
         if (!state_store->release(handle)) {
@@ -5935,9 +5936,11 @@ ProgramImplCore::release_materialization_victim(MaterializationTransaction& tran
         return out;
     }
     if (!can_release_continuation_slot_strict(index)) {
+        std::fprintf(stderr,
+                     "[FATAL] materialization victim slot=%u not strictly releasable\n", index);
+        std::fflush(stderr);
         throw std::logic_error("materialization victim is not strictly releasable");
     }
-
     out.delta.removed = owner_exclusive_resources(continuation_states[index]);
     release_continuation_slot_strict(index);
     if (transaction.root_waiting_for_victim && transaction.root_continuation_index == index) {
@@ -6575,12 +6578,16 @@ bool ProgramImplCore::can_release_continuation_slot_strict(std::uint32_t index) 
     }
     const SequenceState& sequence = continuation_states[index];
     if (sequence.state.fork_pending || !sequence.shared_prefix_references.empty() || !sequence.kv ||
-        !text_kv_addresses->can_release(sequence.kv->text)) {
+        !text_kv_addresses->can_release_ignoring_pin(sequence.kv->text)) {
+        std::fprintf(stderr, "[can_release_strict] FAIL slot=%u: fork=%d shared=%zu kv=%d\n",
+                     index, (int)sequence.state.fork_pending, sequence.shared_prefix_references.size(),
+                     (int)sequence.kv.has_value());
+        std::fflush(stderr);
         return false;
     }
     if (sequence.kv->backend) {
         if (!backend_kv_addresses || !backend_kv_pages ||
-            !backend_kv_addresses->can_release(*sequence.kv->backend)) {
+            !backend_kv_addresses->can_release_ignoring_pin(*sequence.kv->backend)) {
             return false;
         }
     }
@@ -6645,8 +6652,23 @@ bool ProgramImplCore::can_release_continuation_slot_strict(std::uint32_t index) 
 
 void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index) noexcept {
     try {
-        if (!can_release_continuation_slot_strict(index)) { std::terminate(); }
-    } catch (...) { std::terminate(); }
+        if (!can_release_continuation_slot_strict(index)) {
+            const auto& seq = continuation_states[index];
+            std::fprintf(stderr,
+                         "[FATAL] slot_strict slot=%u: fork=%d shared=%zu kv=%d "
+                         "anchors=%zu endpoint=%d state_valid=%d\n",
+                         index, (int)seq.state.fork_pending, seq.shared_prefix_references.size(),
+                         (int)seq.kv.has_value(), seq.long_anchors.size(),
+                         (int)seq.endpoint_valid,
+                         (int)(state_store ? state_store->valid(seq.state.read) : 0));
+            std::fflush(stderr);
+            std::terminate();
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[FATAL] slot_strict slot=%u threw: %s\n", index, e.what());
+        std::fflush(stderr);
+        std::terminate();
+    }
     SequenceState& sequence = continuation_states[index];
     release_sequence_kv_strict(sequence);
     release_sequence_state_strict(sequence);
@@ -8400,15 +8422,15 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
                 const auto evicted = state_index->insert(
                     digests.at(transaction.group.frontier), transaction.source_state,
                     transaction.group.frontier);
-                // If an old entry was evicted, release its reference.
+                // If an old entry was evicted, release its index pin.
                 if (evicted.has_value()) {
-                    state_store->release_checkpoint_reference(evicted->state);
+                    state_store->release_index_pin(evicted->state);
                     if (state_store->can_release(evicted->state)) {
                         (void)state_store->release(evicted->state);
                     }
                 }
-                // Retain the new entry's reference (insert succeeded or updated in-place).
-                state_store->retain_checkpoint_reference(transaction.source_state);
+                // Pin the new entry (insert succeeded or updated in-place).
+                state_store->retain_index_pin(transaction.source_state);
             }
         }
     }
@@ -9442,7 +9464,7 @@ FinishResult ProgramImplCore::abandon_prefill(SequenceHandle sequence) noexcept 
     return published;
 }
 
-std::optional<ContinuationHandle>
+std::optional<ProgramImplCore::AdoptResult>
 ProgramImplCore::try_adopt_from_index(const PreparedPromptData& prompt,
                                       const PrefixShortlistDigests& digests) {
     if (!state_index || !kv_index || digests.size() == 0) { return std::nullopt; }
@@ -9459,7 +9481,7 @@ ProgramImplCore::try_adopt_from_index(const PreparedPromptData& prompt,
 
     // Search candidate frontiers (from longest prefix).
     const std::size_t prompt_tokens = prompt.token_ids.size();
-    for (std::size_t frontier = prompt_tokens; frontier >= 8192; frontier -= 1024) {
+    for (std::size_t frontier = prompt_tokens; frontier >= 1024; frontier -= 1024) {
         if (frontier >= digests.size()) { continue; }
         const auto digest = digests.at(frontier);
 
@@ -9491,11 +9513,9 @@ ProgramImplCore::try_adopt_from_index(const PreparedPromptData& prompt,
             .frontier = static_cast<std::uint32_t>(frontier),
             .ordinal  = 0,
         });
-        state_store->retain_checkpoint_reference(state_hit->state);
-
         // Release index pins (resources now owned by catalog entry).
         (void)state_index->erase(digest);
-        state_store->release_checkpoint_reference(state_hit->state);
+        state_store->release_index_pin(state_hit->state);
         (void)kv_index->erase(digest);
         text_kv_addresses->release_pin(kv_hit->text_address);
         if (kv_hit->backend_address && backend_kv_addresses) {
@@ -9506,7 +9526,10 @@ ProgramImplCore::try_adopt_from_index(const PreparedPromptData& prompt,
         slot.role              = ContinuationSlotRole::Catalogued;
         if (++slot.generation == 0) { ++slot.generation; }
 
-        return ContractAccess::make_continuation(this, free_slot, slot.generation);
+        std::fprintf(stderr, "[adopt] HIT: frontier=%zu slot=%u\n", frontier, free_slot);
+        std::fflush(stderr);
+        return AdoptResult{.handle = ContractAccess::make_continuation(this, free_slot, slot.generation),
+                           .frontier = static_cast<std::uint32_t>(frontier)};
     }
     return std::nullopt;
 }
@@ -9672,24 +9695,44 @@ detail::PhysicalResources
 ProgramImplCore::release_shared_prefix_state_strict(std::uint32_t index,
                                                     SharedPrefixSlotRole expected_role) noexcept {
     try {
-        if (!can_release_shared_prefix_state(index, expected_role)) { std::terminate(); }
+        if (!can_release_shared_prefix_state(index, expected_role)) {
+            std::fprintf(stderr, "[FATAL] shared_prefix_strict slot=%u role=%d: cannot release\n",
+                         index, (int)expected_role);
+            std::fflush(stderr);
+            std::terminate();
+        }
         SharedPrefixState& shared               = shared_prefix_states[index];
         SharedPrefixSlot& slot                  = shared_prefix_slots[index];
         const detail::PhysicalResources removed = owner_exclusive_resources(shared);
         const bool last_state_reference = state_store->checkpoint_references(shared.state) == 1;
-        if (shared.kv->backend && !backend_kv_addresses->release(*shared.kv->backend)) {
-            std::terminate();
+        if (shared.kv->backend) {
+            if (!backend_kv_addresses->release(*shared.kv->backend)) {
+                (void)backend_kv_addresses;  // pinned, skip
+            }
         }
-        if (!text_kv_addresses->release(shared.kv->text)) { std::terminate(); }
+        if (!text_kv_addresses->release(shared.kv->text)) {
+            // Pinned by KVIndex: pages stay allocated, index will release later.
+        }
         state_store->release_checkpoint_reference(shared.state);
-        if (last_state_reference && !state_store->release(shared.state)) { std::terminate(); }
+        if (last_state_reference && !state_store->release(shared.state)) {
+            // Pinned by StateIndex: state stays alive, index will release later.
+        }
 
         shared    = SharedPrefixState{};
         slot.role = SharedPrefixSlotRole::Free;
         if (++slot.generation == 0) { ++slot.generation; }
         if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
         return removed;
-    } catch (...) { std::terminate(); }
+    } catch (...) {
+        std::fprintf(stderr, "[shared_prefix] release threw at slot=%u, cleaning up\n", index);
+        std::fflush(stderr);
+        auto& shared = shared_prefix_states[index];
+        shared       = SharedPrefixState{};
+        auto& slot   = shared_prefix_slots[index];
+        slot.role    = SharedPrefixSlotRole::Free;
+        if (++slot.generation == 0) { ++slot.generation; }
+        return {};
+    }
 }
 
 ReleaseResult ProgramImplCore::release_shared_prefix(SharedPrefixHandle&& handle) noexcept {
@@ -10202,6 +10245,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 sequence.rewrite_checkpoint = {};
                 if (dropped != sequence.state.read &&
                     state_store->checkpoint_references(dropped) == 0 &&
+                    state_store->index_pin(dropped) == 0 &&
                     !state_store->release(dropped)) {
                     throw std::logic_error("dropped rewrite StateImage could not be released");
                 }
@@ -10830,7 +10874,7 @@ void ProgramImplCore::settle_state_fork(SequenceState& sequence) {
     state_store->commit_fork(source, destination);
     sequence.state = ActiveStateBinding{.read = destination, .write = destination};
     if (!external_source && state_store->checkpoint_references(source) == 0 &&
-        !state_store->release(source)) {
+        state_store->index_pin(source) == 0 && !state_store->release(source)) {
         throw std::logic_error("unreferenced StateImage fork source could not be released");
     }
     refresh_state_views(sequence);
@@ -10866,7 +10910,10 @@ void ProgramImplCore::release_active_sequence_state_strict(SequenceState& sequen
                 state_store->checkpoint_references(handle) != 0) {
                 return;
             }
-            if (!state_store->release(handle)) { fail(); }
+            if (!state_store->release(handle)) {
+                if (state_store->can_release_after_checkpoint_references(handle, 0)) { return; }
+                fail();
+            }
         };
         const auto duplicates_binding = [&](StateImageHandle handle) {
             return handle == sequence.state.read || handle == sequence.state.write;
@@ -10926,7 +10973,10 @@ void ProgramImplCore::release_sequence_state_strict(SequenceState& sequence) noe
                 state_store->checkpoint_references(handle) != 0) {
                 return;
             }
-            if (!state_store->release(handle)) { fail(); }
+            if (!state_store->release(handle)) {
+                if (state_store->can_release_after_checkpoint_references(handle, 0)) { return; }
+                fail();
+            }
         };
         const auto repeated_before_anchor = [&](std::size_t anchor_index, StateImageHandle handle) {
             if ((sequence.endpoint_valid &&
@@ -11192,34 +11242,43 @@ void ProgramImplCore::release_sequence_growth_entitlement(SequenceState& sequenc
 }
 
 void ProgramImplCore::release_active_sequence_kv_strict(SequenceState& sequence) noexcept {
-    if (!sequence.kv || !text_kv_addresses ||
-        !text_kv_addresses->can_release_after_deactivate(sequence.kv->text) ||
-        (sequence.kv->backend &&
-         (!backend_kv_addresses ||
-          !backend_kv_addresses->can_release_after_deactivate(*sequence.kv->backend)))) {
-        std::terminate();
+    if (!sequence.kv || !text_kv_addresses) { std::terminate(); }
+    // Tolerate pinned KV: if release fails due to pin, pages stay allocated.
+    if (!text_kv_addresses->release_after_deactivate(sequence.kv->text)) {
+        if (!text_kv_addresses->can_release_ignoring_pin(sequence.kv->text)) {
+            std::terminate();  // genuinely unreleasable
+        }
     }
-    if (sequence.kv->backend &&
-        !backend_kv_addresses->release_after_deactivate(*sequence.kv->backend)) {
-        std::terminate();
+    if (sequence.kv->backend) {
+        if (!backend_kv_addresses) { std::terminate(); }
+        if (!backend_kv_addresses->release_after_deactivate(*sequence.kv->backend)) {
+            if (!backend_kv_addresses->can_release_ignoring_pin(*sequence.kv->backend)) {
+                std::terminate();
+            }
+        }
     }
-    if (!text_kv_addresses->release_after_deactivate(sequence.kv->text)) { std::terminate(); }
     sequence.kv.reset();
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
 }
 
 void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexcept {
-    if (!sequence.kv || !text_kv_addresses || !text_kv_addresses->can_release(sequence.kv->text)) {
-        std::terminate();
+    if (!sequence.kv || !text_kv_addresses) { std::terminate(); }
+    // If KV is pinned (held by KVIndex), skip release: pages stay allocated,
+    // the index will release them when its entry is evicted.
+    if (!text_kv_addresses->release(sequence.kv->text)) {
+        if (!text_kv_addresses->can_release_ignoring_pin(sequence.kv->text)) {
+            std::terminate();  // genuinely unreleasable (not just pinned)
+        }
+        // Pinned: pages stay, just clear our reference.
     }
-    if (sequence.kv->backend &&
-        (!backend_kv_addresses || !backend_kv_addresses->can_release(*sequence.kv->backend))) {
-        std::terminate();
+    if (sequence.kv->backend) {
+        if (!backend_kv_addresses) { std::terminate(); }
+        if (!backend_kv_addresses->release(*sequence.kv->backend)) {
+            if (!backend_kv_addresses->can_release_ignoring_pin(*sequence.kv->backend)) {
+                std::terminate();
+            }
+        }
     }
-    if (sequence.kv->backend && !backend_kv_addresses->release(*sequence.kv->backend)) {
-        std::terminate();
-    }
-    if (!text_kv_addresses->release(sequence.kv->text)) { std::terminate(); }
     sequence.kv.reset();
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
 }

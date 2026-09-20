@@ -56,7 +56,7 @@ def make_followup(conv_id: int) -> str:
     )
 
 
-def chat(base_url: str, messages: list, model: str = "default") -> dict:
+def chat(base_url: str, messages: list, model: str = "myai") -> dict:
     """Send a chat completion request and return the response."""
     url = f"{base_url}/chat/completions"
     body = json.dumps({

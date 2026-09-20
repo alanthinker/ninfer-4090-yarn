@@ -630,9 +630,14 @@ public:
     // Declines (Released) when the prefix cannot be resumed; `abandon_outcome` names the case.
     [[nodiscard]] FinishResult abandon_prefill(SequenceHandle sequence) noexcept;
     // Attempt to adopt pinned state+KV from StateIndex/KVIndex into a free catalog slot.
-    // Returns a valid ContinuationHandle if adopt succeeded (caller can use it as source
-    // with ReusePath::PrivateLongAnchor). Returns nullopt if no match or no free slot.
-    [[nodiscard]] std::optional<ContinuationHandle>
+    // Returns a valid ContinuationHandle + frontier if adopt succeeded (caller can use it as
+    // source with ReusePath::PrivateLongAnchor and the returned frontier as checkpoint).
+    // Returns nullopt if no match or no free slot.
+    struct AdoptResult {
+        ContinuationHandle handle;
+        std::uint32_t frontier = 0;
+    };
+    [[nodiscard]] std::optional<AdoptResult>
     try_adopt_from_index(const PreparedPromptData& prompt,
                          const PrefixShortlistDigests& digests);
     // Publishes a cancelled request's executed prefix as the continuation endpoint. A client that
