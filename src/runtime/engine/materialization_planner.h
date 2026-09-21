@@ -242,6 +242,7 @@ public:
                     identity_best->cost, static_cast<std::uint32_t>(candidates.size()),
                     projection_work, planning_started, MaterializationStopReason::NoPressure,
                     false);
+                diagnostics.candidates = static_cast<std::uint32_t>(candidates.size());
                 diagnostics.best_reuse_prompt_tokens = best_offered_reuse(candidates);
         diagnostics.best_reuse_feasible       = best_reuse_feasible;
         diagnostics.best_reuse_rejection =
@@ -392,6 +393,10 @@ public:
         std::uint64_t maximum_step_ns          = 0;
         std::uint32_t optional_targets         = 0;
         std::uint32_t guided_assessments       = 0;
+        std::uint32_t expansions               = 0;
+        std::uint32_t fanned_out_children_max  = 0;
+        std::uint32_t guided_closures_ok       = 0;
+        std::uint32_t guided_closures_failed   = 0;
         MaterializationStopReason stop_reason  = MaterializationStopReason::QueueExhausted;
         bool budget_exhausted                  = false;
 
@@ -491,6 +496,8 @@ public:
             }
             const auto children = session.commit_expansion(std::move(prepared));
             optional_targets += children.new_canonical_count;
+            ++expansions;
+            fanned_out_children_max = std::max(fanned_out_children_max, children.new_canonical_count);
             mark_target(parent.stable_target_ordinal, kTargetExpanded);
             for (const PressureTargetHandle child : children.children) {
                 const PressureTargetGuidance guidance = session.guidance(child);
@@ -580,7 +587,13 @@ public:
             const std::optional<PressureTargetHandle> closure = session.guided_closure_target(
                 candidates[root.candidate_index].id, preferred_owner_ids);
             maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
-            if (!closure) { continue; }
+            if (!closure) {
+                // A failed closure leaves this candidate unseeded for the whole search: it is
+                // never retried, so its only remaining route is a full expansion of its identity
+                // root. Count it instead of losing the fact.
+                ++guided_closures_failed;
+                continue;
+            }
             const PressureTargetGuidance closure_guidance = session.guidance(*closure);
             if (closure_guidance.candidate != candidates[root.candidate_index].id) {
                 throw std::logic_error("guided closure changed admission candidate");
@@ -596,6 +609,7 @@ public:
             (void)assess_target(*closure, root.candidate_index,
                                 closure_guidance.stable_target_ordinal);
             ++guided_assessments;
+            ++guided_closures_ok;
             maximum_step_ns =
                 std::max(maximum_step_ns, elapsed_ns(assessment_started, Clock::now()));
         }
@@ -783,6 +797,12 @@ public:
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
             search_budget_ns, stop_reason, budget_exhausted, incumbent.degradation_units,
             incumbent.root_maximal);
+        diagnostics.candidates               = static_cast<std::uint32_t>(candidates.size());
+        diagnostics.optional_targets         = optional_targets;
+        diagnostics.expansions               = expansions;
+        diagnostics.fanned_out_children_max  = fanned_out_children_max;
+        diagnostics.guided_closures_succeeded = guided_closures_ok;
+        diagnostics.guided_closures_failed    = guided_closures_failed;
         diagnostics.best_reuse_prompt_tokens = best_offered_reuse(candidates);
         diagnostics.best_reuse_feasible      = best_reuse_feasible;
         diagnostics.best_reuse_rejection =

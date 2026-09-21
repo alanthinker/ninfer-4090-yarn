@@ -1137,9 +1137,18 @@ private:
     // Device StateImage slots the capacity-release ladder can still free: Both-resident
     // checkpoints drop their Device replica for free; DeviceOnly ones demote, each needing one
     // Host slot from free Host capacity, `planned_host_state_release` slots this plan itself
-    // frees, or a Host replica the ladder evicts off the oldest anchor.
+    // frees, or the slots the ladder's final step frees by retiring the oldest idle continuation.
     [[nodiscard]] std::uint32_t
     state_slot_relief(std::uint32_t planned_host_state_release) const noexcept;
+    // The StateImage the in-flight reservation depends on (the plan's selected source). The release
+    // ladder must never demote, drop, evict, or retire it while its own reservation needs it: the
+    // plan priced that source as Device-resident, so reclaiming it between planning and the
+    // publishing transfer makes the commit fail with "Host retained Fork destination was not
+    // published" (reproduced on the agent test instance, 2026-09-21).
+    std::optional<StateImageHandle> release_protected_state;
+    // True when that continuation still holds the release-protected state anywhere in its retained
+    // checkpoint set, so the ladder's final retirement step can skip it.
+    [[nodiscard]] bool owner_holds_release_protected_state(std::uint32_t index) const;
     [[nodiscard]] bool
     protected_materialization_page(const MaterializationSourceProtection* protection,
                                    const KVAddressSpaceStore& addresses, std::uint32_t page_offset,

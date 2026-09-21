@@ -618,6 +618,11 @@ public:
         }
         if (exact_shared != nullptr) {
             if (!private_baseline.publishes_private || !private_baseline.physically_feasible) {
+                std::fprintf(stderr,
+                             "capture: skip reason=exact-resident-baseline-infeasible frontier=%u "
+                             "private=%d feasible=%d\n",
+                             private_baseline.frontier, private_baseline.publishes_private ? 1 : 0,
+                             private_baseline.physically_feasible ? 1 : 0);
                 program.skip_capture(std::move(offer));
                 return ActiveCaptureReserveResult::Skipped;
             }
@@ -877,9 +882,21 @@ public:
 
         if (!selected) {
             if (!private_baseline.publishes_private || !private_baseline.physically_feasible) {
+                std::fprintf(stderr,
+                             "capture: skip reason=pressure-baseline-infeasible frontier=%u "
+                             "private=%d feasible=%d\n",
+                             private_baseline.frontier, private_baseline.publishes_private ? 1 : 0,
+                             private_baseline.physically_feasible ? 1 : 0);
                 program.skip_capture(std::move(offer));
                 return ActiveCaptureReserveResult::Skipped;
             }
+            // No shared scenario reached a strictly positive net gain, so only the private
+            // baseline publishes. Per §6.2 this is the documented outcome, but it is the
+            // difference between "the anchor exists privately" and "the shared entry exists",
+            // which is invisible in every other log.
+            std::fprintf(stderr,
+                         "capture: shared-planner-skip frontier=%u reason=no-positive-net-gain\n",
+                         private_baseline.frontier);
             transaction_.template emplace<ActiveCaptureRecord>(ActiveCaptureRecord{
                 .lane              = lane,
                 .publishes_private = true,

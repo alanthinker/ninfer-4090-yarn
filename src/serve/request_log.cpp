@@ -340,11 +340,20 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"projection_work", diagnostics.projection_work},
         {"planning_elapsed_ns", diagnostics.planning_elapsed_ns},
         {"search_elapsed_ns", diagnostics.search_elapsed_ns},
+        {"search_budget_ns", diagnostics.search_budget_ns},
         {"stop_reason", ninfer::materialization_stop_reason_name(diagnostics.stop_reason)},
         {"budget_exhausted", diagnostics.budget_exhausted},
         {"selected_degradation_units", diagnostics.selected_degradation_units},
         {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
         {"best_reuse_prompt_tokens", diagnostics.best_reuse_prompt_tokens},
+        // Search shape: see MaterializationDiagnostics. One expansion that fans out to the whole
+        // target budget is otherwise indistinguishable from a genuinely exhausted space.
+        {"candidates", diagnostics.candidates},
+        {"optional_targets", diagnostics.optional_targets},
+        {"expansions", diagnostics.expansions},
+        {"fanned_out_children_max", diagnostics.fanned_out_children_max},
+        {"guided_closures_succeeded", diagnostics.guided_closures_succeeded},
+        {"guided_closures_failed", diagnostics.guided_closures_failed},
     };
 }
 

@@ -813,6 +813,27 @@ struct MaterializationDiagnostics {
     bool selected_maximal_fallback           = false;
 
     /**
+     * Shape of the bounded search, to separate "the arena stopped the search inside its first
+     * neighbourhood" from "the search genuinely explored its space and stopped".
+     *
+     * `optional_targets` is what the expansion arena committed, `expansions` is how many
+     * expansions ran, and `fanned_out_children_max` is the largest single expansion's child
+     * count. A fan-out at (or near) the target budget beside a small expansion count means one
+     * expansion consumed the whole arena — the 2026-09-21 production incident produced 3,698
+     * evaluated targets, `budget_exhausted`, and `expansion_capacity` from a single expansion,
+     * which the earlier fields could not distinguish from an exhausted search space.
+     */
+    std::uint32_t candidates              = 0;
+    std::uint32_t optional_targets        = 0;
+    std::uint32_t expansions              = 0;
+    std::uint32_t fanned_out_children_max = 0;
+    // How the guided-closure pass ended. A closure that returns no target is skipped for the rest
+    // of the search (that candidate is never seeded), so a nonzero failure count beside a
+    // budget-exhausted stop names a second, independent cause of a truncated plan.
+    std::uint32_t guided_closures_succeeded = 0;
+    std::uint32_t guided_closures_failed    = 0;
+
+    /**
      * The most reusable candidate the search actually ASSESSED, with what the cost model
      * charged for it and whether it was physically feasible.
      *

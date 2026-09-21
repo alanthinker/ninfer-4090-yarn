@@ -319,6 +319,16 @@ public:
         return require(handle).source_pins;
     }
 
+    // Replica residency, for callers that price what a release step would free (the planner's
+    // capacity-relief credit) without walking the object table themselves.
+    [[nodiscard]] bool has_device_replica(StateImageHandle handle) const {
+        return valid(handle) && require(handle).device_slot.has_value();
+    }
+
+    [[nodiscard]] bool has_host_replica(StateImageHandle handle) const {
+        return valid(handle) && require(handle).host_slot.has_value();
+    }
+
     [[nodiscard]] std::uint32_t checkpoint_references(StateImageHandle handle) const {
         return require(handle).checkpoint_references;
     }

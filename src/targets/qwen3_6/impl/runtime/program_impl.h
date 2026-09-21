@@ -742,6 +742,48 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
     }
 }
 
+// Name every capacity dimension that cannot take the given peak, with its numbers ("host_state
+// add=1 used=8 cap=8; "). Reuse rejection already reports this for its own gate; active capture
+// needs the same detail, because a capture that never publishes is otherwise invisible: the
+// capture path logs nothing, the engine discards `Skipped`, and no counter moves, so production
+// could not tell "never offered" from "statically infeasible" from "planner skipped" from
+// "runtime aborted" (2026-09-21: three consecutive one-shot requests cold-prefilled while the
+// tools-boundary anchor silently never appeared).
+std::string physical_peak_dimension_detail(const detail::PhysicalResources& peak,
+                                           const detail::PhysicalResources& used,
+                                           const detail::PhysicalResources& caps) {
+    const auto part = [](const char* name, std::uint64_t a, std::uint64_t u, std::uint64_t c) {
+        if (a <= c && u <= c - a) { return std::string(); }
+        return std::string(name) + " add=" + std::to_string(a) + " used=" + std::to_string(u) +
+               " cap=" + std::to_string(c) + "; ";
+    };
+    std::string detail;
+    detail +=
+        part("lanes", peak.device.active_lanes, used.device.active_lanes, caps.device.active_lanes);
+    detail +=
+        part("state", peak.device.state_slots, used.device.state_slots, caps.device.state_slots);
+    detail += part("main_kv", peak.device.main_kv_pages, used.device.main_kv_pages,
+                   caps.device.main_kv_pages);
+    detail += part("backend_kv", peak.device.backend_kv_pages, used.device.backend_kv_pages,
+                   caps.device.backend_kv_pages);
+    detail += part("host_state", peak.host.state_slots, used.host.state_slots,
+                   caps.host.state_slots);
+    detail += part("host_kv_bytes", peak.host.kv_bytes, used.host.kv_bytes, caps.host.kv_bytes);
+    return detail;
+}
+
+// One line per active-capture decision, so a capture that never publishes says why. The counters
+// stay in the request log; this is the per-decision record the 2026-09-21 incident lacked.
+void log_capture_decision(const char* outcome, std::uint32_t frontier, const char* reason,
+                          const std::string& detail) {
+    if (detail.empty()) {
+        std::fprintf(stderr, "capture: %s frontier=%u reason=%s\n", outcome, frontier, reason);
+    } else {
+        std::fprintf(stderr, "capture: %s frontier=%u reason=%s %s\n", outcome, frontier, reason,
+                     detail.c_str());
+    }
+}
+
 } // namespace
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
@@ -3990,29 +4032,9 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
         // Name the dimension and its numbers: which capacity blocked reuse is otherwise
         // indistinguishable from "reuse was priced worse".
         if (rejection != nullptr) {
-            const detail::PhysicalResources peak = details.demand.physical_peak_additional;
-            const detail::PhysicalResources used = physical_occupancy();
-            const detail::PhysicalResources caps = admission_capacity();
-            const auto part = [](const char* name, std::uint64_t a, std::uint64_t u,
-                                 std::uint64_t c) {
-                if (a <= c && u <= c - a) { return std::string(); }
-                return std::string(name) + " add=" + std::to_string(a) + " used=" +
-                       std::to_string(u) + " cap=" + std::to_string(c) + "; ";
-            };
-            std::string detail;
-            detail += part("lanes", peak.device.active_lanes, used.device.active_lanes,
-                           caps.device.active_lanes);
-            detail += part("state", peak.device.state_slots, used.device.state_slots,
-                           caps.device.state_slots);
-            detail += part("main_kv", peak.device.main_kv_pages, used.device.main_kv_pages,
-                           caps.device.main_kv_pages);
-            detail += part("backend_kv", peak.device.backend_kv_pages, used.device.backend_kv_pages,
-                           caps.device.backend_kv_pages);
-            detail += part("host_state", peak.host.state_slots, used.host.state_slots,
-                           caps.host.state_slots);
-            detail += part("host_kv_bytes", peak.host.kv_bytes, used.host.kv_bytes,
-                           caps.host.kv_bytes);
-            plan.impl_->identity_rejection_detail = std::move(detail);
+            plan.impl_->identity_rejection_detail = physical_peak_dimension_detail(
+                details.demand.physical_peak_additional, physical_occupancy(),
+                admission_capacity());
         }
         return reject(runtime::MaterializationRejection::PhysicalPeak);
     }
@@ -4843,6 +4865,14 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
                                           ? &shared_prefix_states[transaction.shared_source_index]
                                           : nullptr;
     std::uint32_t state_count       = demand.reservation_added.device.state_slots;
+    // Reservations below may run the capacity-release ladder, which must not reclaim the source
+    // this plan is restoring. The guard restores the previous protection even when a reservation
+    // throws, so a failed preparation cannot leave a state pinned forever.
+    struct ReleaseProtectionGuard {
+        std::optional<StateImageHandle>* slot;
+        std::optional<StateImageHandle> saved;
+        ~ReleaseProtectionGuard() { *slot = saved; }
+    } release_protection{&release_protected_state, release_protected_state};
     std::optional<StateImageHandle> host_state_restore;
     std::optional<StateImageHandle> host_state_fork_destination;
     if (source_state != nullptr || shared_state != nullptr) {
@@ -4857,6 +4887,7 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
             residency == StateReplicaResidency::None) {
             throw std::logic_error("materialization source has no published StateImage replica");
         }
+        release_protected_state = state;
         const bool consuming_fork =
             source_state != nullptr &&
             details.source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
@@ -6621,6 +6652,25 @@ bool ProgramImplCore::release_state_capacity_step() {
     return retire_oldest_idle_continuation();
 }
 
+bool ProgramImplCore::owner_holds_release_protected_state(std::uint32_t index) const {
+    if (!release_protected_state || index >= continuation_capacity) { return false; }
+    const SequenceState& sequence = continuation_states[index];
+    if (sequence.state.read == *release_protected_state ||
+        sequence.state.write == *release_protected_state) {
+        return true;
+    }
+    if (sequence.reserved_state && *sequence.reserved_state == *release_protected_state) {
+        return true;
+    }
+    if (sequence.rewrite_state && *sequence.rewrite_state == *release_protected_state) {
+        return true;
+    }
+    return std::any_of(sequence.long_anchors.begin(), sequence.long_anchors.end(),
+                       [this](const LongAnchorCheckpoint& anchor) {
+                           return anchor.state == *release_protected_state;
+                       });
+}
+
 std::optional<StateImageHandle> ProgramImplCore::reserve_state_destination_with_release() {
     // Each step either frees something or reports that nothing more can be freed, so the loop is
     // bounded by the number of releasable entries rather than by an arbitrary retry count.
@@ -6651,6 +6701,8 @@ bool ProgramImplCore::retire_oldest_idle_continuation() {
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
         if (continuation_slots[index].role != ContinuationSlotRole::Catalogued) { continue; }
         if (!can_release_continuation_slot_strict(index)) { continue; }
+        // Retiring this owner would release the very state the in-flight reservation restores.
+        if (owner_holds_release_protected_state(index)) { continue; }
         const std::uint64_t age =
             state_store->last_touched(continuation_states[index].state.read);
         if (!best_continuation && !best_shared) {
@@ -7044,12 +7096,24 @@ ProgramImplCore::owner_exclusive_resources(const SharedPrefixState& shared) cons
 
 bool ProgramImplCore::release_one_device_state_slot() {
     if (!state_store) { return false; }
+    // The release ladder must never reclaim the state the in-flight reservation is restoring: the
+    // plan priced it as Device-resident, so demoting it here is what made a commit fail with
+    // "Host retained Fork destination was not published".
+    const auto is_release_protected = [this](StateImageHandle handle) {
+        return release_protected_state && *release_protected_state == handle;
+    };
     // Demotion and replica drops keep the state valid, so only a full release has to respect the
     // ownership of a live sequence.
-    const auto keep_all = [](StateImageHandle) { return false; };
-    const auto keep_bound_states = [this](StateImageHandle handle) {
-        return state_bound_by_live_sequence(handle);
+    const auto keep_all = [&](StateImageHandle handle) { return is_release_protected(handle); };
+    const auto keep_live_states = [&](StateImageHandle handle) {
+        return is_release_protected(handle) || state_bound_by_live_sequence(handle);
     };
+    // Reclaiming a replica of an IDLE (catalogued) owner's retained checkpoint is not a live
+    // binding, but evicting its Host replica can destroy the very replica a planned Fork/restore
+    // depends on. The ladder's supported way to reclaim an idle owner is
+    // `retire_oldest_idle_continuation`, which retires the owner and its states together, so this
+    // step keeps the conservative predicate plus the in-flight reservation's protection.
+    const auto keep_active_states = keep_live_states;
     // Cheapest first: a checkpoint that already holds a Host replica only needs its Device slot
     // back. A DeviceOnly checkpoint needs a Device-to-Host copy before its slot is reusable, which
     // is also what keeps its data available for reuse instead of discarding it. Demotion and
@@ -7080,14 +7144,16 @@ bool ProgramImplCore::release_one_device_state_slot() {
     // every reuse that restores one into Device) with a root prefill. The evicted checkpoint's
     // state is unavailable until its owner republishes it; its KV pages are untouched.
     if (const std::optional<StateImageHandle> evicted = state_store->select_slot_release_victim(
-            StateImageStore::SlotReleaseKind::EvictHostReplica, keep_bound_states);
+            StateImageStore::SlotReleaseKind::EvictHostReplica, keep_active_states);
         evicted && state_store->evict_host_replica(*evicted)) {
         if (demote_one()) { return true; }
     }
     // No Host capacity could be created: drop the oldest checkpoint nobody references and no
-    // live sequence still binds.
+    // live sequence still binds. This step destroys data, so it keeps the conservative predicate:
+    // a Catalogued owner's summary still references its checkpoints, and only
+    // `retire_oldest_idle_continuation` retires an owner and its states together.
     if (const std::optional<StateImageHandle> victim = state_store->select_slot_release_victim(
-            StateImageStore::SlotReleaseKind::Drop, keep_bound_states)) {
+            StateImageStore::SlotReleaseKind::Drop, keep_live_states)) {
         if (state_store->release(*victim)) { return true; }
     }
     return false;
@@ -7117,6 +7183,9 @@ detail::PhysicalResources ProgramImplCore::physical_occupancy() const noexcept {
 std::uint32_t
 ProgramImplCore::state_slot_relief(std::uint32_t planned_host_state_release) const noexcept {
     if (!state_store) { return 0; }
+    // Conservative on purpose: crediting the idle (Catalogued) owners' replicas needs the restore
+    // path below to survive a ladder-provided destination first (see the note at the end of this
+    // function).
     const auto keep_bound = [this](StateImageHandle handle) {
         return state_bound_by_live_sequence(handle);
     };
@@ -7132,6 +7201,15 @@ ProgramImplCore::state_slot_relief(std::uint32_t planned_host_state_release) con
                    ? std::numeric_limits<std::uint32_t>::max()
                    : a + b;
     };
+    // NOTE (2026-09-21): crediting the ladder's final retirement step here
+    // (`oldest_idle_retirement_relief`) was implemented and reverted. It made the planner offer a
+    // Host-resident reuse it had previously rejected with `state add=1 used=4 cap=4`, and the
+    // runtime then failed the request with HTTP 500 "Host retained Fork destination was not
+    // published": when the destination reservation is satisfied through the release ladder, a
+    // HostOnly retained source is never published as ActiveMutable before the commit check
+    // (program_impl.h, "Host retained Fork destination was not published"). Fixing that restore
+    // path is the prerequisite for crediting retirement relief; until then the credit would trade
+    // a slow-but-correct cold prefill for a failed request.
     const std::uint32_t host_budget =
         sat_u32(sat_u32(free_host, planned_host_state_release), counts.host_evictable);
     return sat_u32(counts.drop_device_replica,
@@ -8145,12 +8223,14 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
         throw std::logic_error("capture transaction is not reservable");
     }
     if (cancellation.requested()) {
+        log_capture_decision("skip", 0, "cancelled", {});
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
     const CaptureAssessment assessment = inspect_capture(
         offer, exact_shared, replacement, private_replacement, permit_shared_publication);
     if (!assessment.publishes_private && !assessment.publishes_shared) {
+        log_capture_decision("skip", assessment.frontier, "no-publication", {});
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
@@ -8161,10 +8241,21 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
          pressure_details->summary.prompt_tokens != assessment.frontier ||
          pressure_details->blocked_host_allocation_bytes != 0 ||
          !physical_peak_fits(pressure_details->demand.physical_peak_additional))) {
+        log_capture_decision(
+            "skip", assessment.frontier, "pressure-invalid",
+            pressure_details == nullptr
+                ? std::string()
+                : physical_peak_dimension_detail(
+                      pressure_details->demand.physical_peak_additional, physical_occupancy(),
+                      admission_capacity()));
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
     if (!pressure && !assessment.physically_feasible) {
+        log_capture_decision(
+            "skip", assessment.frontier, "static-infeasible",
+            physical_peak_dimension_detail(assessment.implementation->demand.physical_peak_additional,
+                                           physical_occupancy(), admission_capacity()));
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
@@ -8280,6 +8371,13 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
         transaction.transfer_enqueue_pending = assessment.needs_transfer;
         advance_resource_revision();
         context_transaction_.emplace<ActiveCaptureTransaction>(std::move(transaction));
+        log_capture_decision("reserved", assessment.frontier,
+                             assessment.state_placement == qwen3_6::CaptureStatePlacement::HostSnapshot
+                                 ? "host-snapshot"
+                                 : "device-fork",
+                             std::string("private=") +
+                                 (assessment.publishes_private ? "1" : "0") + " shared=" +
+                                 (assessment.publishes_shared ? "1" : "0"));
         return runtime::ContextTransactionReserveStatus::Reserved;
     } catch (...) {
         abort_active_capture(transaction);
