@@ -67,6 +67,18 @@ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsig
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// Same contraction with an implicit zero addend. Quantized routes restart the
+// INT32 accumulator at every quant group; writing D from a constant zero C
+// removes one register clear per accumulator element per group.
+__device__ __forceinline__ void mma_s8_zero(int& d0, int& d1, int& d2, int& d3, unsigned a0,
+                                            unsigned a1, unsigned a2, unsigned a3, unsigned b0,
+                                            unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {0,0,0,0};\n"
+                 : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
 __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, float& c3,
                                              unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                              unsigned b0, unsigned b1) {

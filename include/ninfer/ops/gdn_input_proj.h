@@ -37,10 +37,22 @@ namespace ninfer::ops {
  *   Writes the full qkv and z outputs; inputs and outputs must not alias.
  *
  * Workspace:
- *   No transient bytes are required.
+ *   The A16 routes require no transient bytes; the AllowA8 INT8 prefill route may use
+ *   caller-owned transient storage for its private quantized activation.
  */
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, cudaStream_t stream);
+
+/**
+ * The split-parent GDN projection under an explicit activation policy. A16Only admits only the
+ * A16 routes; AllowA8 additionally admits the INT8 prefill route, which stages the group-64
+ * quantized activation once per call and shares it across all four projections, so the caller
+ * must reserve gdn_input_proj_workspace_capacity_bytes() of transient storage in `workspace`.
+ * AllowA4 is rejected for the Q4/Q5 parents.
+ */
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
+                    cudaStream_t stream);
 
 /**
  * Single-parent GDN projection. Registered parent forms are:

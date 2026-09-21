@@ -26,12 +26,24 @@ namespace ninfer::ops {
  * promoted and compared directly with those ideal values; final output storage rounding belongs
  * to AttnInputProj's named A16 criterion, not the oracle. Production routes choose their private
  * accumulator and staging precision. Inputs and the four outputs must be mutually non-overlapping.
- * Current registered routes require no transient allocation. The Op has no persistent state side
- * effect.
+ * The A16 routes require no transient allocation; the AllowA8 INT8 prefill route may use
+ * caller-owned transient storage for its private quantized activation. The Op has no persistent
+ * state side effect.
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      cudaStream_t stream);
+
+/**
+ * The split-parent projection under an explicit activation policy. A16Only admits only the A16
+ * routes; AllowA8 additionally admits the INT8 prefill route, which stages the group-64
+ * quantized activation once per call and shares it across the four projections, so the caller
+ * must reserve attn_input_proj_workspace_capacity_bytes() of transient storage in `workspace`.
+ * AllowA4 is rejected for the Q4/Q5 parents.
+ */
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                     LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
  * Computes the single-parent Q/K/output-gate/V projection.

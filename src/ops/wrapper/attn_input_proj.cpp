@@ -210,6 +210,10 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         return 0;
     case QType::Q4G64_F16S:
     case QType::Q5G64_F16S:
+        if (input_rows != 5120 || policy == LinearPolicy::AllowA4) {
+            throw std::invalid_argument("attn_input_proj workspace: unsupported Q4/Q5 profile");
+        }
+        return detail::q4_q5_attn_input_capacity_workspace_bytes(min_tokens, max_tokens, policy);
     case QType::Q6G64_F16S:
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
@@ -218,13 +222,21 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
     throw std::invalid_argument("attn_input_proj workspace: unsupported parent qtype");
 }
 
-void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
-                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                     cudaStream_t stream) {
+namespace {
+
+void dispatch_split_parent(const Tensor& x, const Weight& query_key_weight,
+                           const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
+                           Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
+                           cudaStream_t stream) {
+    validate_policy(policy);
+    if (policy == LinearPolicy::AllowA4) {
+        throw std::invalid_argument("attn_input_proj: Q4/Q5 parents admit only A16 or A8");
+    }
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kQRows  = 6144;
     constexpr std::int32_t kKvRows = 1024;
     const std::int32_t cols        = x.ne[1];
+    if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
     require_matrix(x, kHidden, cols, "x");
     require_matrix(q, kQRows, cols, "q");
     require_matrix(gate, kQRows, cols, "gate");
@@ -234,7 +246,23 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     require_rowsplit(gate_value_weight, QType::Q5G64_F16S, kQRows + kKvRows, "gate/value weight");
 
     detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
-                                      stream);
+                                      workspace, policy, stream);
+}
+
+} // namespace
+
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                     LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
+    dispatch_split_parent(x, query_key_weight, gate_value_weight, q, gate, k, v, policy, &workspace,
+                          stream);
+}
+
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                     cudaStream_t stream) {
+    dispatch_split_parent(x, query_key_weight, gate_value_weight, q, gate, k, v,
+                          LinearPolicy::A16Only, nullptr, stream);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
