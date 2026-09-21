@@ -768,6 +768,7 @@ enum class MaterializationStopReason : std::uint8_t {
     ExpansionCapacity,
     TimeBudget,
     ValueOfNextExpansion,
+    SeedAccepted,
 };
 
 [[nodiscard]] inline constexpr const char*
@@ -785,6 +786,8 @@ materialization_stop_reason_name(MaterializationStopReason reason) noexcept {
         return "time_budget";
     case MaterializationStopReason::ValueOfNextExpansion:
         return "value_of_next_expansion";
+    case MaterializationStopReason::SeedAccepted:
+        return "seed_accepted";
     }
     return "no_pressure";
 }

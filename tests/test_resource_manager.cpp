@@ -577,6 +577,7 @@ public:
     [[nodiscard]] std::optional<FakePressureTargetHandle>
     guided_closure_target(PlanningCandidateId candidate,
                           std::span<const PlanningOwnerId> preferred_owner_ids);
+    bool retention_infeasible(PlanningCandidateId candidate);
     [[nodiscard]] ninfer::runtime::PressureTargetGuidance guidance(FakePressureTargetHandle target);
     [[nodiscard]] FakeAssessedPressureTarget assess(FakePressureTargetHandle target);
     [[nodiscard]] FakePreparedPressureExpansion prepare_expansion(FakePressureTargetHandle parent);
@@ -1169,6 +1170,11 @@ public:
     std::uint32_t pressure_assessment_delay_us           = 0;
     std::uint64_t pressure_checkpoint_recovery_ns        = 100;
     bool require_evictions                               = false;
+    bool retention_infeasible_override                   = false;
+    // Models the family closure's step-based semantics, where a retention choice already
+    // made for an owner can be upgraded to that owner's eviction outcome in the destructive
+    // phase.  Off by default: the default two-pass closure never revisits assigned owners.
+    bool closure_upgrades_to_eviction                    = false;
     bool abort_start                                     = false;
     bool abort_progress                                  = false;
     bool malform_last_private_victim                     = false;
@@ -1417,7 +1423,11 @@ std::optional<FakePressureTargetHandle> FakePressurePlanningSession::guided_clos
     for (int destructive = 0; destructive < 2; ++destructive) {
         for (const std::size_t owner_index : order) {
             const auto& alternatives = options_[selected_candidate][owner_index];
-            if (target.choices[owner_index] != 0 || alternatives.empty()) { continue; }
+            if (alternatives.empty()) { continue; }
+            if (target.choices[owner_index] != 0 &&
+                !(program_->closure_upgrades_to_eviction && destructive != 0)) {
+                continue;
+            }
             const auto found = std::find_if(
                 alternatives.begin(), alternatives.end(), [&](const FakeTargetDecision& decision) {
                     return decision.evicts_continuation == (destructive != 0);
@@ -1444,6 +1454,12 @@ std::optional<FakePressureTargetHandle> FakePressurePlanningSession::guided_clos
         }
     }
     return std::nullopt;
+}
+
+bool FakePressurePlanningSession::retention_infeasible(PlanningCandidateId candidate) {
+    (void)candidate;
+    require(program_ != nullptr, "fake pressure session is detached");
+    return program_->retention_infeasible_override;
 }
 
 ninfer::runtime::PressureTargetGuidance
@@ -2334,6 +2350,120 @@ void test_feasible_identity_expands_when_pressure_can_remove_copy() {
                 program.pressure_planning_sessions == 1 && !program.seal_attempts.empty() &&
                 program.seal_attempts.back() == std::vector<std::uint64_t>{1009},
             "feasible identity suppressed a cheaper complete pressure target");
+}
+
+void test_evicting_seed_accepted_when_retention_proven_infeasible() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+
+    FakeProgram program;
+    // Units 6 with 3 owners x 2 units forces every owner evicted: the all-evicting closure
+    // seed is the only feasible plan, so no probe step can beat it.
+    program.required_pressure_actions         = 4;
+    program.require_evictions                 = true;
+    program.private_pressure_alternatives     = 4;
+    program.retention_infeasible_override     = true;
+    program.closure_upgrades_to_eviction      = true;
+    program.eviction_pressure_action_units    = 2;
+    program.pressure_action_immediate_ns      = 1'000'000;
+    program.pressure_action_degradation_units = 1;
+    program.pressure_assessment_delay_us      = 100;
+    program.pressure_checkpoint_recovery_ns   = 1'000'000;
+
+    FakeAdmissionCandidate root;
+    set_fake_machine_costs(root.identity.machine_work, 8'000'000'000ULL, 8'000'000'000ULL);
+    root.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    root.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
+    root.identity.expandable        = true;
+    root.identity.assessment_digest = 101;
+
+    FakeAdmissionCandidate reuse;
+    reuse.value.reusable_prompt_tokens = 55'048;
+    reuse.private_source_id            = 1;
+    set_fake_machine_costs(reuse.identity.machine_work, 100'000'000, 100'000'000);
+    reuse.identity.machine_work.reused_prompt_tokens = 55'048;
+    reuse.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    reuse.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
+    reuse.identity.expandable        = true;
+    reuse.identity.assessment_digest = 202;
+
+    const std::array<Planner::CandidateInput, 2> candidates{
+        Planner::CandidateInput{.candidate               = &root,
+                                .id                      = PlanningCandidateId{.value = 0},
+                                .stable_ordinal          = 0,
+                                .current_session_binding = false},
+        Planner::CandidateInput{.candidate               = &reuse,
+                                .id                      = PlanningCandidateId{.value = 1},
+                                .stable_ordinal          = 1,
+                                .current_session_binding = true},
+    };
+    std::array<FakeContinuationHandle, 3> owner_handles{
+        FakeContinuationHandle{1, 0},
+        FakeContinuationHandle{2, 0},
+        FakeContinuationHandle{3, 0},
+    };
+    const std::array<const FakeContinuationHandle*, 3> private_owners{
+        &owner_handles[0], &owner_handles[1], &owner_handles[2]};
+    const std::array<PlanningOwnerId, 3> private_owner_ids{
+        PlanningOwnerId{.value = 0}, PlanningOwnerId{.value = 1}, PlanningOwnerId{.value = 2}};
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 3> owner_policy{
+        ninfer::runtime::MaterializationOwnerPolicy{.owner           = PlanningOwnerId{.value = 0},
+                                                    .retention_class = RetentionClass::LiveSession,
+                                                    .private_retention_weight = 16},
+        ninfer::runtime::MaterializationOwnerPolicy{.owner           = PlanningOwnerId{.value = 1},
+                                                    .retention_class = RetentionClass::LiveSession,
+                                                    .private_retention_weight = 16},
+        ninfer::runtime::MaterializationOwnerPolicy{.owner           = PlanningOwnerId{.value = 2},
+                                                    .retention_class = RetentionClass::LiveSession,
+                                                    .private_retention_weight = 16},
+    };
+    const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 3> checkpoint_policy{
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = PlanningOwnerId{.value = 0},
+            .checkpoint = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                        .frontier = 16,
+                                        .ordinal  = 0},
+            .rebuild_ns = 1'000'000},
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = PlanningOwnerId{.value = 1},
+            .checkpoint = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                        .frontier = 16,
+                                        .ordinal  = 0},
+            .rebuild_ns = 1'000'000},
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = PlanningOwnerId{.value = 2},
+            .checkpoint = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                        .frontier = 16,
+                                        .ordinal  = 0},
+            .rebuild_ns = 1'000'000},
+    };
+
+    Planner planner;
+    const auto pressure_inputs = [&]() -> Planner::PressureInputs {
+        return Planner::PressureInputs{
+            .private_owners    = private_owners,
+            .private_owner_ids = private_owner_ids,
+            .shared_owners     = {},
+            .shared_owner_ids  = {},
+            .owner_policy      = owner_policy,
+            .checkpoint_policy = checkpoint_policy,
+        };
+    };
+    const auto logical_goal = [](PlanningCandidateId, PrivateSourceMode,
+                                 std::span<const ninfer::runtime::PressureOwnerOutcome>)
+        -> std::optional<Planner::LogicalGoal> {
+        return Planner::LogicalGoal{.publication_slot = 0};
+    };
+    auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
+                               pressure_inputs, logical_goal, 1'000'000U, Planner::Clock::now());
+
+    require(result && result->plan &&
+                result->diagnostics.stop_reason == ninfer::MaterializationStopReason::SeedAccepted,
+            "certified evicting seed should be accepted by the bounded probe");
+    require(std::any_of(result->plan->private_actions.begin(), result->plan->private_actions.end(),
+                        [](const FakeTargetDecision& action) {
+                            return action.evicts_continuation;
+                        }),
+            "accepted evicting seed dropped its certified eviction");
 }
 
 void test_dominating_identity_does_not_build_pressure_graph() {
@@ -3433,6 +3563,8 @@ int main() {
              test_feasible_identity_expands_when_pressure_can_remove_copy);
     run_test("dominating identity fast path",
              test_dominating_identity_does_not_build_pressure_graph);
+    run_test("certified evicting seed acceptance",
+             test_evicting_seed_accepted_when_retention_proven_infeasible);
     run_test("root lifecycle and prefix reuse", test_root_lifecycle_and_prefix_reuse);
     run_test("stale revision is retryable", test_stale_revision_is_retryable);
     run_test("materialization abort preserves source", test_materialization_abort_preserves_source);

@@ -1424,6 +1424,15 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
     [[nodiscard]] std::optional<qwen3_6::PressureTargetHandle>
     guided_closure_target(runtime::PlanningCandidateId candidate,
                           std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
+    // Linear-capacity certificate for the evicting-seed fast path: true when no pressure
+    // plan that keeps every owner alive can satisfy this candidate's device shortfall.  Each
+    // eligible owner contributes its deepest non-evicting decision (per-dimension maximum
+    // device release); if that maximal retention pressure still leaves a positive device
+    // residual, no retention-only subset of it can close the gap either.  Shared-page
+    // release is under-counted by the additive model, so a true result can miss retention
+    // plans that depend on cross-owner shared pages; the planner's probe steps re-check the
+    // cheaper alternatives before accepting an evicting seed.
+    bool retention_infeasible(runtime::PlanningCandidateId candidate);
     [[nodiscard]] runtime::PressureTargetGuidance guidance(qwen3_6::PressureTargetHandle target);
     [[nodiscard]] qwen3_6::AssessedPressureTarget<NINFER_QWEN36_VARIANT>
     assess(qwen3_6::PressureTargetHandle target);

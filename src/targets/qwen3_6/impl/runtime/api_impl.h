@@ -182,6 +182,12 @@ std::optional<PressureTargetHandle> PressurePlanningSession<Variant>::guided_clo
 }
 
 template <>
+bool PressurePlanningSession<Variant>::retention_infeasible(runtime::PlanningCandidateId candidate) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    return impl_->retention_infeasible(candidate);
+}
+
+template <>
 runtime::PressureTargetGuidance
 PressurePlanningSession<Variant>::guidance(PressureTargetHandle target) {
     if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }

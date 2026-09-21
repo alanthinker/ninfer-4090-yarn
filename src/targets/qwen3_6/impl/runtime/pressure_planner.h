@@ -800,6 +800,52 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
     return std::nullopt;
 }
 
+inline bool
+PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::retention_infeasible(
+    runtime::PlanningCandidateId candidate) {
+    const std::uint32_t selected_candidate = candidate_index(candidate);
+    populate_options(selected_candidate);
+    const CandidateOptions& options       = candidate_options[selected_candidate];
+    const CandidateState& candidate_state = *candidates[selected_candidate].state;
+    const auto protection                 = program->materialization_source_protection(candidate_state);
+    if (!protection) {
+        throw std::logic_error("pressure candidate source protection is stale");
+    }
+    const detail::PhysicalResources residual =
+        program->guided_materialization_deficit(candidate_state, detail::PhysicalDelta{});
+    if (residual == detail::PhysicalResources{}) { return false; }
+    std::uint32_t total_lanes   = 0;
+    std::uint32_t total_state   = 0;
+    std::uint32_t total_main    = 0;
+    std::uint32_t total_backend = 0;
+    for (const CandidateVictimOptions& victim : options.victims) {
+        std::uint32_t best_lanes   = 0;
+        std::uint32_t best_state   = 0;
+        std::uint32_t best_main    = 0;
+        std::uint32_t best_backend = 0;
+        for (const PressureDecision& successor :
+             pressure_successors(victim, residual, *protection, nullptr)) {
+            if (successor.evicts_continuation) { continue; }
+            best_lanes    = std::max(best_lanes, successor.effect.removed.device.active_lanes);
+            best_state    = std::max(best_state, successor.effect.removed.device.state_slots);
+            best_main     = std::max(best_main, successor.effect.removed.device.main_kv_pages);
+            best_backend  = std::max(best_backend, successor.effect.removed.device.backend_kv_pages);
+        }
+        total_lanes    = std::min<std::uint32_t>(
+            std::numeric_limits<std::uint32_t>::max(), total_lanes + best_lanes);
+        total_state    = std::min<std::uint32_t>(
+            std::numeric_limits<std::uint32_t>::max(), total_state + best_state);
+        total_main     = std::min<std::uint32_t>(
+            std::numeric_limits<std::uint32_t>::max(), total_main + best_main);
+        total_backend  = std::min<std::uint32_t>(
+            std::numeric_limits<std::uint32_t>::max(), total_backend + best_backend);
+    }
+    return residual.device.active_lanes > total_lanes ||
+           residual.device.state_slots > total_state ||
+           residual.device.main_kv_pages > total_main ||
+           residual.device.backend_kv_pages > total_backend;
+}
+
 inline runtime::PressureTargetGuidance
 PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guidance(qwen3_6::PressureTargetHandle target) {
     if (!valid(target) || scratch_live) {

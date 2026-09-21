@@ -641,6 +641,42 @@ public:
             maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
         }
 
+        // Value-of-computation acceptance.  The seeded incumbent is the result of the scoring
+        // pass (guidance ordering: coldest, least reused, lowest retention weight first)
+        // verified by one exact assessment.  On a large candidate frontier the budgeted
+        // refinement is what makes admission cost multi-second host time while the best plan
+        // almost never moves off the seed.  The loop therefore spends a small bounded probe
+        // of refinements first: if the seeded plan is feasible, preserves every owner (no
+        // eviction), costs less than a quarter of the search budget, and none of the probe's
+        // evaluations beats it, it is accepted.  Any improvement disables the acceptance and
+        // the search continues under its normal stopping rules; on a small frontier the queue
+        // simply exhausts before the probe completes and the behavior is unchanged.  Plans
+        // that evict any owner never take this path: eviction is the destructive decision
+        // class and must keep the guarantee that every preserving alternative is explored.
+        constexpr std::uint64_t kSeedProbeSteps = 64U;
+        bool seed_acceptable                    = false;
+        if (!incumbent.root_maximal && incumbent.assessed) {
+            const bool seed_has_no_eviction = std::none_of(
+                incumbent.owner_outcomes.begin(), incumbent.owner_outcomes.end(),
+                [](const PressureOwnerOutcome& outcome) {
+                    return outcome.disposition == VictimDisposition::Evicted;
+                });
+            if (seed_has_no_eviction) {
+                seed_acceptable = incumbent.cost.total_ns < search_budget_ns / 4U;
+            } else if (session.retention_infeasible(candidates[incumbent.candidate_index].id)) {
+                // Certified: even maximal retention pressure cannot close the device
+                // shortfall, so an evicting seed is a safe acceptance candidate after the
+                // probe (value of computation: the refinement gain is bounded by the seed's
+                // own total cost, which must not pay for the whole remaining budget).
+                seed_acceptable = incumbent.cost.total_ns < search_budget_ns;
+            }
+        }
+        const std::uint64_t seed_total_ns       = seed_acceptable ? incumbent.cost.total_ns : 0;
+        const std::uint32_t seed_candidate      = seed_acceptable
+                                                      ? incumbent.candidate_index
+                                                      : static_cast<std::uint32_t>(-1);
+        std::uint64_t seed_probe_steps          = 0;
+
         for (;;) {
             while (!queue_.empty() &&
                    target_marked(queue_.front().stable_target_ordinal, kTargetExpanded)) {
@@ -705,6 +741,17 @@ public:
                 }
             }
             maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
+            if (seed_acceptable) {
+                if (incumbent.cost.total_ns < seed_total_ns ||
+                    incumbent.candidate_index != seed_candidate) {
+                    // The probe beat the seed: run the ordinary search to its normal stop.
+                    seed_acceptable = false;
+                } else if (++seed_probe_steps >= kSeedProbeSteps) {
+                    // Heuristic stop like ValueOfNextExpansion: the budget was not exhausted.
+                    stop_reason = MaterializationStopReason::SeedAccepted;
+                    break;
+                }
+            }
         }
 
         const std::uint64_t search_elapsed_ns = elapsed_ns(search_started, Clock::now());
