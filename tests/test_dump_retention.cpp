@@ -7,10 +7,12 @@
 // multi-day-old files (large numbers) survived indefinitely. Retention must order by
 // capture time instead.
 //
-// Names: finalized names carry the RFC 3339 local form "YYYY-MM-DDTHH:MM:SS±HH:MM" (local
-// wall clock plus its explicit UTC offset). The offset makes the parse pure arithmetic, so
-// a name written on a UTC+8 host must mean the same instant on a UTC+14 host — the tests
-// below verify that by switching the process timezone between write and parse.
+// Names: finalized names are time-leading "<time>-req-<number>-<route>.json" with the RFC 3339
+// local form "YYYY-MM-DDTHH:MM:SS±HH:MM" (local wall clock plus its explicit UTC offset) at
+// the front. The offset makes the parse pure arithmetic, so a name written on a UTC+8 host
+// must mean the same instant on a UTC+14 host — the tests below verify that by switching the
+// process timezone between write and parse. Names written by older builds
+// ("req-<number>-<time>-<route>.json") must keep parsing so a directory outlives the change.
 
 #include <chrono>
 #include <cstdio>
@@ -32,6 +34,12 @@ std::string format_local_timestamp(std::int64_t ms);
 namespace {
 
 std::string finalized_name(std::int64_t number, std::int64_t capture_ms) {
+    const std::string stamp = ninfer::serve::format_local_timestamp(capture_ms);
+    assert(!stamp.empty());
+    return stamp + "-req-" + std::to_string(number) + "-chat.json";
+}
+
+std::string legacy_finalized_name(std::int64_t number, std::int64_t capture_ms) {
     const std::string stamp = ninfer::serve::format_local_timestamp(capture_ms);
     assert(!stamp.empty());
     return "req-" + std::to_string(number) + "-" + stamp + "-chat.json";
@@ -56,6 +64,13 @@ struct Harness {
     }
     bool present(std::int64_t number, std::int64_t capture_ms) {
         return std::filesystem::exists(directory / finalized_name(number, capture_ms));
+    }
+    // A file named by an older build: it must be ordered and pruned like any other.
+    void add_legacy(std::int64_t number, std::int64_t capture_ms) {
+        std::ofstream(directory / legacy_finalized_name(number, capture_ms)).put('x');
+    }
+    bool present_legacy(std::int64_t number, std::int64_t capture_ms) {
+        return std::filesystem::exists(directory / legacy_finalized_name(number, capture_ms));
     }
     void add_pending(std::int64_t capture_ms) {
         // Pending files are named req-<unix-ms>-<route>.json: the stamp is the number.
@@ -87,19 +102,24 @@ int main() {
     {
         const std::int64_t t = now_ms / 1000 * 1000;
         const std::optional<std::int64_t> parsed =
-            ninfer::serve::parse_dump_file_time("req-9-" +
-                                                    ninfer::serve::format_local_timestamp(t) +
-                                                    "-chat.json",
+            ninfer::serve::parse_dump_file_time(ninfer::serve::format_local_timestamp(t) +
+                                                    "-req-9-chat.json",
                                                 9);
         assert(parsed.has_value() && *parsed == t);
+        // The same instant named by an older build parses to the same value.
+        const std::optional<std::int64_t> legacy =
+            ninfer::serve::parse_dump_file_time("req-9-" +
+                                                     ninfer::serve::format_local_timestamp(t) +
+                                                     "-chat.json",
+                                                9);
+        assert(legacy.has_value() && *legacy == t);
     }
 
     // 2. The same name must mean the same instant on a host in another timezone: the
     //    embedded offset, not the reader's zone, decides the conversion.
     {
         const std::int64_t t = now_ms / 1000 * 1000;
-        const std::string name = "req-20-" +
-                                 ninfer::serve::format_local_timestamp(t) + "-chat.json";
+        const std::string name = ninfer::serve::format_local_timestamp(t) + "-req-20-chat.json";
         const std::optional<std::int64_t> before =
             ninfer::serve::parse_dump_file_time(name, 20);
         const char* saved_tz = std::getenv("TZ");
@@ -123,6 +143,7 @@ int main() {
         harness.add(370, now_ms - 10 * hour);     // young, but outranked by the restart era
         harness.add(9, now_ms - 2 * hour);
         harness.add(20, now_ms - 1 * hour);
+        harness.add_legacy(500, now_ms - 30 * hour);  // 26 h old: named by an older build
         harness.add_pending(now_ms - day - 12 * hour);  // 36 h-old pending file
 
         ninfer::serve::prune_dump_directory(harness.directory.string(), now_ms);
@@ -136,6 +157,8 @@ int main() {
         assert(!harness.present(1000, now_ms - 2 * day));
         // Ten hours old and limit 2: removed by the count rule.
         assert(!harness.present(370, now_ms - 10 * hour));
+        // 26 h-old legacy-name file: the older format is still ordered by its embedded time.
+        assert(!harness.present_legacy(500, now_ms - 30 * hour));
         // 36 h-old pending file: removed by the age rule through its unix-ms stamp.
         assert(!harness.present_pending(now_ms - day - 12 * hour));
     }

@@ -68,14 +68,17 @@ std::int64_t days_from_civil(std::int64_t year, std::int64_t month, std::int64_t
 // The directory is pruned on every write, which costs one readdir of a <=limit-entry directory and
 // guarantees the count bound holds at all times.
 //
-// Entries are ordered by capture time, never by request number: the number resets to zero on
-// every process restart, so in a directory that outlives a restart the newest dumps carry the
-// smallest numbers and a number-ordered prune deleted fresh dumps while keeping multi-day-old
-// ones. The time comes from the filename itself — finalized names embed the capture instant in
-// RFC 3339 local form "YYYY-MM-DDTHH:MM:SS±HH:MM" (process-local wall clock plus its explicit
-// UTC offset, so the name is locale-independent and parses to the same instant on any host in
-// any timezone), pending names use the unix-ms capture stamp as their leading number; stat()
-// mtime is only a fallback for names that carry neither.
+// File names: finalized dumps are "<time>-req-<number>-<route>.json" with the capture instant
+// in RFC 3339 local form "YYYY-MM-DDTHH:MM:SS±HH:MM" leading (process-local wall clock plus
+// its explicit UTC offset, so the name is locale-independent, parses to the same instant on
+// any host in any timezone, and a plain directory listing reads in capture order); pending
+// dumps are "req-<unix-ms stamp>-s<sequence>-<route>.json" where the sequence is a
+// process-unique capture counter that keeps two captures in the same millisecond apart.
+// Names written by older builds ("req-<number>[-<time>]-<route>.json") parse through the same
+// code and coexist during the transition. The number is the engine request id after
+// finalization (it resets to zero on every process restart, so it is only a deterministic
+// tiebreak, never a retention order key); retention always orders by the filename time, with
+// stat() mtime as the fallback for names that carry neither.
 //
 // Serving must never be affected: every failure path is swallowed and the directory is resolved
 // once, on first use.
@@ -93,11 +96,13 @@ std::uint64_t read_count_option(const char* name, std::uint64_t fallback) {
     return parsed;
 }
 
-// A dump file is named req-<number>-<route>.json. The number is the engine request id after
-// finalization, or the unix-ms capture timestamp while pending; it is used only as a
-// deterministic tiebreak and as that legacy pending-file time, never as a retention order key
-// (it resets on every process restart). Anything else in the directory is left alone: the
-// directory belongs to the operator, not to this diagnostic.
+// A dump file is named "<time>-req-<number>-<route>.json" after finalization (capture instant
+// leading) or "req-<unix-ms stamp>-s<sequence>-<route>.json" while pending; builds before the
+// time-leading form wrote "req-<number>[-<time>]-<route>.json" and those keep parsing. The
+// number is the engine request id after finalization, or the unix-ms capture stamp while
+// pending; it is used only as a deterministic tiebreak and as that pending-file time, never as
+// a retention order key (it resets on every process restart). Anything else in the directory
+// is left alone: the directory belongs to the operator, not to this diagnostic.
 struct DumpFile {
     std::int64_t number = 0;
     std::int64_t time_ms = 0;  // capture time (ms since epoch): filename timestamp, else mtime
@@ -105,17 +110,26 @@ struct DumpFile {
 };
 
 bool parse_dump_file_name(const std::string& name, DumpFile& out) {
-    constexpr std::string_view prefix = "req-";
     constexpr std::string_view suffix = ".json";
-    if (!name.starts_with(prefix) || !name.ends_with(suffix)) { return false; }
-    const char* cursor = name.data() + prefix.size();
-    const char* end    = name.data() + name.size() - suffix.size();
-    // Format: {number}[-{timestamp}]-{route}
-    // The first number (request sequence, or unix-ms capture stamp for pending files).
-    auto result = std::from_chars(cursor, end, out.number);
+    if (!name.ends_with(suffix)) { return false; }
+    const char* end = name.data() + name.size() - suffix.size();
+    if (name.starts_with("req-")) {
+        // Pending names of every build and the finalized names written by older builds:
+        // req-<number>[-<timestamp>]-<route>.json with the request id (or the unix-ms
+        // capture stamp while pending) as the leading number.
+        const char* cursor = name.data() + 4;
+        auto result = std::from_chars(cursor, end, out.number);
+        if (result.ec != std::errc() || result.ptr == end) { return false; }
+        // Expect a dash after the first number (separating it from the route or timestamp).
+        if (*result.ptr != '-') { return false; }
+        return true;
+    }
+    // Time-leading finalized names: <time>-req-<number>-<route>.json.
+    const std::size_t marker = name.find("-req-");
+    if (marker == std::string::npos || marker == 0) { return false; }
+    auto result = std::from_chars(name.data() + marker + 5, end, out.number);
     if (result.ec != std::errc() || result.ptr == end) { return false; }
-    // Expect a dash after the first number (separating it from the route or timestamp).
-    if (*result.ptr != '-') { return false; }
+    if (result.ptr != end && *result.ptr != '-') { return false; }
     return true;
 }
 
@@ -263,52 +277,60 @@ void prune_dump_directory(const std::string& directory, std::int64_t now_ms) {
     }
 }
 
-std::int64_t dump_request_body(const httplib::Request& request, const char* route) {
+// Handle returned by dump_request_body and consumed by finalize_dump_file.  pending_path is
+// the exact file the body was written to; stamp_ms is the capture instant used to build the
+// finalized name.  A zero stamp means dumping is disabled or the write failed.
+struct DumpCapture {
+    std::int64_t stamp_ms = 0;
+    std::string pending_path;
+};
+
+DumpCapture dump_request_body(const httplib::Request& request, const char* route) {
     static const std::string directory = [] {
         const char* value = std::getenv("NINFER_DUMP_REQUESTS");
         return value == nullptr ? std::string() : std::string(value);
     }();
-    if (directory.empty()) { return 0; }
+    if (directory.empty()) { return {}; }
     try {
         static std::mutex mutex;
+        static std::uint64_t next_sequence = 0;
         std::lock_guard lock(mutex);
         const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
                                std::chrono::system_clock::now().time_since_epoch())
                                .count();
-        const std::string path = directory + "/req-" + std::to_string(stamp) + "-" +
-                                 route + ".json";
+        // A client can fire several requests in one millisecond (a message plus its side
+        // calls), so the pending name carries a process-unique sequence: a name shared by
+        // two captures would let the later write truncate the earlier body, and the
+        // finalize rename race would then decide which request's file survives.
+        const std::string path = directory + "/req-" + std::to_string(stamp) + "-s" +
+                                 std::to_string(next_sequence++) + "-" + route + ".json";
         std::FILE* file = std::fopen(path.c_str(), "wb");
-        if (file == nullptr) { return 0; }
+        if (file == nullptr) { return {}; }
         (void)std::fwrite(request.body.data(), 1, request.body.size(), file);
         (void)std::fclose(file);
         prune_dump_directory(directory, stamp);
-        return stamp;
+        return {.stamp_ms = stamp, .pending_path = path};
     } catch (...) {
         // A diagnostic failure must never affect serving.
-        return 0;
+        return {};
     }
 }
 
-void finalize_dump_file(std::int64_t timestamp, std::uint64_t request_id, const char* route) {
-    if (timestamp <= 0) { return; }
-    static const std::string directory = [] {
-        const char* value = std::getenv("NINFER_DUMP_REQUESTS");
-        return value == nullptr ? std::string() : std::string(value);
-    }();
-    if (directory.empty()) { return; }
+void finalize_dump_file(const DumpCapture& capture, std::uint64_t request_id, const char* route) {
+    if (capture.stamp_ms <= 0) { return; }
+    // RFC 3339 local form (YYYY-MM-DDTHH:MM:SS±HH:MM) for human readability: operators
+    // on the serving host read the wall clock at a glance, and the explicit offset keeps
+    // the name unambiguous and locale-independent for the retention parser and for any
+    // other consumer on any host.
     try {
-        const std::string old_path = directory + "/req-" + std::to_string(timestamp) + "-" +
-                                     route + ".json";
-        // RFC 3339 local form (YYYY-MM-DDTHH:MM:SS±HH:MM) for human readability: operators
-        // on the serving host read the wall clock at a glance, and the explicit offset keeps
-        // the name unambiguous and locale-independent for the retention parser and for any
-        // other consumer on any host.
-        const std::string stamp = format_local_timestamp(timestamp);
+        const std::string stamp = format_local_timestamp(capture.stamp_ms);
         if (stamp.empty()) { return; }
-        const std::string new_path = directory + "/req-" + std::to_string(request_id) + "-" +
-                                     stamp + "-" + route + ".json";
+        // Time-leading so a plain directory listing reads in capture order.
+        const std::string new_path = std::filesystem::path(capture.pending_path).parent_path() /
+                                     (stamp + "-req-" + std::to_string(request_id) + "-" +
+                                      route + ".json");
         std::error_code error;
-        std::filesystem::rename(old_path, new_path, error);
+        std::filesystem::rename(capture.pending_path, new_path, error);
     } catch (...) {
         // A diagnostic failure must never affect serving.
     }
@@ -798,14 +820,14 @@ void HttpServer::register_routes() {
     });
     server_.Post("/v1/chat/completions",
                  [this](const httplib::Request& req, httplib::Response& res) {
-                     const std::int64_t ts = dump_request_body(req, "chat");
+                     const DumpCapture dump = dump_request_body(req, "chat");
                      handle_chat_completions(req, res);
-                     finalize_dump_file(ts, request_seq_.load(), "chat");
+                     finalize_dump_file(dump, request_seq_.load(), "chat");
                  });
     server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
-        const std::int64_t ts = dump_request_body(req, "responses");
+        const DumpCapture dump = dump_request_body(req, "responses");
         handle_responses(req, res);
-        finalize_dump_file(ts, request_seq_.load(), "responses");
+        finalize_dump_file(dump, request_seq_.load(), "responses");
     });
     server_.Post("/v1/responses/input_tokens",
                  [this](const httplib::Request& req, httplib::Response& res) {
@@ -836,9 +858,9 @@ void HttpServer::register_routes() {
                      handle_count_tokens(req, res);
                  });
     server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
-        const std::int64_t ts = dump_request_body(req, "messages");
+        const DumpCapture dump = dump_request_body(req, "messages");
         handle_messages(req, res);
-        finalize_dump_file(ts, request_seq_.load(), "messages");
+        finalize_dump_file(dump, request_seq_.load(), "messages");
     });
 }
 
