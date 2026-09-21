@@ -1850,6 +1850,11 @@ std::vector<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_pressure
     const auto already_dropped = [&](runtime::CheckpointRef checkpoint) {
         return std::find(dropped.begin(), dropped.end(), checkpoint) != dropped.end();
     };
+    const auto dropped_and = [&](runtime::CheckpointRef checkpoint) {
+        std::vector<runtime::CheckpointRef> target_drops = dropped;
+        target_drops.push_back(checkpoint);
+        return target_drops;
+    };
     const auto state_change_conflicts =
         [](runtime::CheckpointRef checkpoint,
            const qwen3_6::detail::PressureDecision& explicit_target) {
@@ -1871,10 +1876,7 @@ std::vector<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_pressure
             }
             return false;
         };
-    const auto append_checkpoint_successor = [&](runtime::CheckpointRef checkpoint) {
-        if (already_dropped(checkpoint)) { return; }
-        std::vector<runtime::CheckpointRef> target_drops = dropped;
-        target_drops.push_back(checkpoint);
+    const auto append_drop_set_successor = [&](std::vector<runtime::CheckpointRef> target_drops) {
         std::optional<qwen3_6::detail::PressureDecision> drop =
             inspect_checkpoint_drop_option(sequence, target_drops);
         if (!drop) { return; }
@@ -1885,7 +1887,10 @@ std::vector<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_pressure
             return;
         }
         qwen3_6::detail::PressureDecision explicit_target = explicit_pressure_target(*current);
-        if (state_change_conflicts(checkpoint, explicit_target)) { return; }
+        for (const runtime::CheckpointRef added : target_drops) {
+            if (std::find(dropped.begin(), dropped.end(), added) != dropped.end()) { continue; }
+            if (state_change_conflicts(added, explicit_target)) { return; }
+        }
         const std::optional<qwen3_6::TargetKVRequirement> retained =
             retained_requirement_after_drops(summary, drop->dropped_checkpoints);
         if (!retained) { return; }
@@ -1904,10 +1909,76 @@ std::vector<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_pressure
         append_unique(
             combine_checkpoint_and_replica_target(std::move(*drop), std::move(explicit_target)));
     };
-    if (summary.endpoint) { append_checkpoint_successor(summary.endpoint->ref); }
-    if (summary.rewrite) { append_checkpoint_successor(summary.rewrite->ref); }
-    for (const qwen3_6::CheckpointSummary& anchor : summary.long_anchors) {
-        append_checkpoint_successor(anchor.ref);
+    if (summary.endpoint && !already_dropped(summary.endpoint->ref)) {
+        append_drop_set_successor(dropped_and(summary.endpoint->ref));
+    }
+    if (summary.rewrite && !already_dropped(summary.rewrite->ref)) {
+        append_drop_set_successor(dropped_and(summary.rewrite->ref));
+    }
+    // Bound the per-owner fan-out. Emitting one successor per retained long anchor makes a single
+    // expansion's child count grow with the owner's anchor count (production 2026-09-21: one
+    // expansion produced 3,698 evaluated targets and exhausted the 4,096 target budget, so the
+    // search never left its first neighbourhood). Keep the drop-set the exact evaluator can
+    // distinguish in relief: the minimal greedily-ordered anchor prefix that covers the residual,
+    // plus one aggregate that drops every remaining anchor. Deeper retention sets stay reachable
+    // through further expansions, so this bounds exploration without losing post-states.
+    if (!summary.long_anchors.empty()) {
+        struct AnchorRelief {
+            std::uint64_t relief    = 0;
+            std::uint32_t frontier  = 0;
+            runtime::CheckpointRef ref;
+        };
+        std::vector<AnchorRelief> ranked;
+        ranked.reserve(summary.long_anchors.size());
+        for (const qwen3_6::CheckpointSummary& anchor : summary.long_anchors) {
+            if (already_dropped(anchor.ref)) { continue; }
+            std::vector<runtime::CheckpointRef> target_drops = dropped_and(anchor.ref);
+            std::optional<qwen3_6::detail::PressureDecision> drop =
+                inspect_checkpoint_drop_option(sequence, target_drops);
+            if (!drop) { continue; }
+            const detail::PhysicalResources& removed = drop->checkpoint_drop_effect.removed;
+            std::uint64_t relief = 0;
+            if (residual.device.state_slots != 0) { relief += removed.device.state_slots; }
+            if (residual.device.main_kv_pages != 0) { relief += removed.device.main_kv_pages; }
+            if (residual.device.backend_kv_pages != 0) { relief += removed.device.backend_kv_pages; }
+            if (residual.host.state_slots != 0) { relief += removed.host.state_slots; }
+            if (residual.device.state_slots == 0 && residual.device.main_kv_pages == 0 &&
+                residual.device.backend_kv_pages == 0 && residual.host.state_slots == 0) {
+                relief = removed.device.state_slots + removed.device.main_kv_pages +
+                         removed.device.backend_kv_pages + removed.host.state_slots;
+            }
+            ranked.push_back(AnchorRelief{
+                .relief = relief, .frontier = anchor.ref.frontier, .ref = anchor.ref});
+        }
+        std::stable_sort(ranked.begin(), ranked.end(),
+                         [](const AnchorRelief& left, const AnchorRelief& right) {
+                             if (left.relief != right.relief) { return left.relief > right.relief; }
+                             return left.frontier < right.frontier;
+                         });
+        std::uint64_t deficit = 0;
+        if (residual.device.state_slots != 0) { deficit += residual.device.state_slots; }
+        if (residual.device.main_kv_pages != 0) { deficit += residual.device.main_kv_pages; }
+        if (residual.device.backend_kv_pages != 0) {
+            deficit += residual.device.backend_kv_pages;
+        }
+        if (residual.host.state_slots != 0) { deficit += residual.host.state_slots; }
+        std::uint64_t covered = 0;
+        std::size_t emitted   = 0;
+        // kAnchorDropSuccessors bounds the level-1 fan-out per owner; the aggregate below keeps the
+        // "retain nothing here" post-state reachable in one step.
+        constexpr std::size_t kAnchorDropSuccessors = 4;
+        for (const AnchorRelief& candidate : ranked) {
+            if (covered >= deficit && emitted != 0) { break; }
+            if (emitted >= kAnchorDropSuccessors) { break; }
+            append_drop_set_successor(dropped_and(candidate.ref));
+            covered += candidate.relief;
+            ++emitted;
+        }
+        if (ranked.size() > 1) {
+            std::vector<runtime::CheckpointRef> all = dropped;
+            for (const AnchorRelief& candidate : ranked) { all.push_back(candidate.ref); }
+            append_drop_set_successor(std::move(all));
+        }
     }
 
     const std::optional<qwen3_6::TargetKVRequirement> retained =
