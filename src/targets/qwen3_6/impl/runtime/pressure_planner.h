@@ -196,7 +196,15 @@ inline PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::PressurePlanningSessi
     for (std::size_t index = 0; index < private_owners.size(); ++index) {
         const ContinuationHandle* handle = private_owners[index];
         if (handle == nullptr || !owner.valid_continuation(*handle)) {
-            throw std::logic_error("pressure planning private owner is stale");
+            // The ResourceManager's catalog view can lag one reconciliation behind an emergency
+            // retirement (storage doc 4.2), so an owner it listed may already be gone. That owner
+            // can be neither a victim nor a source, so skip it: failing the request here turned a
+            // serviceable request into HTTP 500 (2026-09-21, pinned-full pool). The id-to-record
+            // mapping is unaffected because every other owner keeps the id the ResourceManager
+            // assigned it.
+            std::fprintf(stderr, "[planner] skip retired private owner id=%u\n",
+                         private_owner_ids[index].value);
+            continue;
         }
         owners.push_back(
             Owner{.private_handle = handle, .id = private_owner_ids[index], .shared = false});
@@ -204,7 +212,9 @@ inline PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::PressurePlanningSessi
     for (std::size_t index = 0; index < shared_owners.size(); ++index) {
         const SharedPrefixHandle* handle = shared_owners[index];
         if (handle == nullptr || !owner.valid_shared_prefix(*handle)) {
-            throw std::logic_error("pressure planning shared owner is stale");
+            std::fprintf(stderr, "[planner] skip retired shared owner id=%u\n",
+                         shared_owner_ids[index].value);
+            continue;
         }
         owners.push_back(
             Owner{.shared_handle = handle, .id = shared_owner_ids[index], .shared = true});

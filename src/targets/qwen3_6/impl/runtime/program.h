@@ -1155,6 +1155,9 @@ private:
     // bindings, so the release ladder's non-destructive steps and the planner's relief credit must
     // be allowed to reclaim them.
     [[nodiscard]] bool state_bound_by_active_sequence(StateImageHandle state) const;
+    // Host state slots the ladder can free by evicting an idle owner's retained Host replica (2b):
+    // the host half of the release ladder's deliverable capacity.
+    [[nodiscard]] std::uint32_t host_slot_relief() const noexcept;
     // Device and Host state replicas owned by the oldest retirable Catalogued continuation: what
     // one call of the ladder's final step (`retire_oldest_idle_continuation`) frees.
     [[nodiscard]] std::pair<std::uint32_t, std::uint32_t>

@@ -6749,6 +6749,18 @@ bool ProgramImplCore::state_bound_by_active_sequence(StateImageHandle state) con
     return false;
 }
 
+std::uint32_t ProgramImplCore::host_slot_relief() const noexcept {
+    if (!state_store) { return 0; }
+    // Host slots the ladder's replica-eviction step (2b) can free: an idle owner's retained Host
+    // replica is cache, not a live binding, and dropping it is the documented way to make room
+    // when the Host pool is pinned full (storage doc 4.4). It is not credited for a state the
+    // in-flight reservation restores, nor for one a live sequence is using.
+    const auto keep_bound = [this](StateImageHandle handle) {
+        return release_protected_state && *release_protected_state == handle;
+    };
+    return state_store->count_state_relief(keep_bound).host_evictable;
+}
+
 std::pair<std::uint32_t, std::uint32_t>
 ProgramImplCore::oldest_idle_retirement_relief() const noexcept {
     if (!state_store) { return {0, 0}; }
@@ -7274,7 +7286,9 @@ bool ProgramImplCore::release_one_device_state_slot() {
     // depends on. The ladder's supported way to reclaim an idle owner is
     // `retire_oldest_idle_continuation`, which retires the owner and its states together, so this
     // step keeps the conservative predicate plus the in-flight reservation's protection.
-    const auto keep_active_states = keep_live_states;
+    const auto keep_active_states = [&](StateImageHandle handle) {
+        return is_release_protected(handle) || state_bound_by_active_sequence(handle);
+    };
     // Cheapest first: a checkpoint that already holds a Host replica only needs its Device slot
     // back. A DeviceOnly checkpoint needs a Device-to-Host copy before its slot is reusable, which
     // is also what keeps its data available for reuse instead of discarding it. Demotion and
@@ -7413,6 +7427,9 @@ ProgramImplCore::materialization_deficit(const ResourceCandidateState& admission
     const std::uint32_t relief = state_slot_relief(0);
     if (relief > residual.device.state_slots) { residual.device.state_slots = 0; }
     else { residual.device.state_slots -= relief; }
+    const std::uint32_t host_relief = host_slot_relief();
+    if (host_relief > residual.host.state_slots) { residual.host.state_slots = 0; }
+    else { residual.host.state_slots -= host_relief; }
     return residual;
 }
 
@@ -7451,6 +7468,13 @@ bool ProgramImplCore::physical_peak_fits(detail::PhysicalResources peak) const n
     const std::uint32_t state_used   = state_relief > occupied.device.state_slots
                                            ? 0
                                            : occupied.device.state_slots - state_relief;
+    // The Host half of the same inequality: a pinned-full Host pool must not read as permanently
+    // infeasible, because 2b can drop an idle owner's Host replica (2026-09-21: a private capture
+    // whose HostSnapshot needed one slot was skipped with 'pressure-baseline-infeasible' at host
+    // 320/320, so the newest request published no anchor and every later sibling missed).
+    const std::uint32_t host_relief = host_slot_relief();
+    const std::uint32_t host_state_used =
+        host_relief > occupied.host.state_slots ? 0 : occupied.host.state_slots - host_relief;
     return fits_u32(occupied.device.active_lanes, peak.device.active_lanes,
                     limits.device.active_lanes) &&
            fits_u32(state_used, peak.device.state_slots, limits.device.state_slots) &&
@@ -7458,7 +7482,7 @@ bool ProgramImplCore::physical_peak_fits(detail::PhysicalResources peak) const n
                     limits.device.main_kv_pages) &&
            fits_u32(occupied.device.backend_kv_pages, peak.device.backend_kv_pages,
                     limits.device.backend_kv_pages) &&
-           fits_u32(occupied.host.state_slots, peak.host.state_slots, limits.host.state_slots) &&
+           fits_u32(host_state_used, peak.host.state_slots, limits.host.state_slots) &&
            fits_size(occupied.host.kv_bytes, peak.host.kv_bytes, limits.host.kv_bytes);
 }
 
@@ -8669,6 +8693,15 @@ void ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
         throw std::logic_error("active capture capacity preparation is stale");
     }
     SequenceState& sequence = active_sequence(transaction.lane);
+    // A capture that publishes the request's OWN private checkpoint is the private-only baseline:
+    // scheduling doc 6.2 keeps it executable no matter what the shared option decides, so it may
+    // use the whole release ladder, including retiring an idle session. A shared-only promotion is
+    // an engine-generated candidate and may use only spare capacity that does not degrade an
+    // existing owner (docs 7.2), so it stops before the retirement step. Without this split a
+    // pinned-full pool (host 320/320) skipped the newest request's own anchor with
+    // 'pressure-baseline-infeasible', and every later sibling message then had nothing to reuse
+    // (2026-09-21 production acceptance: cold request 0%, sibling 0%).
+    const bool allow_retire = transaction.publish_private;
     if (transaction.publish_shared) {
         if (!transaction.shared_index || *transaction.shared_index >= shared_prefix_capacity) {
             throw std::logic_error("shared capture has no reserved descriptor");
@@ -8718,13 +8751,8 @@ void ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
         transaction.recycled_state_epoch =
             state_store->recycle_checkpoint_destination(transaction.destination_state);
     } else {
-        // A capture is optional publication: docs 7.2 lets an engine-generated candidate use only
-        // spare capacity that does not degrade an existing owner, so it must not reach the ladder's
-        // retirement step. Without this the credit let every capture reserve, and a capture whose
-        // slots were pinned retired an idle session instead (retention collapsed from 320 to ~28
-        // retained states during a 2026-09-21 fill).
         std::optional<StateImageHandle> destination =
-            reserve_state_destination_with_release(/*allow_retire=*/false);
+            reserve_state_destination_with_release(allow_retire);
         if (!destination) {
             throw std::logic_error("selected capture has no prepared Device State capacity");
         }
