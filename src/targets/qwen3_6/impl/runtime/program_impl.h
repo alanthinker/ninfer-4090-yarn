@@ -7052,26 +7052,40 @@ bool ProgramImplCore::release_one_device_state_slot() {
     };
     // Cheapest first: a checkpoint that already holds a Host replica only needs its Device slot
     // back. A DeviceOnly checkpoint needs a Device-to-Host copy before its slot is reusable, which
-    // is also what keeps its data available for reuse instead of discarding it.
+    // is also what keeps its data available for reuse instead of discarding it. Demotion and
+    // replica drops keep the state valid, so only the discarding steps (EvictHostReplica, Drop)
+    // have to respect the ownership of a live sequence.
     if (const std::optional<StateImageHandle> victim = state_store->select_slot_release_victim(
             StateImageStore::SlotReleaseKind::DropDeviceReplica, keep_all)) {
         if (state_store->drop_device_replica(*victim)) { return true; }
     }
-    if (const std::optional<StateImageHandle> victim = state_store->select_slot_release_victim(
-            StateImageStore::SlotReleaseKind::CopyToHost, keep_all)) {
+    const auto demote_one = [this]() {
+        const std::optional<StateImageHandle> victim = state_store->select_slot_release_victim(
+            StateImageStore::SlotReleaseKind::CopyToHost, [](StateImageHandle) { return false; });
+        if (!victim) { return false; }
         std::optional<StateImageTransfer> transfer =
             state_store->begin_device_to_host(*victim, device.transfer_stream);
-        if (transfer) {
-            // The Device slot is reusable only after the copy has read it.
-            if (device.transfer_stream != nullptr) {
-                (void)cudaStreamSynchronize(device.transfer_stream);
-            }
-            state_store->publish_transfer(std::move(*transfer), false);
-            return true;
+        if (!transfer) { return false; }
+        // The Device slot is reusable only after the copy has read it.
+        if (device.transfer_stream != nullptr) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
         }
+        state_store->publish_transfer(std::move(*transfer), false);
+        return true;
+    };
+    if (demote_one()) { return true; }
+    // The Host pool was too full to take a DeviceOnly replica. Evict the oldest evictable
+    // anchor's Host replica to free a slot, then demote. Pinned anchors are eligible on purpose:
+    // a full Host pool must degrade the oldest anchor, not reject every new checkpoint (and
+    // every reuse that restores one into Device) with a root prefill. The evicted checkpoint's
+    // state is unavailable until its owner republishes it; its KV pages are untouched.
+    if (const std::optional<StateImageHandle> evicted = state_store->select_slot_release_victim(
+            StateImageStore::SlotReleaseKind::EvictHostReplica, keep_bound_states);
+        evicted && state_store->evict_host_replica(*evicted)) {
+        if (demote_one()) { return true; }
     }
-    // Host capacity could not take the replica: drop the oldest checkpoint nobody references and
-    // no live sequence still binds.
+    // No Host capacity could be created: drop the oldest checkpoint nobody references and no
+    // live sequence still binds.
     if (const std::optional<StateImageHandle> victim = state_store->select_slot_release_victim(
             StateImageStore::SlotReleaseKind::Drop, keep_bound_states)) {
         if (state_store->release(*victim)) { return true; }
@@ -7100,13 +7114,45 @@ detail::PhysicalResources ProgramImplCore::physical_occupancy() const noexcept {
     return out;
 }
 
+std::uint32_t
+ProgramImplCore::state_slot_relief(std::uint32_t planned_host_state_release) const noexcept {
+    if (!state_store) { return 0; }
+    const auto keep_bound = [this](StateImageHandle handle) {
+        return state_bound_by_live_sequence(handle);
+    };
+    const auto counts = state_store->count_state_relief(keep_bound);
+    const auto limits   = admission_capacity();
+    const auto occupied = physical_occupancy();
+    const std::uint32_t free_host =
+        limits.host.state_slots > occupied.host.state_slots
+            ? limits.host.state_slots - occupied.host.state_slots
+            : 0;
+    const auto sat_u32 = [](std::uint32_t a, std::uint32_t b) {
+        return a > std::numeric_limits<std::uint32_t>::max() - b
+                   ? std::numeric_limits<std::uint32_t>::max()
+                   : a + b;
+    };
+    const std::uint32_t host_budget =
+        sat_u32(sat_u32(free_host, planned_host_state_release), counts.host_evictable);
+    return sat_u32(counts.drop_device_replica,
+                   std::min(counts.demote_candidates, host_budget));
+}
+
 detail::PhysicalResources
 ProgramImplCore::materialization_deficit(const ResourceCandidateState& admission) const {
     // Pressure is relative to this candidate's real peak. Treating every dimension as scarce
     // would forbid Device-to-Host demotion even when Host capacity is available.
-    const detail::PhysicalResources required =
-        checked_resource_sum(physical_occupancy(), admission.demand.physical_peak_additional);
-    return positive_resource_difference(required, admission_capacity());
+    detail::PhysicalResources residual =
+        positive_resource_difference(
+            checked_resource_sum(physical_occupancy(), admission.demand.physical_peak_additional),
+            admission_capacity());
+    // The release ladder can still free Device state slots (drop replica / demote / evict an
+    // anchor's Host replica), so the residual must credit that relief or a full Host pool would
+    // read as a permanently infeasible Device pool.
+    const std::uint32_t relief = state_slot_relief(0);
+    if (relief > residual.device.state_slots) { residual.device.state_slots = 0; }
+    else { residual.device.state_slots -= relief; }
+    return residual;
 }
 
 detail::PhysicalResources
@@ -7118,9 +7164,14 @@ ProgramImplCore::guided_materialization_deficit(const ResourceCandidateState& ad
     const detail::PhysicalResources projected_peak = positive_resource_difference(
         checked_resource_sum(admission.demand.physical_peak_additional, pressure.added),
         pressure.removed);
-    const detail::PhysicalResources required =
-        checked_resource_sum(physical_occupancy(), projected_peak);
-    return positive_resource_difference(required, admission_capacity());
+    detail::PhysicalResources residual =
+        positive_resource_difference(
+            checked_resource_sum(physical_occupancy(), projected_peak), admission_capacity());
+    // Host slots freed by this plan's own releases also feed the demotion budget.
+    const std::uint32_t relief = state_slot_relief(pressure.removed.host.state_slots);
+    if (relief > residual.device.state_slots) { residual.device.state_slots = 0; }
+    else { residual.device.state_slots -= relief; }
+    return residual;
 }
 
 bool ProgramImplCore::physical_peak_fits(detail::PhysicalResources peak) const noexcept {
@@ -7132,10 +7183,16 @@ bool ProgramImplCore::physical_peak_fits(detail::PhysicalResources peak) const n
     const auto fits_size = [](std::size_t used, std::size_t added, std::size_t capacity) {
         return added <= capacity && used <= capacity - added;
     };
+    // Device state slots the release ladder can free count against `used`, not against a lower
+    // capacity: the runtime ladder (release_one_device_state_slot) backs this credit, and its
+    // final step (retire the oldest idle session) makes the reservation succeed regardless.
+    const std::uint32_t state_relief = state_slot_relief(0);
+    const std::uint32_t state_used   = state_relief > occupied.device.state_slots
+                                           ? 0
+                                           : occupied.device.state_slots - state_relief;
     return fits_u32(occupied.device.active_lanes, peak.device.active_lanes,
                     limits.device.active_lanes) &&
-           fits_u32(occupied.device.state_slots, peak.device.state_slots,
-                    limits.device.state_slots) &&
+           fits_u32(state_used, peak.device.state_slots, limits.device.state_slots) &&
            fits_u32(occupied.device.main_kv_pages, peak.device.main_kv_pages,
                     limits.device.main_kv_pages) &&
            fits_u32(occupied.device.backend_kv_pages, peak.device.backend_kv_pages,

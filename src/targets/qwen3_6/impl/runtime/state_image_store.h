@@ -228,14 +228,24 @@ public:
         DropDeviceReplica,  // victim already holds a Host replica: only the Device slot is freed
         CopyToHost,         // victim is DeviceOnly: copy to Host, then free the Device slot
         Drop,               // victim is unreferenced and unpinned: release it entirely
+        // The victim holds a Host replica (possibly also a Device replica) and may be pinned:
+        // dropping the Host replica frees a Host slot. Without this kind a full Host pool makes
+        // the Device pool unrecoverable — CopyToHost needs a free Host slot and Drop refuses
+        // pinned victims — so every new checkpoint (and every reuse that must restore one into
+        // Device) is rejected and degrades to root prefill. Evicting the oldest anchor's Host
+        // replica is what keeps the release ladder moving.
+        EvictHostReplica,
     };
 
-    // Select the least-valuable retained checkpoint that can release its Device slot at the given
-    // cost. Anchors are preferred over endpoints, because endpoints are likelier to be reused by
-    // the next request in their session; among one class the least-recently-touched wins. The veto
-    // callback receives the candidate handle so the caller can apply ownership rules the store
-    // cannot see (a state a live sequence still binds must never be released). Returns nullopt when
-    // no checkpoint can release its slot that way.
+    // Select the least-valuable retained checkpoint that can release a slot at the given cost
+    // (a Device slot for the first three kinds, a Host slot for EvictHostReplica). Anchors are
+    // preferred over endpoints, because endpoints are likelier to be reused by the next request in
+    // their session; among one class the least-recently-touched wins. Pinned victims are excluded
+    // only for Drop (a full release would orphan live references); EvictHostReplica may drop the
+    // Host replica of a pinned anchor, which makes exactly that checkpoint's state unavailable
+    // until the owner republishes it. The veto callback receives the candidate handle so the
+    // caller can apply ownership rules the store cannot see (a state a live sequence still binds
+    // must never be evicted). Returns nullopt when no checkpoint qualifies.
     template <class VetoFn>
     [[nodiscard]] std::optional<StateImageHandle>
     select_slot_release_victim(SlotReleaseKind kind, VetoFn&& veto) const noexcept {
@@ -244,12 +254,16 @@ public:
         bool best_is_anchor        = true;
         for (std::uint32_t i = 0; i < objects_.size(); ++i) {
             const Object& obj = objects_[i];
-            if (obj.role != StateImageRole::CheckpointImmutable || !obj.device_slot) { continue; }
-            if (kind == SlotReleaseKind::DropDeviceReplica && !obj.host_slot) { continue; }
-            if (kind != SlotReleaseKind::DropDeviceReplica && obj.host_slot) { continue; }
-            if (kind == SlotReleaseKind::Drop &&
-                obj.checkpoint_references != 0) {
-                continue;
+            if (obj.role != StateImageRole::CheckpointImmutable) { continue; }
+            if (kind == SlotReleaseKind::EvictHostReplica) {
+                if (!obj.host_slot) { continue; }
+            } else {
+                if (!obj.device_slot) { continue; }
+                if (kind == SlotReleaseKind::DropDeviceReplica && !obj.host_slot) { continue; }
+                if (kind != SlotReleaseKind::DropDeviceReplica && obj.host_slot) { continue; }
+                if (kind == SlotReleaseKind::Drop && obj.checkpoint_references != 0) {
+                    continue;
+                }
             }
             if (obj.source_pins != 0 || obj.destination_pinned || has_pending_replica(obj)) {
                 continue;
@@ -264,6 +278,41 @@ public:
             }
         }
         return best;
+    }
+
+    // How many StateImage slots the capacity-release ladder can still free, by mechanism.
+    // `drop_device_replica`: Both-resident checkpoints whose Device slot frees without any Host
+    // capacity. `demote_candidates`: DeviceOnly checkpoints, each of which needs one free Host
+    // slot to demote. `host_evictable`: Host replicas the EvictHostReplica step can drop (pinned
+    // or not) to create Host capacity. All counts honor the veto callback, so states bound to a
+    // live sequence are never counted. A null Host pool means no Host-side mechanism is available.
+    struct StateReliefCounts {
+        std::uint32_t drop_device_replica = 0;
+        std::uint32_t demote_candidates   = 0;
+        std::uint32_t host_evictable      = 0;
+    };
+
+    template <class VetoFn>
+    [[nodiscard]] StateReliefCounts count_state_relief(VetoFn&& veto) const noexcept {
+        StateReliefCounts counts;
+        if (host_ == nullptr) { return counts; }
+        for (std::uint32_t i = 0; i < objects_.size(); ++i) {
+            const Object& obj = objects_[i];
+            if (obj.role != StateImageRole::CheckpointImmutable) { continue; }
+            if (obj.source_pins != 0 || obj.destination_pinned || has_pending_replica(obj)) {
+                continue;
+            }
+            if (veto(StateImageHandle(this, i, obj.generation))) { continue; }
+            if (obj.host_slot) { ++counts.host_evictable; }
+            if (obj.device_slot) {
+                if (obj.host_slot) {
+                    ++counts.drop_device_replica;
+                } else {
+                    ++counts.demote_candidates;
+                }
+            }
+        }
+        return counts;
     }
 
     [[nodiscard]] std::uint32_t source_pins(StateImageHandle handle) const {
@@ -392,6 +441,30 @@ public:
             !host_->release(*object.host_slot)) {
             return false;
         }
+        object.host_slot.reset();
+        return true;
+    }
+
+    // Drops the Host replica of a retained checkpoint to free a Host StateImage slot, for the
+    // EvictHostReplica step of the capacity-release ladder (see SlotReleaseKind). Unlike
+    // drop_host_replica this also works on HostOnly states: a pinned HostOnly checkpoint becomes
+    // a replica-less placeholder — its checkpoint is unavailable until the owner republishes it —
+    // which is the documented "丢最老锚点" degradation, not data corruption: the object keeps its
+    // references until the owner is released, and its KV pages stay independent. A Both-resident
+    // checkpoint demotes to DeviceOnly and keeps serving Device-side reuse.
+    [[nodiscard]] bool evict_host_replica(StateImageHandle handle) noexcept {
+        if (!valid(handle)) { return false; }
+        Object& object = objects_[handle.index_];
+        if (host_ == nullptr || object.role != StateImageRole::CheckpointImmutable ||
+            !object.host_slot || object.source_pins != 0 || object.destination_pinned ||
+            has_pending_replica(object) || !host_->release(*object.host_slot)) {
+            return false;
+        }
+        std::fprintf(stderr,
+                     "state-store: anchor host evict handle=%u host_slot=%d pinned=%u "
+                     "device_only_after=%d\n",
+                     handle.index_, *object.host_slot, object.checkpoint_references,
+                     object.device_slot ? 1 : 0);
         object.host_slot.reset();
         return true;
     }

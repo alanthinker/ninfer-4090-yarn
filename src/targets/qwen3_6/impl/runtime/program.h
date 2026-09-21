@@ -1134,6 +1134,12 @@ private:
     [[nodiscard]] detail::PhysicalResources
     guided_materialization_deficit(const ResourceCandidateState& candidate,
                                    const detail::PhysicalDelta& pressure) const;
+    // Device StateImage slots the capacity-release ladder can still free: Both-resident
+    // checkpoints drop their Device replica for free; DeviceOnly ones demote, each needing one
+    // Host slot from free Host capacity, `planned_host_state_release` slots this plan itself
+    // frees, or a Host replica the ladder evicts off the oldest anchor.
+    [[nodiscard]] std::uint32_t
+    state_slot_relief(std::uint32_t planned_host_state_release) const noexcept;
     [[nodiscard]] bool
     protected_materialization_page(const MaterializationSourceProtection* protection,
                                    const KVAddressSpaceStore& addresses, std::uint32_t page_offset,
