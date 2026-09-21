@@ -1012,6 +1012,15 @@ Stop reasons are `no_pressure`, `queue_exhausted`, `target_budget`, `expansion_c
 `value_of_next_expansion`. Search is bounded and heuristic; these diagnostics do not claim model or global optimality.
 Aborted planning attempts are not published.
 
+The same object reports the *shape* of that bounded search, which the stop reason alone cannot express:
+`search_budget_ns` (the wall budget this problem received), `candidates`, `optional_targets` (targets the expansion
+arena committed), `expansions`, `fanned_out_children_max` (the largest single expansion's child count), and
+`guided_closures_succeeded`/`guided_closures_failed`. A fan-out at or near the target budget with a small expansion
+count means one expansion consumed the arena — the 2026-09-21 production incident evaluated 3,698 targets and stopped
+with `expansion_capacity` inside its first neighbourhood, which no other field separated from a genuinely exhausted
+space. A nonzero `guided_closures_failed` names a second, independent cause: an unseeded candidate whose only
+remaining route is a full expansion of its identity root.
+
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be

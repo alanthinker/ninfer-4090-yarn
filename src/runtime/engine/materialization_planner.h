@@ -1008,6 +1008,38 @@ private:
         return found == policies.end() ? nullptr : &*found;
     }
 
+    // Indexed owner lookup for the fold's checkpoint loop. The linear `owner_policy_for` made one
+    // assessment cost owners x checkpoints, i.e. catalog-proportional planning cost (measured
+    // ~1.5 ms per assessment at ~3,800 checkpoint rows on 2026-09-21, 5.7 s for 3,700 targets).
+    // The index is rebuilt only when the policy span itself changes, so repeated folds over the
+    // same candidate stay O(checkpoints x log owners).
+    [[nodiscard]] const MaterializationOwnerPolicy*
+    owner_policy_indexed(std::span<const MaterializationOwnerPolicy> policies,
+                         PlanningOwnerId owner) const {
+        if (owner_policy_index_source_ != policies.data() ||
+            owner_policy_index_size_ != policies.size()) {
+            owner_policy_index_.clear();
+            owner_policy_index_.reserve(policies.size());
+            for (const MaterializationOwnerPolicy& policy : policies) {
+                owner_policy_index_.push_back(&policy);
+            }
+            std::sort(owner_policy_index_.begin(), owner_policy_index_.end(),
+                      [](const MaterializationOwnerPolicy* left,
+                         const MaterializationOwnerPolicy* right) {
+                          return left->owner.value < right->owner.value;
+                      });
+            owner_policy_index_source_ = policies.data();
+            owner_policy_index_size_   = policies.size();
+        }
+        const auto found = std::lower_bound(
+            owner_policy_index_.begin(), owner_policy_index_.end(), owner.value,
+            [](const MaterializationOwnerPolicy* entry, std::uint32_t value) {
+                return entry->owner.value < value;
+            });
+        if (found == owner_policy_index_.end() || (*found)->owner != owner) { return nullptr; }
+        return *found;
+    }
+
     [[nodiscard]] static const MaterializationCheckpointPolicy*
     checkpoint_policy_for(std::span<const MaterializationCheckpointPolicy> policies,
                           PlanningOwnerId owner, CheckpointRef checkpoint) noexcept {
@@ -1064,7 +1096,7 @@ private:
 
         for (const PressureOwnerOutcome& outcome : guidance.owner_outcomes) {
             const MaterializationOwnerPolicy* policy =
-                owner_policy_for(owner_policies, outcome.owner);
+                owner_policy_indexed(owner_policies, outcome.owner);
             if (policy == nullptr) {
                 throw std::logic_error("pressure guidance references an unknown logical owner");
             }
@@ -1104,7 +1136,7 @@ private:
 
         for (const PressureOwnerOutcome& outcome : assessment.owner_outcomes) {
             const MaterializationOwnerPolicy* policy =
-                owner_policy_for(owner_policies, outcome.owner);
+                owner_policy_indexed(owner_policies, outcome.owner);
             if (policy == nullptr) {
                 throw std::logic_error("pressure target references an unknown logical owner");
             }
@@ -1131,6 +1163,17 @@ private:
                 throw std::logic_error("pressure recovery impact is duplicated");
             }
         }
+        // Keep the impact rows ordered so the checkpoint loop above/below can binary-search them
+        // instead of scanning once per row.
+        std::sort(impact_scratch_.begin(), impact_scratch_.end(),
+                  [](const CombinedImpact& left, const CombinedImpact& right) {
+                      return std::tuple{left.owner.value,
+                                        static_cast<std::uint8_t>(left.checkpoint.kind),
+                                        left.checkpoint.frontier, left.checkpoint.ordinal} <
+                             std::tuple{right.owner.value,
+                                        static_cast<std::uint8_t>(right.checkpoint.kind),
+                                        right.checkpoint.frontier, right.checkpoint.ordinal};
+                  });
         portfolio_owner_scratch_.clear();
         for (const MaterializationOwnerPolicy& policy : owner_policies) {
             portfolio_owner_scratch_.push_back(ContextPortfolioOwnerPolicy{
@@ -1143,16 +1186,26 @@ private:
         bool portfolio_degraded = false;
         for (const MaterializationCheckpointPolicy& policy : checkpoint_policies) {
             const MaterializationOwnerPolicy* owner =
-                owner_policy_for(owner_policies, policy.owner);
+                owner_policy_indexed(owner_policies, policy.owner);
             if (owner == nullptr) {
                 throw std::logic_error("checkpoint policy has no portfolio owner");
             }
-            const auto impact = std::find_if(
-                impact_scratch_.begin(), impact_scratch_.end(), [&](const CombinedImpact& value) {
-                    return value.owner == policy.owner && value.checkpoint == policy.checkpoint;
+            const auto lookup_key = std::tuple{
+                policy.owner.value, static_cast<std::uint8_t>(policy.checkpoint.kind),
+                policy.checkpoint.frontier, policy.checkpoint.ordinal};
+            const auto impact = std::lower_bound(
+                impact_scratch_.begin(), impact_scratch_.end(), lookup_key,
+                [](const CombinedImpact& value, const auto& key) {
+                    return std::tuple{value.owner.value,
+                                      static_cast<std::uint8_t>(value.checkpoint.kind),
+                                      value.checkpoint.frontier,
+                                      value.checkpoint.ordinal} < key;
                 });
             const std::uint64_t target_recovery =
-                impact == impact_scratch_.end() ? policy.baseline_recovery_ns : impact->target_ns;
+                impact == impact_scratch_.end() || impact->owner != policy.owner ||
+                        impact->checkpoint != policy.checkpoint
+                    ? policy.baseline_recovery_ns
+                    : impact->target_ns;
             portfolio_checkpoint_scratch_.push_back(ContextPortfolioCheckpointValue{
                 .owner                = policy.owner,
                 .demand_mask          = policy.demand_mask,
@@ -1406,6 +1459,10 @@ private:
     std::vector<std::uint8_t> candidate_seed_complete_;
     BoundedTargetLedger target_ledger_;
     std::vector<CombinedImpact> impact_scratch_;
+    // Lookup cache, not planning state: a const planner may refresh it for a new policy span.
+    mutable std::vector<const MaterializationOwnerPolicy*> owner_policy_index_;
+    mutable const void* owner_policy_index_source_ = nullptr;
+    mutable std::size_t owner_policy_index_size_   = 0;
     ContextPortfolioValue portfolio_value_;
     std::vector<ContextPortfolioOwnerPolicy> portfolio_owner_scratch_;
     std::vector<ContextPortfolioCheckpointValue> portfolio_checkpoint_scratch_;

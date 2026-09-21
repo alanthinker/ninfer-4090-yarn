@@ -613,6 +613,14 @@ logical publication 可采用的 targets 之间比较价值。
 
 成本模型不参与容量判定。任何预测误差都只能改变“选择哪个可行方案”，不能让不可行方案通过。
 
+**可行性的 relief 必须与运行时阶梯一致，且只能计入做得到的部分（2026-09-21 补充）。** Program
+的 residual 通过 `state_slot_relief` 抵扣释放阶梯还能腾出的 Device 槽；该计数使用“活跃绑定”
+谓词（空闲 Catalogued 会话保留的锚点是缓存，不是活绑定），并计入阶梯最后一步
+（`retire_oldest_idle_continuation`）一次退休所释放的 Device/Host 槽；而 Host 副本驱逐（②b，
+运行时保留保守谓词）**不**计入，因为运行时做不到的事不能出现在可行性模型里。反向亦然：
+`release_protected_state` 让阶梯在在途物化期间不得回收其 source，否则“计划说无需搬运、执行时
+源已被降级”会让提交失败（实测 500：`Host retained Fork destination was not published`）。
+
 ### 8.2 机器成本
 
 Program 将物理工作折叠为：
@@ -783,6 +791,19 @@ Target budget 同时约束 canonical targets 与 exact assessments。Materializa
 operation 之间检查 wall/value budget；identity assessments 和 root maximal correctness assessment 不计
 optional budget。Shared capture 以固定 target budget 约束工作量，incumbent 始终为 Skip。任何 budget 只影响
 cache quality，不改变 mandatory request readiness。
+
+**单次 expansion 的扇出必须对每个 owner 有界（2026-09-21 补充）。** 旧实现对每个合格 victim 的
+**每个**保留长锚点各生成一个 drop 后继，于是"一次 expansion 的子节点数 = Σ(11 + 锚点数)"：生产
+事故里一次 expansion 就产出 3,698 个 target、吃满 4,096 的 target budget，搜索从未离开第一个邻域
+（规划 5.7 s 落在请求排队里）。现在：端点与 rewrite 后继不变；长锚点只生成**覆盖残留缺口的最小
+贪心前缀**（按释放量降序、frontier 作确定并列，上限 4 个）与一条"丢弃其余全部锚点"的聚合后继。
+更深的保留集合仍可通过后续 expansion 到达，因此该界只限制探索量，不移除可达 post-state。
+
+**定价必须容忍 owner 已被退休（2026-09-21 补充）。** 阶梯最后一步可以在任何时刻退休一个空闲
+owner，而 ResourceManager 的 catalog 视图要等下一次重建才对 齐；此时对该 owner 的检查点定价
+（`checkpoint_recovery_work`）抛出 `runtime::StalePlanningReference`。规划侧把该检查点视为不可用
+（其 saving 已不可实现）而跳过，预留阶段则返回 `MaterializationReserveResult::Stale` 让引擎重新
+规划——这类过期引用不得再变成 HTTP 500。
 
 ### 8.8 目标函数与确定性
 
