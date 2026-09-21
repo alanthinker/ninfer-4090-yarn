@@ -218,6 +218,9 @@ ninfer_add_test(ninfer_http_transport_test
   LIBRARIES ninfer_serve)
 target_include_directories(ninfer_http_transport_test PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
+ninfer_add_test(ninfer_dump_retention_test
+  SOURCES test_dump_retention.cpp
+  LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_bench_support_test
   SOURCES test_ninfer_bench_support.cpp
           ${PROJECT_SOURCE_DIR}/bench/targets/qwen3_6_27b/ninfer_bench_support.cpp

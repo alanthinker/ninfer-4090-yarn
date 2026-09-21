@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -39,6 +40,20 @@ std::string format_seconds(double seconds) {
     return text;
 }
 
+// Days between 1970-01-01 and a proleptic Gregorian date (the civil-date algorithm). Pure
+// arithmetic: no timezone, no locale, no OS tables — the same instant converts identically
+// on any host.
+std::int64_t days_from_civil(std::int64_t year, std::int64_t month, std::int64_t day) noexcept {
+    year -= month <= 2;
+    const std::int64_t era = (year >= 0 ? year : year - 399) / 400;
+    const std::uint32_t yoe = static_cast<std::uint32_t>(year - era * 400);        // [0, 399]
+    const std::uint32_t doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+    const std::uint32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;               // [0, 146096]
+    return era * 146097 + static_cast<std::int64_t>(doe) - 719468;
+}
+
+} // namespace
+
 // Diagnostic-only raw request dump, enabled by NINFER_DUMP_REQUESTS=<dir> (unset by default).
 //
 // Exists because prefix-reuse debugging needs the exact rendered payload: the engine reports how
@@ -52,6 +67,15 @@ std::string format_seconds(double seconds) {
 //   NINFER_DUMP_REQUESTS_MAX_AGE_HOURS   delete bodies older than this (default 24; 0 = no age limit)
 // The directory is pruned on every write, which costs one readdir of a <=limit-entry directory and
 // guarantees the count bound holds at all times.
+//
+// Entries are ordered by capture time, never by request number: the number resets to zero on
+// every process restart, so in a directory that outlives a restart the newest dumps carry the
+// smallest numbers and a number-ordered prune deleted fresh dumps while keeping multi-day-old
+// ones. The time comes from the filename itself — finalized names embed the capture instant in
+// RFC 3339 local form "YYYY-MM-DDTHH:MM:SS±HH:MM" (process-local wall clock plus its explicit
+// UTC offset, so the name is locale-independent and parses to the same instant on any host in
+// any timezone), pending names use the unix-ms capture stamp as their leading number; stat()
+// mtime is only a fallback for names that carry neither.
 //
 // Serving must never be affected: every failure path is swallowed and the directory is resolved
 // once, on first use.
@@ -70,11 +94,13 @@ std::uint64_t read_count_option(const char* name, std::uint64_t fallback) {
 }
 
 // A dump file is named req-<number>-<route>.json. The number is the engine request id after
-// finalization, or the unix-ms timestamp while pending. Anything else in the directory is left
-// alone: the directory belongs to the operator, not to this diagnostic.
+// finalization, or the unix-ms capture timestamp while pending; it is used only as a
+// deterministic tiebreak and as that legacy pending-file time, never as a retention order key
+// (it resets on every process restart). Anything else in the directory is left alone: the
+// directory belongs to the operator, not to this diagnostic.
 struct DumpFile {
     std::int64_t number = 0;
-    std::int64_t mtime_ms = 0;  // file last-modification time (ms since epoch)
+    std::int64_t time_ms = 0;  // capture time (ms since epoch): filename timestamp, else mtime
     std::filesystem::path path;
 };
 
@@ -85,12 +111,96 @@ bool parse_dump_file_name(const std::string& name, DumpFile& out) {
     const char* cursor = name.data() + prefix.size();
     const char* end    = name.data() + name.size() - suffix.size();
     // Format: {number}[-{timestamp}]-{route}
-    // Parse the first number (request sequence or legacy timestamp) as the sort key.
+    // The first number (request sequence, or unix-ms capture stamp for pending files).
     auto result = std::from_chars(cursor, end, out.number);
     if (result.ec != std::errc() || result.ptr == end) { return false; }
     // Expect a dash after the first number (separating it from the route or timestamp).
     if (*result.ptr != '-') { return false; }
     return true;
+}
+
+// Capture time embedded in a dump file name, if any. Every character the names use (digits,
+// '-', 'T', ':', '+') is legal in POSIX file names, so the names round-trip through the file
+// system untouched and this parser is the writer's exact inverse.
+//
+// Finalized names carry the RFC 3339 local form "YYYY-MM-DDTHH:MM:SS±HH:MM" written by
+// format_local_timestamp: the process-local wall clock plus the explicit UTC offset of that
+// instant. The offset makes the conversion pure arithmetic (days_from_civil), so the name
+// parses to the same instant on any host, under any timezone and any locale — no time zone
+// tables, no mktime, no DST ambiguity.
+//
+// Names written by older builds carry a bare "YYYY-MM-DDTHH:MM:SS" segment with no offset
+// (local or UTC): those are read back with mktime under the reader's local timezone, exact
+// when reader and writer share a zone and skewed otherwise. Such files rotate out within a
+// day, so the skew is bounded.
+//
+// Pending names carry no date segment: their leading number is the unix-ms capture stamp.
+std::optional<std::int64_t> parse_dump_file_time(const std::string& name, std::int64_t number) {
+    for (std::size_t i = 0; i + 19 <= name.size(); ++i) {
+        const char* text = name.data() + i;
+        if (text[4] != '-' || text[7] != '-' || text[10] != 'T') { continue; }
+        int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+        if (std::sscanf(text, "%d-%d-%dT%d:%d:%d", &year, &month, &day, &hour, &minute,
+                        &second)
+            != 6) {
+            continue;
+        }
+        if (year < 2000 || year > 2100 || month < 1 || month > 12 || day < 1 || day > 31 ||
+            hour > 23 || minute > 59 || second > 59) {
+            continue;
+        }
+        const std::int64_t civil =
+            days_from_civil(year, month, day) * 86400 +
+            static_cast<std::int64_t>(hour) * 3600 + minute * 60 + second;
+        // Explicit UTC offset (±HH:MM, as format_local_timestamp writes it): timezone-free.
+        if (i + 25 <= name.size() && (text[19] == '+' || text[19] == '-') && text[22] == ':') {
+            int off_hour = 0, off_min = 0;
+            if (std::sscanf(text + 20, "%2d:%d", &off_hour, &off_min) == 2 &&
+                off_hour >= 0 && off_hour <= 14 && off_min >= 0 && off_min < 60) {
+                const std::int64_t offset = (off_hour * 60 + off_min) * 60;
+                return (civil + (text[19] == '-' ? offset : -offset)) * 1000;
+            }
+        }
+        // Legacy bare segment: local wall clock, resolved under the reader's timezone.
+        std::tm parsed{};
+        parsed.tm_year  = year - 1900;
+        parsed.tm_mon   = month - 1;
+        parsed.tm_mday  = day;
+        parsed.tm_hour  = hour;
+        parsed.tm_min   = minute;
+        parsed.tm_sec   = second;
+        parsed.tm_isdst = -1;  // let mktime resolve the DST flag against local rules
+        const std::time_t local = std::mktime(&parsed);
+        if (local < 0) { continue; }
+        return static_cast<std::int64_t>(local) * 1000;
+    }
+    if (number >= 1'000'000'000'000) { return number; }  // pending: unix-ms capture stamp
+    return std::nullopt;
+}
+
+// RFC 3339 local form of the capture instant: "YYYY-MM-DDTHH:MM:SS±HH:MM" in the process's
+// local timezone (e.g. 2026-09-21T17:29:13+08:00). The wall-clock part is what operators on
+// the serving host read at a glance; the explicit offset is what makes the name parse to the
+// same instant on any host, in any timezone or locale. format_local_timestamp and
+// parse_dump_file_time are exact inverses and must stay in lockstep.
+std::string format_local_timestamp(std::int64_t ms) {
+    const std::time_t seconds = static_cast<std::time_t>(ms / 1000);
+    std::tm local{};
+    if (localtime_r(&seconds, &local) == nullptr) { return {}; }
+    std::tm utc{};
+    gmtime_r(&seconds, &utc);
+    const auto civil = [](const std::tm& t) {
+        return days_from_civil(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday) * 86400 +
+               t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec;
+    };
+    const std::int64_t offset = civil(local) - civil(utc);  // seconds east of UTC
+    char buffer[40];
+    const int used = static_cast<int>(
+        std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", &local));
+    const long long east = std::llabs(offset);
+    std::snprintf(buffer + used, sizeof(buffer) - used, "%c%02lld:%02lld",
+                  offset >= 0 ? '+' : '-', east / 3600, east % 3600 / 60);
+    return buffer;
 }
 
 void prune_dump_directory(const std::string& directory, std::int64_t now_ms) {
@@ -109,28 +219,38 @@ void prune_dump_directory(const std::string& directory, std::int64_t now_ms) {
         DumpFile file;
         file.path = entry.path();
         if (parse_dump_file_name(file.path.filename().string(), file)) {
-            // Wall-clock mtime for the age calculation (works for both timestamp-based and
-            // sequence-number-based filenames). std::filesystem::last_write_time must NOT be
-            // used here: since C++20 it is file_clock-based, and libstdc++'s file_clock
-            // epoch is not the Unix epoch, so its time_since_epoch() is incomparable with
-            // the system_clock now_ms and makes every fresh file look "too old" — the
-            // prune then deleted every dump file immediately after it was written.
-            struct stat st{};
-            if (::stat(file.path.c_str(), &st) == 0) {
-                file.mtime_ms = st.st_mtim.tv_sec * 1000 + st.st_mtim.tv_nsec / 1000000;
+            if (const auto named =
+                    parse_dump_file_time(file.path.filename().string(), file.number)) {
+                file.time_ms = *named;
             } else {
-                // Unknown age: treat as fresh instead of deleting it on the spot.
-                file.mtime_ms = now_ms;
+                // The name carries no timestamp: fall back to the mtime. std::filesystem::
+                // last_write_time must NOT be used here: since C++20 it is file_clock-based,
+                // and libstdc++'s file_clock epoch is not the Unix epoch, so its
+                // time_since_epoch() is incomparable with the system_clock now_ms and would
+                // make every fresh file look "too old" — the prune then deleted every dump
+                // file immediately after it was written.
+                struct stat st{};
+                if (::stat(file.path.c_str(), &st) == 0) {
+                    file.time_ms = st.st_mtim.tv_sec * 1000 + st.st_mtim.tv_nsec / 1000000;
+                } else {
+                    // Unknown age: treat as fresh instead of deleting it on the spot.
+                    file.time_ms = now_ms;
+                }
             }
             files.push_back(std::move(file));
         }
     }
+    // Oldest capture first. The filename time is the primary key; the request number is
+    // only a deterministic tiebreak for entries that share a capture instant.
     std::sort(files.begin(), files.end(),
-              [](const DumpFile& left, const DumpFile& right) { return left.number < right.number; });
+              [](const DumpFile& left, const DumpFile& right) {
+                  if (left.time_ms != right.time_ms) { return left.time_ms < right.time_ms; }
+                  return left.number < right.number;
+              });
 
     std::size_t keep_from = 0;
     if (max_age_ms > 0) {
-        while (keep_from < files.size() && now_ms - files[keep_from].mtime_ms > max_age_ms) {
+        while (keep_from < files.size() && now_ms - files[keep_from].time_ms > max_age_ms) {
             ++keep_from;
         }
     }
@@ -179,20 +299,23 @@ void finalize_dump_file(std::int64_t timestamp, std::uint64_t request_id, const 
     try {
         const std::string old_path = directory + "/req-" + std::to_string(timestamp) + "-" +
                                      route + ".json";
-        // Format timestamp as ISO 8601 (YYYY-MM-DDTHH:MM:SS) for human readability.
-        const std::time_t seconds = static_cast<std::time_t>(timestamp / 1000);
-        std::tm tm{};
-        gmtime_r(&seconds, &tm);
-        char date_buf[32];
-        std::strftime(date_buf, sizeof(date_buf), "%Y-%m-%dT%H:%M:%S", &tm);
+        // RFC 3339 local form (YYYY-MM-DDTHH:MM:SS±HH:MM) for human readability: operators
+        // on the serving host read the wall clock at a glance, and the explicit offset keeps
+        // the name unambiguous and locale-independent for the retention parser and for any
+        // other consumer on any host.
+        const std::string stamp = format_local_timestamp(timestamp);
+        if (stamp.empty()) { return; }
         const std::string new_path = directory + "/req-" + std::to_string(request_id) + "-" +
-                                     date_buf + "-" + route + ".json";
+                                     stamp + "-" + route + ".json";
         std::error_code error;
         std::filesystem::rename(old_path, new_path, error);
     } catch (...) {
         // A diagnostic failure must never affect serving.
     }
 }
+
+namespace {
+
 void write_exception(httplib::Response& res, const std::exception& ex) {
     ApiError error;
     error.status  = 500;
