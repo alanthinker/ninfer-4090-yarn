@@ -613,13 +613,18 @@ logical publication 可采用的 targets 之间比较价值。
 
 成本模型不参与容量判定。任何预测误差都只能改变“选择哪个可行方案”，不能让不可行方案通过。
 
-**可行性的 relief 必须与运行时阶梯一致，且只能计入做得到的部分（2026-09-21 补充）。** Program
-的 residual 通过 `state_slot_relief` 抵扣释放阶梯还能腾出的 Device 槽；该计数使用“活跃绑定”
-谓词（空闲 Catalogued 会话保留的锚点是缓存，不是活绑定），并计入阶梯最后一步
-（`retire_oldest_idle_continuation`）一次退休所释放的 Device/Host 槽；而 Host 副本驱逐（②b，
-运行时保留保守谓词）**不**计入，因为运行时做不到的事不能出现在可行性模型里。反向亦然：
-`release_protected_state` 让阶梯在在途物化期间不得回收其 source，否则“计划说无需搬运、执行时
-源已被降级”会让提交失败（实测 500：`Host retained Fork destination was not published`）。
+**可行性的 relief 必须与运行时阶梯一致，且只能计入运行时一定做得到的部分（2026-09-21 定案）。**
+Program 的 residual 抵扣释放阶梯能腾出的槽位：`state_slot_relief` 计 Device 侧（丢弃 Device 副本、
+降级、以及冗余 Host 副本被驱逐后腾出的降级空间），`host_slot_relief` 计 Host 侧（**只**计 Both
+驻留检查点的冗余 Host 副本）。两条约束：
+
+- 计数用“活跃绑定”谓词（空闲 Catalogued 会话保留的锚点是缓存，不是活绑定）；
+- **最后一步的退休不计入**任何 credit：它会让规划器按“能退休会话”排计划，运行时随后销毁活跃引用
+  仍在使用的状态（实测 500：`StateImage handle is stale`）。需要容量的**私有捕获**改为在预留时
+  先回收再重新评估；需要容量的复用/物化则由阶梯在预留处按需释放。
+
+反向亦然：`release_protected_state` 让阶梯在在途物化期间不得回收其 source，否则“计划说无需搬运、
+执行时源已被降级”会让提交失败（实测 500：`Host retained Fork destination was not published`）。
 
 ### 8.2 机器成本
 

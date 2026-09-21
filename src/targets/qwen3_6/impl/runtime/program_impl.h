@@ -6758,48 +6758,12 @@ std::uint32_t ProgramImplCore::host_slot_relief() const noexcept {
     const auto keep_bound = [this](StateImageHandle handle) {
         return release_protected_state && *release_protected_state == handle;
     };
+    // Only redundant (Both-resident) Host replicas are credited. Retirement is NOT credited: a plan
+    // built on capacity that only retirement can deliver is an over-promise, and the runtime then
+    // destroyed owner state a live reference still held ('StateImage handle is stale', 2026-09-21
+    // harness). A private capture that needs capacity reclaims it at reservation time instead, so
+    // the assessment is always made against the pool the ladder has already produced.
     return state_store->count_state_relief(keep_bound).host_evictable;
-}
-
-std::pair<std::uint32_t, std::uint32_t>
-ProgramImplCore::oldest_idle_retirement_relief() const noexcept {
-    if (!state_store) { return {0, 0}; }
-    std::optional<std::uint32_t> oldest;
-    std::uint64_t oldest_age = std::numeric_limits<std::uint64_t>::max();
-    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
-        if (continuation_slots[index].role != ContinuationSlotRole::Catalogued) { continue; }
-        if (!can_release_continuation_slot_strict(index)) { continue; }
-        if (owner_holds_release_protected_state(index)) { continue; }
-        const std::uint64_t age = state_store->last_touched(continuation_states[index].state.read);
-        if (!oldest || age < oldest_age) {
-            oldest     = index;
-            oldest_age = age;
-        }
-    }
-    if (!oldest) { return {0, 0}; }
-    const SequenceState& sequence = continuation_states[*oldest];
-    std::array<StateImageHandle, 128> handles{};
-    std::size_t count = 0;
-    const auto add_handle = [&](std::optional<StateImageHandle> handle) {
-        if (!handle || !handle->valid()) { return; }
-        for (std::size_t index = 0; index < count; ++index) {
-            if (handles[index] == *handle) { return; }
-        }
-        if (count < handles.size()) { handles[count++] = *handle; }
-    };
-    add_handle(sequence.state.read);
-    if (sequence.state.write != sequence.state.read) { add_handle(sequence.state.write); }
-    add_handle(sequence.reserved_state);
-    add_handle(sequence.rewrite_state);
-    for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) { add_handle(anchor.state); }
-    std::uint32_t device = 0;
-    std::uint32_t host   = 0;
-    for (std::size_t index = 0; index < count; ++index) {
-        if (!state_store->valid(handles[index])) { continue; }
-        if (state_store->has_device_replica(handles[index])) { ++device; }
-        if (state_store->has_host_replica(handles[index])) { ++host; }
-    }
-    return {device, host};
 }
 
 bool ProgramImplCore::release_state_capacity_step(const char* site, bool allow_retire) {
@@ -7393,15 +7357,10 @@ ProgramImplCore::state_slot_relief(std::uint32_t planned_host_state_release) con
                    ? std::numeric_limits<std::uint32_t>::max()
                    : a + b;
     };
-    // NOTE (2026-09-21): crediting the ladder's final retirement step here
-    // (`oldest_idle_retirement_relief`) was implemented and reverted. It made the planner offer a
-    // Host-resident reuse it had previously rejected with `state add=1 used=4 cap=4`, and the
-    // runtime then failed the request with HTTP 500 "Host retained Fork destination was not
-    // published": when the destination reservation is satisfied through the release ladder, a
-    // HostOnly retained source is never published as ActiveMutable before the commit check
-    // (program_impl.h, "Host retained Fork destination was not published"). Fixing that restore
-    // path is the prerequisite for crediting retirement relief; until then the credit would trade
-    // a slow-but-correct cold prefill for a failed request.
+    // Retirement is deliberately NOT credited (see host_slot_relief and storage doc 4.2): a plan
+    // built on capacity only retirement can deliver is an over-promise, and the runtime then
+    // destroyed state a live reference still held. A private capture that needs capacity reclaims
+    // it at reservation time instead, so every assessment sees the pool the ladder produced.
     // Retirement is deliberately NOT credited. Crediting the ladder's last step (retire the oldest
     // idle continuation) made the planner plan around capacity only that step can deliver; the
     // runtime then retired an idle session on nearly every request, and retention collapsed from
@@ -8434,12 +8393,27 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
-    const CaptureAssessment assessment = inspect_capture(
+    CaptureAssessment assessment = inspect_capture(
         offer, exact_shared, replacement, private_replacement, permit_shared_publication);
     if (!assessment.publishes_private && !assessment.publishes_shared) {
         log_capture_decision("skip", assessment.frontier, "no-publication", {});
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
+    }
+    // A capture that publishes the request's OWN private checkpoint is the private-only baseline;
+    // scheduling doc 6.2 keeps it executable whatever the shared option decides, so a pinned-full
+    // pool must reclaim capacity for it instead of skipping the newest request's cache (2026-09-21:
+    // at host 320/320 and device 8/8 the newest request published no anchor, and every later
+    // sibling message then cold-prefilled at 0%). Reclaim through the release ladder and assess
+    // again, so the decision is always made against the pool the ladder actually produced: a plan
+    // built on crediting retirement instead destroyed state a live reference still held.
+    if (!pressure.has_value() && !assessment.physically_feasible && assessment.publishes_private) {
+        for (std::uint32_t attempt = 0; attempt < 4U; ++attempt) {
+            if (!release_state_capacity_step("capture-reclaim", /*allow_retire=*/true)) { break; }
+            assessment = inspect_capture(offer, exact_shared, replacement, private_replacement,
+                                        permit_shared_publication);
+            if (assessment.physically_feasible) { break; }
+        }
     }
     const CapturePressureCandidateImpl* pressure_details =
         pressure && pressure->impl_ ? pressure->impl_.get() : nullptr;

@@ -262,7 +262,12 @@ public:
             const Object& obj = objects_[i];
             if (obj.role != StateImageRole::CheckpointImmutable) { continue; }
             if (kind == SlotReleaseKind::EvictHostReplica) {
-                if (!obj.host_slot) { continue; }
+                // Only a REDUNDANT Host replica may be dropped: the checkpoint must keep its Device
+                // replica, or it would end with no published replica at all while its owner still
+                // references it ('checkpoint StateImage has no published replica', 2026-09-21).
+                // Freeing the last replica of a HostOnly checkpoint is the retirement step's job,
+                // which retires the owner and its states together.
+                if (!obj.host_slot || !obj.device_slot) { continue; }
             } else {
                 if (!obj.device_slot) { continue; }
                 if (kind == SlotReleaseKind::DropDeviceReplica && !obj.host_slot) { continue; }
@@ -289,9 +294,10 @@ public:
     // How many StateImage slots the capacity-release ladder can still free, by mechanism.
     // `drop_device_replica`: Both-resident checkpoints whose Device slot frees without any Host
     // capacity. `demote_candidates`: DeviceOnly checkpoints, each of which needs one free Host
-    // slot to demote. `host_evictable`: Host replicas the EvictHostReplica step can drop (pinned
-    // or not) to create Host capacity. All counts honor the veto callback, so states bound to a
-    // live sequence are never counted. A null Host pool means no Host-side mechanism is available.
+    // slot to demote. `host_evictable`: REDUNDANT Host replicas (Both-resident checkpoints) the
+    // EvictHostReplica step can drop to create Host capacity; a HostOnly checkpoint is never
+    // counted, because dropping its only replica would leave the checkpoint unpublished. All
+    // counts honor the veto callback. A null Host pool means no Host-side mechanism is available.
     struct StateReliefCounts {
         std::uint32_t drop_device_replica = 0;
         std::uint32_t demote_candidates   = 0;
@@ -309,7 +315,7 @@ public:
                 continue;
             }
             if (veto(StateImageHandle(this, i, obj.generation))) { continue; }
-            if (obj.host_slot) { ++counts.host_evictable; }
+            if (obj.host_slot && obj.device_slot) { ++counts.host_evictable; }
             if (obj.device_slot) {
                 if (obj.host_slot) {
                     ++counts.drop_device_replica;
@@ -476,8 +482,9 @@ public:
         if (!valid(handle)) { return false; }
         Object& object = objects_[handle.index_];
         if (host_ == nullptr || object.role != StateImageRole::CheckpointImmutable ||
-            !object.host_slot || object.source_pins != 0 || object.destination_pinned ||
-            has_pending_replica(object) || !host_->release(*object.host_slot)) {
+            !object.host_slot || !object.device_slot || object.source_pins != 0 ||
+            object.destination_pinned || has_pending_replica(object) ||
+            !host_->release(*object.host_slot)) {
             return false;
         }
         std::fprintf(stderr,

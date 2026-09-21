@@ -629,14 +629,17 @@ public:
             }
         }
         if (exact_shared != nullptr) {
-            if (!private_baseline.publishes_private || !private_baseline.physically_feasible) {
+            if (!private_baseline.publishes_private) {
                 std::fprintf(stderr,
-                             "capture: skip reason=exact-resident-baseline-infeasible frontier=%u "
-                             "private=%d feasible=%d\n",
-                             private_baseline.frontier, private_baseline.publishes_private ? 1 : 0,
-                             private_baseline.physically_feasible ? 1 : 0);
+                             "capture: skip reason=exact-resident-no-private-baseline frontier=%u\n",
+                             private_baseline.frontier);
                 program.skip_capture(std::move(offer));
                 return ActiveCaptureReserveResult::Skipped;
+            }
+            if (!private_baseline.physically_feasible) {
+                std::fprintf(stderr,
+                             "capture: retry frontier=%u reason=exact-resident-baseline-infeasible\n",
+                             private_baseline.frontier);
             }
             transaction_.template emplace<ActiveCaptureRecord>(ActiveCaptureRecord{
                 .lane              = lane,
@@ -898,14 +901,22 @@ public:
         }
 
         if (!selected) {
-            if (!private_baseline.publishes_private || !private_baseline.physically_feasible) {
+            if (!private_baseline.publishes_private) {
                 std::fprintf(stderr,
-                             "capture: skip reason=pressure-baseline-infeasible frontier=%u "
-                             "private=%d feasible=%d\n",
-                             private_baseline.frontier, private_baseline.publishes_private ? 1 : 0,
-                             private_baseline.physically_feasible ? 1 : 0);
+                             "capture: skip reason=pressure-no-private-baseline frontier=%u\n",
+                             private_baseline.frontier);
                 program.skip_capture(std::move(offer));
                 return ActiveCaptureReserveResult::Skipped;
+            }
+            if (!private_baseline.physically_feasible) {
+                // The private baseline is the request's OWN checkpoint (scheduling doc 6.2), so a
+                // static capacity rejection is not final: the Program reclaims capacity at
+                // reservation time (demote a replica, reclaim a redundant Host replica, retire an
+                // idle session) and re-assesses. It skips the capture itself when it still cannot
+                // be placed, so this cannot fail the request.
+                std::fprintf(stderr,
+                             "capture: retry frontier=%u reason=private-baseline-infeasible\n",
+                             private_baseline.frontier);
             }
             // No shared scenario reached a strictly positive net gain, so only the private
             // baseline publishes. Per §6.2 this is the documented outcome, but it is the

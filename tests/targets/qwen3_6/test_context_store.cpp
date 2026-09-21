@@ -244,8 +244,9 @@ void test_state_relief_selectors(ninfer::DeviceContext& device) {
     const store::StateImageStore::StateReliefCounts counts =
         images.count_state_relief(accept_all);
     expect(counts.demote_candidates == 1 && counts.drop_device_replica == 1 &&
-               counts.host_evictable == 2,
-           "relief counts every reclaimable replica by kind");
+               counts.host_evictable == 1,
+           "relief counts every reclaimable replica by kind; only a REDUNDANT Host replica "
+           "(Both-resident) is host-evictable, never a HostOnly checkpoint's only replica");
     const store::StateImageStore::StateReliefCounts rejected =
         images.count_state_relief(reject_all);
     expect(rejected.demote_candidates == 0 && rejected.drop_device_replica == 0 &&
@@ -271,6 +272,17 @@ void test_state_relief_selectors(ninfer::DeviceContext& device) {
             store::StateImageStore::SlotReleaseKind::DropDeviceReplica, accept_all);
     expect(replica_victim.has_value() && *replica_victim == *both,
            "replica drop selects the Both-resident checkpoint");
+    const std::optional<store::StateImageHandle> host_victim =
+        images.select_slot_release_victim(
+            store::StateImageStore::SlotReleaseKind::EvictHostReplica, accept_all);
+    expect(host_victim.has_value() && *host_victim == *both,
+           "Host-replica eviction never takes a HostOnly checkpoint's only replica");
+    expect(images.evict_host_replica(*both), "a redundant Host replica is droppable");
+    expect(!images.evict_host_replica(*host_only),
+           "the only replica of a HostOnly checkpoint is not droppable");
+    expect(images.residency(*both) == store::StateReplicaResidency::DeviceOnly &&
+               images.valid(*both),
+           "dropping the redundant Host replica leaves the checkpoint published on Device");
 }
 
 void test_kv_store(ninfer::DeviceContext& device) {
