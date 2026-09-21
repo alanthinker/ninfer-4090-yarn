@@ -167,6 +167,112 @@ void test_state_store(ninfer::DeviceContext& device) {
            "State Host/Device replica ownership closes without leaked slots");
 }
 
+// The capacity-release ladder selects victims from the store by a caller-supplied predicate, and
+// the planner's relief credit counts the same objects with the same predicate. Both must follow the
+// predicate exactly: on 2026-09-21 the program passed the conservative live-binding veto to the
+// *demotion* step, which rejected every idle owner's retained checkpoint (a Catalogued
+// continuation still lists its anchors), so no demotion victim existed, the ladder retired a whole
+// session instead, and retention collapsed from ~320 to ~29 states. The store itself must never
+// reject a demotion candidate for holding checkpoint references -- only the caller's predicate
+// decides.
+void test_state_relief_selectors(ninfer::DeviceContext& device) {
+    q36::StateImageSpec spec{
+        .linear =
+            {
+                .layers         = 1,
+                .conv_channels  = 8,
+                .conv_width     = 3,
+                .value_heads    = 2,
+                .value_head_dim = 4,
+                .key_head_dim   = 4,
+                .slot_count     = 4,
+                .conv_dtype     = ninfer::DType::BF16,
+            },
+        .hidden = 8,
+        .dflash_local =
+            q36::DFlashLocalStateSpec{.layers = 1, .capacity = 8, .kv_heads = 2, .head_dim = 4},
+    };
+    ninfer::LayoutBuilder builder;
+    const q36::StateImageDeviceLayout layout = q36::plan_state_image_device_pool(builder, spec);
+    ninfer::DeviceArena arena(builder.finish(256));
+    q36::StateImageDevicePool physical({arena.base(), arena.capacity()}, layout);
+    q36::HostStatePool host(layout.host, 4);
+    store::StateImageStore images(
+        physical, &host, static_cast<std::uint32_t>(physical.slot_count()) + host.capacity());
+
+    const auto accept_all = [](store::StateImageHandle) { return false; };
+    const auto reject_all = [](store::StateImageHandle) { return true; };
+
+    // DeviceOnly checkpoint (the shape an idle owner's long anchor has after a capture).
+    const auto device_only = images.reserve_reset(device.stream);
+    expect(device_only.has_value(), "device-only state allocation");
+    images.freeze(*device_only);
+    images.retain_checkpoint_reference(*device_only);
+    expect(images.residency(*device_only) == store::StateReplicaResidency::DeviceOnly,
+           "captured checkpoint starts DeviceOnly");
+
+    // Both-resident checkpoint: demotion publishes a Host replica and keeps the Device one.
+    const auto both = images.reserve_reset(device.stream);
+    expect(both.has_value(), "both-resident state allocation");
+    images.freeze(*both);
+    {
+        std::optional<store::StateImageTransfer> transfer =
+            images.begin_device_to_host(*both, device.stream);
+        expect(transfer.has_value(), "both-resident demotion stages");
+        device.synchronize();
+        images.publish_transfer(std::move(*transfer), true);
+    }
+    expect(images.residency(*both) == store::StateReplicaResidency::Both,
+           "published demotion keeps both replicas");
+
+    // HostOnly checkpoint: demotion drops the Device replica.
+    const auto host_only = images.reserve_reset(device.stream);
+    expect(host_only.has_value(), "host-only state allocation");
+    images.freeze(*host_only);
+    {
+        std::optional<store::StateImageTransfer> transfer =
+            images.begin_device_to_host(*host_only, device.stream);
+        expect(transfer.has_value(), "host-only demotion stages");
+        device.synchronize();
+        images.publish_transfer(std::move(*transfer), false);
+    }
+    expect(images.residency(*host_only) == store::StateReplicaResidency::HostOnly,
+           "published demotion drops the Device replica");
+
+    // Relief accounting: one demotion candidate (DeviceOnly), one occupied Host replica that can
+    // be evicted, one Both-resident checkpoint whose Device replica can be dropped for free.
+    const store::StateImageStore::StateReliefCounts counts =
+        images.count_state_relief(accept_all);
+    expect(counts.demote_candidates == 1 && counts.drop_device_replica == 1 &&
+               counts.host_evictable == 2,
+           "relief counts every reclaimable replica by kind");
+    const store::StateImageStore::StateReliefCounts rejected =
+        images.count_state_relief(reject_all);
+    expect(rejected.demote_candidates == 0 && rejected.drop_device_replica == 0 &&
+               rejected.host_evictable == 0,
+           "relief honours the caller's veto exactly");
+
+    // Victim selection: the demotion step must find the DeviceOnly checkpoint even though it holds
+    // a checkpoint reference.
+    const std::optional<store::StateImageHandle> demote_victim =
+        images.select_slot_release_victim(store::StateImageStore::SlotReleaseKind::CopyToHost,
+                                          accept_all);
+    expect(demote_victim.has_value() && *demote_victim == *device_only,
+           "demotion selects the DeviceOnly checkpoint regardless of its references");
+    expect(!images
+                .select_slot_release_victim(store::StateImageStore::SlotReleaseKind::CopyToHost,
+                                            [&](store::StateImageHandle handle) {
+                                                return handle == *device_only;
+                                            })
+                .has_value(),
+           "demotion honours a veto that excludes the only candidate");
+    const std::optional<store::StateImageHandle> replica_victim =
+        images.select_slot_release_victim(
+            store::StateImageStore::SlotReleaseKind::DropDeviceReplica, accept_all);
+    expect(replica_victim.has_value() && *replica_victim == *both,
+           "replica drop selects the Both-resident checkpoint");
+}
+
 void test_kv_store(ninfer::DeviceContext& device) {
     ninfer::LayoutBuilder builder;
     ninfer::DeviceKVPagePoolSpec page_spec{
@@ -604,6 +710,7 @@ int main() {
     try {
         ninfer::DeviceContext device(0);
         test_state_store(device);
+        test_state_relief_selectors(device);
         test_kv_store(device);
         device.synchronize();
     } catch (const std::exception& error) {
