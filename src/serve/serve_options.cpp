@@ -1,6 +1,8 @@
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
 
+#include <cstdio>
+
 #include <algorithm>
 
 #include <cerrno>
@@ -84,6 +86,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] [--auto-long-anchors N] "
             "[--fair-share-buckets N] "
+           "[--prefix-checkpoint-policy stable-turn|rolling-tool] "
+           "[--continuation-cache off|l1|l1-l2|l1-l2-l3] (Tensorninja compatibility aliases) "
            "[--auto-anchor-spacing N] [--first-anchor-spacing N] "
            "[--request-log-jsonl FILE] [--slot-save-path DIR] [--auto-save-evicted] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
@@ -146,6 +150,10 @@ std::string serve_usage_text(const char* argv0) {
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
            "--host-kv-mib uses MiB\n"
+           "       Tensorninja compatibility: --prefix-checkpoint-policy rolling-tool maps to "
+           "--auto-long-anchors 2; --continuation-cache l1-l2-l3 runs the device+host cache "
+           "(this build has no disk tier); other --continuation-cache-* values are accepted "
+           "and ignored (l2-mib maps to --host-kv-mib)\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --default-reasoning-effort low|medium|xhigh is the level a request gets when it "
@@ -167,6 +175,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     ServeOptions options;
     options.startup_argv.reserve(static_cast<std::size_t>(argc));
     bool redact_next = false;
+    bool compat_aliases_seen = false; // a Tensorninja-spelled flag was accepted
     for (int i = 0; i < argc; ++i) {
         if (redact_next) {
             options.startup_argv.emplace_back("<redacted>");
@@ -419,9 +428,75 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                       "rope-scaling-original-context"));
         } else if (arg == "--log-level") {
             options.log_level = product::parse_log_level(require_value("--log-level"));
+            // Tensorninja CLI compatibility aliases: existing launch scripts pass these
+            // spellings. Where this build has a different mechanism, map to the closest
+            // equivalent and note it on stderr; where nothing exists (disk L3 tier), the
+            // value is accepted and ignored so the command line keeps working.
+        } else if (arg == "--prefix-checkpoint-policy") {
+            const std::string value = require_value("--prefix-checkpoint-policy");
+            if (value != "stable-turn" && value != "rolling-tool") {
+                throw std::invalid_argument("invalid prefix-checkpoint-policy: " + value);
+            }
+            // This build has no per-turn checkpoint ring: per-sequence long anchors cover
+            // the same mid-history divergence. rolling-tool anchors at recent message
+            // boundaries, which is what rolling tool checkpoints approximate.
+            if (value == "rolling-tool" && !options.auto_long_anchors.has_value()) {
+                options.auto_long_anchors = 2;
+                std::fprintf(stderr,
+                             "note: --prefix-checkpoint-policy rolling-tool maps to "
+                             "--auto-long-anchors 2 on this build\n");
+            }
+            compat_aliases_seen = true;
+        } else if (arg == "--continuation-cache") {
+            const std::string value = require_value("--continuation-cache");
+            if (value == "off") {
+                options.allow_prefix_reuse = false;
+            } else if (value == "l1") {
+                // Device tier only: drop the host tiers.
+                options.context_cache.host_state_slots       = 0;
+                options.context_cache.host_kv_capacity_bytes = 0;
+                context_capacity_explicit                    = true;
+            } else if (value == "l1-l2") {
+                // Device + host tiers: this build's default context cache. Nothing to do.
+            } else if (value == "l1-l2-l3") {
+                std::fprintf(stderr,
+                             "note: --continuation-cache l1-l2-l3: this build has no disk "
+                             "(L3) tier; running l1-l2, cross-restart state via "
+                             "--slot-save-path\n");
+            } else {
+                throw std::invalid_argument("invalid continuation-cache: " + value);
+            }
+            compat_aliases_seen = true;
+        } else if (arg == "--continuation-cache-policy") {
+            (void)require_value(arg.c_str()); // adaptive sizing: accepted, no equivalent
+        } else if (arg == "--continuation-cache-dir" || arg == "--continuation-cache-namespace") {
+            (void)require_value(arg.c_str()); // disk tier has no equivalent here
+        } else if (arg == "--continuation-cache-l1-mib") {
+            (void)require_value(arg.c_str()); // device pool auto-sizes from free VRAM
+        } else if (arg == "--continuation-cache-l2-mib") {
+            const std::uint64_t mib = parse_u64(require_value(arg.c_str()), "l2-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--continuation-cache-l2-mib is out of range");
+            }
+            options.context_cache.host_kv_capacity_bytes = static_cast<std::size_t>(mib << 20);
+            context_capacity_explicit                    = true;
+        } else if (arg == "--continuation-cache-l3-mib" ||
+                   arg == "--continuation-cache-filesystem-reserve-mib" ||
+                   arg == "--continuation-cache-l1-idle-seconds" ||
+                   arg == "--continuation-cache-l2-idle-seconds" ||
+                   arg == "--continuation-cache-l3-ttl-seconds" ||
+                   arg == "--continuation-cache-persist-interval-seconds" ||
+                   arg == "--continuation-cache-persist-min-tokens") {
+            (void)require_value(arg.c_str()); // disk-tier tuning: accepted, ignored
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }
+    }
+    if (compat_aliases_seen) {
+        std::fprintf(stderr,
+                     "note: Tensorninja-spelled flags accepted "
+                     "(--prefix-checkpoint-policy / --continuation-cache*); behavior maps to "
+                     "this build's long-anchor and device/host context cache\n");
     }
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
