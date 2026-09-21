@@ -11,13 +11,12 @@
 namespace ninfer::ops::detail {
 namespace {
 
-// Past this many blocks the gated epilogue gives up its hoisted loads. Below one block per SM the
-// prefetch is the only source of overlap and those kernels run at 0.83x to 0.96x; above it a
-// second resident block already supplies that overlap and only the register cost is left (35 -> 50
-// on the warp kernel), which measures 1.02x to 1.14x. Swept over grid size on both gated shapes
-// the crossing sits between 176 and 192 blocks; this is the 170 SMs of this part, a literal
-// because nothing in the tree queries the device, so it is not portable.
-constexpr std::int64_t kRmsPrefetchBlocks = 170;
+// Past this many blocks the gated epilogue gives up its hoisted loads. Below roughly one block
+// per SM the prefetch is the only source of overlap and those kernels run at 0.83x to 0.96x;
+// above it a second resident block already supplies that overlap and only the register cost is
+// left (35 -> 50 on the warp kernel), which measures 1.02x to 1.14x. Swept over grid size on
+// both gated shapes the crossing sat near one live SM per block, so the threshold is the device
+// SM count rather than a per-part literal.
 
 template <RmsEpilogue Epilogue>
 void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tensor& out,
@@ -50,7 +49,7 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
         constexpr int kWarpsPerBlock = kBlock / kWarpSize;
         const auto blocks = static_cast<unsigned int>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
         if constexpr (kGateOnGrid) {
-            if (blocks > kRmsPrefetchBlocks) {
+            if (static_cast<std::int64_t>(blocks) > device_sm_count()) {
                 rmsnorm_warp_bf16x2_kernel<Epilogue, kBlock, false><<<blocks, kBlock, 0, stream>>>(
                     reinterpret_cast<const __nv_bfloat162*>(x_bf16),
                     reinterpret_cast<const __nv_bfloat162*>(w_bf16),
@@ -83,7 +82,7 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
                 reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
     } else if (aligned2 && d > 3072 && d <= 8192 && d % 1024 == 0) {
         if constexpr (kGateOnGrid) {
-            if (rows > kRmsPrefetchBlocks) {
+            if (rows > device_sm_count()) {
                 rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 8, false>
                     <<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
                         reinterpret_cast<const __nv_bfloat162*>(x_bf16),
