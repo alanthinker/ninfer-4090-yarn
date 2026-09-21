@@ -144,6 +144,12 @@ public:
         return host_ == nullptr ? 0U : host_->occupied();
     }
 
+    [[nodiscard]] std::uint32_t device_free() const noexcept { return free_device_count_; }
+
+    [[nodiscard]] std::uint32_t host_free() const noexcept {
+        return host_ == nullptr ? 0U : host_->capacity() - host_->occupied();
+    }
+
     [[nodiscard]] std::optional<StateImageHandle> reserve_destination() noexcept {
         return allocate(StateImageRole::ReservedDestination, true);
     }
@@ -317,6 +323,10 @@ public:
 
     [[nodiscard]] std::uint32_t source_pins(StateImageHandle handle) const {
         return require(handle).source_pins;
+    }
+
+    [[nodiscard]] bool destination_pinned(StateImageHandle handle) const {
+        return valid(handle) && require(handle).destination_pinned;
     }
 
     // Replica residency, for callers that price what a release step would free (the planner's

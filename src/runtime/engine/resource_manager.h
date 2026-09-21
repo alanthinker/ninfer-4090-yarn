@@ -2397,18 +2397,19 @@ private:
                     .private_retention_weight = 0,
                     .explicit_shared_credit   = entry.explicit_credit,
                 });
+                const std::optional<std::uint64_t> baseline = try_price_checkpoint_recovery(
+                    program, *entry.handle, entry.summary.checkpoint.ref);
+                if (!baseline) { continue; }
                 checkpoint_policies.push_back(MaterializationCheckpointPolicy{
-                    .owner              = owner,
-                    .checkpoint         = entry.summary.checkpoint.ref,
-                    .retention_class    = RetentionClass::SharedStable,
-                    .selected_hit_count = entry.observation.selected_hit_count,
-                    .last_hit_epoch     = entry.observation.last_hit_epoch,
+                    .owner                = owner,
+                    .checkpoint           = entry.summary.checkpoint.ref,
+                    .retention_class      = RetentionClass::SharedStable,
+                    .selected_hit_count   = entry.observation.selected_hit_count,
+                    .last_hit_epoch       = entry.observation.last_hit_epoch,
                     .demand_mask =
                         demand_mask_for(entry.summary.checkpoint.shortlist_key, provisional_demand),
-                    .rebuild_ns = cost_model_.prefill_ns(entry.summary.checkpoint.rebuild_work),
-                    .baseline_recovery_ns = price_checkpoint_recovery_work(
-                        cost_model_, program.checkpoint_recovery_work(
-                                         *entry.handle, entry.summary.checkpoint.ref)),
+                    .rebuild_ns           = cost_model_.prefill_ns(entry.summary.checkpoint.rebuild_work),
+                    .baseline_recovery_ns = *baseline,
                 });
             }
 

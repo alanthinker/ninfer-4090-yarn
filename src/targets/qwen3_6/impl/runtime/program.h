@@ -1240,12 +1240,15 @@ private:
     // One step of Device/Host StateImage capacity release, least destructive first: demote a
     // retained state to Host, then retire the oldest idle continuation. Returns false when no
     // further step can free anything.
-    [[nodiscard]] bool release_state_capacity_step();
+    [[nodiscard]] bool release_state_capacity_step(const char* site = "unknown",
+                                                   bool allow_retire = true);
     // Reserve a private StateImage destination, releasing capacity step by step until it succeeds.
-    [[nodiscard]] std::optional<StateImageHandle> reserve_state_destination_with_release();
+    [[nodiscard]] std::optional<StateImageHandle>
+    reserve_state_destination_with_release(bool allow_retire = true);
     // The same, for a logical (Host-replica) destination, which consumes a StateImage object but no
     // Device slot.
-    [[nodiscard]] std::optional<StateImageHandle> reserve_logical_destination_with_release();
+    [[nodiscard]] std::optional<StateImageHandle>
+    reserve_logical_destination_with_release(bool allow_retire = true);
     void release_continuation_slot_strict(std::uint32_t index) noexcept;
     void release_continuation_slot_best_effort(std::uint32_t index) noexcept;
     void retire_continuation_slot(std::uint32_t index) noexcept;

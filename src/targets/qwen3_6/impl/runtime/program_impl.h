@@ -5182,7 +5182,7 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
             // When Host cannot take the replica either, the oldest idle continuation is dropped.
             if (!attempt_restore()) {
                 for (;;) {
-                    if (!release_state_capacity_step()) { break; }
+                    if (!release_state_capacity_step("state-restore")) { break; }
                     if (attempt_restore()) { break; }
                 }
             }
@@ -5841,7 +5841,18 @@ void ProgramImplCore::prepare_pressure_work(MaterializationTransaction::Pressure
                 if (auto staged = state_store->begin_device_to_host(*source, device.transfer_stream)) {
                     return staged;
                 }
-                if (!release_state_capacity_step()) { return std::nullopt; }
+                std::fprintf(stderr,
+                             "[ladder] pressure demote unstaged handle=%u role=%d dev=%d host=%d "
+                             "pins=%u refs=%u dst_pinned=%d host_occupied=%u host_free=%u\n",
+                             state_store->debug_index(*source),
+                             static_cast<int>(state_store->role(*source)),
+                             state_store->has_device_replica(*source) ? 1 : 0,
+                             state_store->has_host_replica(*source) ? 1 : 0,
+                             state_store->source_pins(*source),
+                             state_store->checkpoint_references(*source),
+                             state_store->destination_pinned(*source) ? 1 : 0,
+                             state_store->host_occupied(), state_store->host_free());
+                if (!release_state_capacity_step("capture-destination")) { return std::nullopt; }
                 return state_store->begin_device_to_host(*source, device.transfer_stream);
             };
             std::optional<StateImageTransfer> transfer = begin_demotion();
@@ -6779,9 +6790,21 @@ ProgramImplCore::oldest_idle_retirement_relief() const noexcept {
     return {device, host};
 }
 
-bool ProgramImplCore::release_state_capacity_step() {
+bool ProgramImplCore::release_state_capacity_step(const char* site, bool allow_retire) {
     if (release_one_device_state_slot()) { return true; }
-    return retire_oldest_idle_continuation();
+    if (!allow_retire) {
+        std::fprintf(stderr, "[ladder] no non-destructive capacity site=%s\n", site);
+        return false;
+    }
+    // Last resort: destroying an idle session's cache. Log the entry point and the Device-slot
+    // occupancy so a retention collapse is attributable (2026-09-21: a veto regression made every
+    // demotion ineligible and this step ran on nearly every request, dropping retention from ~320
+    // retained states to ~29).
+    const bool retired = retire_oldest_idle_continuation();
+    std::fprintf(stderr, "[ladder] retire site=%s ok=%d device=%u/%u\n", site, retired ? 1 : 0,
+                 state_store ? state_store->device_occupied() : 0,
+                 state_store ? state_store->device_capacity() : 0);
+    return retired;
 }
 
 bool ProgramImplCore::owner_holds_release_protected_state(std::uint32_t index) const {
@@ -6803,23 +6826,29 @@ bool ProgramImplCore::owner_holds_release_protected_state(std::uint32_t index) c
                        });
 }
 
-std::optional<StateImageHandle> ProgramImplCore::reserve_state_destination_with_release() {
+std::optional<StateImageHandle>
+ProgramImplCore::reserve_state_destination_with_release(bool allow_retire) {
     // Each step either frees something or reports that nothing more can be freed, so the loop is
     // bounded by the number of releasable entries rather than by an arbitrary retry count.
     for (;;) {
         std::optional<StateImageHandle> state = state_store->reserve_destination();
         if (state) { return state; }
-        if (!release_state_capacity_step()) { return state_store->reserve_destination(); }
+        if (!release_state_capacity_step("state-destination", allow_retire)) {
+            return state_store->reserve_destination();
+        }
     }
 }
 
-std::optional<StateImageHandle> ProgramImplCore::reserve_logical_destination_with_release() {
+std::optional<StateImageHandle>
+ProgramImplCore::reserve_logical_destination_with_release(bool allow_retire) {
     // A logical (Host-replica) destination consumes a StateImage object but no Device slot, so it
     // releases capacity the same way and for the same reason.
     for (;;) {
         std::optional<StateImageHandle> state = state_store->reserve_logical_destination();
         if (state) { return state; }
-        if (!release_state_capacity_step()) { return state_store->reserve_logical_destination(); }
+        if (!release_state_capacity_step("logical-destination", allow_retire)) {
+            return state_store->reserve_logical_destination();
+        }
     }
 }
 
@@ -7254,14 +7283,34 @@ bool ProgramImplCore::release_one_device_state_slot() {
     if (const std::optional<StateImageHandle> victim = state_store->select_slot_release_victim(
             StateImageStore::SlotReleaseKind::DropDeviceReplica, keep_all)) {
         if (state_store->drop_device_replica(*victim)) { return true; }
+        std::fprintf(stderr, "[ladder] drop_device_replica failed handle=%u\n",
+                     state_store->debug_index(*victim));
     }
     const auto demote_one = [&]() {
+        // Demotion is non-destructive (the state keeps its Host replica), so it must NOT apply the
+        // conservative live-binding veto: an idle (Catalogued) owner's retained anchors still
+        // appear in its `long_anchors` list, and vetoing them made every device slot unreleasable.
+        // The ladder then fell through to retiring a whole idle session on nearly every request,
+        // and retention collapsed from ~320 retained states to ~29 (2026-09-21 fill). Only the
+        // in-flight reservation's own source stays protected here.
         const std::optional<StateImageHandle> victim = state_store->select_slot_release_victim(
-            StateImageStore::SlotReleaseKind::CopyToHost, keep_live_states);
+            StateImageStore::SlotReleaseKind::CopyToHost, keep_all);
         if (!victim) { return false; }
         std::optional<StateImageTransfer> transfer =
             state_store->begin_device_to_host(*victim, device.transfer_stream);
-        if (!transfer) { return false; }
+        if (!transfer) {
+            std::fprintf(stderr,
+                         "[ladder] demote begin failed handle=%u dev=%d host=%d pins=%u refs=%u "
+                         "occupied_host=%u free_host_slots=%u\n",
+                         state_store->debug_index(*victim),
+                         state_store->has_device_replica(*victim) ? 1 : 0,
+                         state_store->has_host_replica(*victim) ? 1 : 0,
+                         state_store->source_pins(*victim),
+                         state_store->checkpoint_references(*victim),
+                         state_store->host_occupied(),
+                         state_store->host_free());
+            return false;
+        }
         // The Device slot is reusable only after the copy has read it.
         if (device.transfer_stream != nullptr) {
             (void)cudaStreamSynchronize(device.transfer_stream);
@@ -7339,11 +7388,14 @@ ProgramImplCore::state_slot_relief(std::uint32_t planned_host_state_release) con
     // (program_impl.h, "Host retained Fork destination was not published"). Fixing that restore
     // path is the prerequisite for crediting retirement relief; until then the credit would trade
     // a slow-but-correct cold prefill for a failed request.
-    const auto [retire_device, retire_host] = oldest_idle_retirement_relief();
+    // Retirement is deliberately NOT credited. Crediting the ladder's last step (retire the oldest
+    // idle continuation) made the planner plan around capacity only that step can deliver; the
+    // runtime then retired an idle session on nearly every request, and retention collapsed from
+    // ~320 retained states to ~29 during a 2026-09-21 fill (20 retirements in 12 requests). The
+    // non-destructive steps below are enough for the reuse the incident needed.
     const std::uint32_t host_budget =
-        sat_u32(sat_u32(free_host, planned_host_state_release),
-                sat_u32(counts.host_evictable, retire_host));
-    return sat_u32(sat_u32(counts.drop_device_replica, retire_device),
+        sat_u32(sat_u32(free_host, planned_host_state_release), counts.host_evictable);
+    return sat_u32(counts.drop_device_replica,
                    std::min(counts.demote_candidates, host_budget));
 }
 
@@ -8666,7 +8718,13 @@ void ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
         transaction.recycled_state_epoch =
             state_store->recycle_checkpoint_destination(transaction.destination_state);
     } else {
-        std::optional<StateImageHandle> destination = reserve_state_destination_with_release();
+        // A capture is optional publication: docs 7.2 lets an engine-generated candidate use only
+        // spare capacity that does not degrade an existing owner, so it must not reach the ladder's
+        // retirement step. Without this the credit let every capture reserve, and a capture whose
+        // slots were pinned retired an idle session instead (retention collapsed from 320 to ~28
+        // retained states during a 2026-09-21 fill).
+        std::optional<StateImageHandle> destination =
+            reserve_state_destination_with_release(/*allow_retire=*/false);
         if (!destination) {
             throw std::logic_error("selected capture has no prepared Device State capacity");
         }
