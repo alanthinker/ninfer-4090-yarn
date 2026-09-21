@@ -3,8 +3,8 @@
 > **Retired.** `--turn-checkpoints` is accepted and ignored since the 2026-09-01 upstream
 > merge; the ring below no longer exists. Its job - restoring below a mid-history edit -
 > is done by upstream's private long anchors, which this fork places automatically at the
-> last N message boundaries of every prompt with `--auto-long-anchors N` (default: the
-> `--max-long-anchors-per-continuation` cap). Without that flag no anchor is ever
+> last N user message boundaries (turn starts) of every prompt with `--auto-long-anchors N`
+> (default: the `--max-long-anchors-per-continuation` cap). Without that flag no anchor is ever
 > captured, because no HTTP protocol can place the explicit marker upstream expects. Size
 > `--host-state-slots` for `continuations x (2 + anchors)` state images of about 147 MiB.
 > See [serving.md](serving.md). The rest of this page is kept as history.

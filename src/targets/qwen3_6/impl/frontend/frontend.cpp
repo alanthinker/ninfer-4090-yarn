@@ -735,6 +735,7 @@ bool exact_vision_frontier(std::uint32_t frontier, std::span<const VisionItem> i
 
 PreparedContextCache prepare_context_cache(
     ContextCacheHints hints, std::size_t message_count,
+    std::span<const ChatRole> message_roles,
     std::span<const std::optional<std::uint32_t>> message_boundaries,
     std::span<const PromptCacheMarker> rendered_markers,
     std::span<const std::optional<std::uint32_t>> cache_boundaries,
@@ -742,6 +743,9 @@ PreparedContextCache prepare_context_cache(
     std::optional<std::uint32_t> leading_boundary, std::uint32_t full_prompt_frontier) {
     if (hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
+    }
+    if (message_roles.size() != message_count) {
+        throw std::logic_error("message role count changed during preparation");
     }
     if (cache_boundaries.size() != rendered_markers.size()) {
         throw std::logic_error("rendered cache marker count changed during preparation");
@@ -853,20 +857,26 @@ PreparedContextCache prepare_context_cache(
     }
 
     std::uint32_t engine_order = static_cast<std::uint32_t>(hints.markers.size());
-    // Engine-automatic private long anchors: the boundaries after the last N messages, newest
-    // first, skipping the boundary after the final message (the endpoint and rewrite checkpoints
-    // already cover the tail) and the preamble boundary at index 0. A prompt that later rewrites
-    // one of those messages restores at the anchor below the edit instead of re-prefilling from
-    // token zero. Unresolved boundaries (a folded instruction message) still consume one of the
-    // N positions, so the count is "the last N boundaries", not "N anchors".
+    // Engine-automatic private long anchors: the boundary after each of the last N user
+    // messages (turn starts), newest first. Only user-turn boundaries qualify: a private
+    // conversation is re-entered at user turns (a fork, a branch-back, or a rewritten user
+    // message), never in the middle of a tool loop, and the newest prefix is covered in real
+    // time by the endpoint and rewrite checkpoints. Tool-result and assistant boundaries
+    // inside a turn are machine-internal stops no request resumes from; taking them would
+    // flood the anchor budget and squeeze out the user-turn anchors forks actually hit. The
+    // boundary after the final message and the preamble boundary at index 0 are never
+    // anchors. Unresolved user boundaries (a folded instruction message) still consume one of
+    // the N positions, so the count is "the last N user boundaries", not "N anchors".
     if (hints.automatic_private_anchors != 0 && message_count > 1) {
         std::uint32_t remaining = hints.automatic_private_anchors;
-        for (std::size_t after = message_count - 1U; after != 0 && remaining != 0;
-             --after, --remaining) {
+        for (std::size_t after = message_count - 1U; after != 0 && remaining != 0; --after) {
+            if (message_roles[after - 1] != ChatRole::User) { continue; }
             if (after >= message_boundaries.size() || !message_boundaries[after] ||
                 *message_boundaries[after] >= full_prompt_frontier) {
+                --remaining;
                 continue;
             }
+            --remaining;
             add_opportunity(PromptCacheMarkerKind::PrivateLongAnchor, SharedCandidateEvidence::None,
                             *message_boundaries[after], engine_order++);
         }
@@ -1542,9 +1552,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     (void)checked_token_count(result.token_ids.size());
     result.identity.reusable = true;
     result.context_cache     = prepare_context_cache(
-        std::move(cache_hints), message_count, message_boundaries, rendered_markers,
-        cache_boundaries, result.vision_items, engine_tool_marker_index, leading_boundary,
-        checked_token_count(result.token_ids.size()));
+        std::move(cache_hints), message_count, message_roles, message_boundaries,
+        rendered_markers, cache_boundaries, result.vision_items, engine_tool_marker_index,
+        leading_boundary, checked_token_count(result.token_ids.size()));
     result.starts_in_reasoning =
         options.continuation == PromptContinuationMode::NewAssistantTurn && options.enable_thinking;
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();

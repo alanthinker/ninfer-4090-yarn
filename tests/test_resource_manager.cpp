@@ -489,6 +489,7 @@ struct FakeCaptureAssessment {
     std::vector<ContextTransferRequirement> transfer_requirements;
     std::vector<CheckpointRecoveryAlternativeWork> projected_recovery_work{fake_recovery_work(0)};
     std::vector<CheckpointRef> private_replacement_candidates;
+    std::uint32_t frontier = 0;
     bool publishes_private   = false;
     bool publishes_shared    = false;
     bool needs_transfer      = false;
@@ -3377,6 +3378,41 @@ void test_fair_share_capture_pressure_cannot_touch_protected_sessions() {
     (void)finish_active(manager, program, active);
 }
 
+// The long-anchor budget is full: the released anchor must be the one whose removal keeps
+// the retained set closest to uniform spacing, never the pinned head anchor, and a redundant
+// offered anchor is skipped instead of forcing a release.
+void test_uniform_private_anchor_replacement() {
+    const auto assess = [](std::initializer_list<std::uint32_t> frontiers, std::uint32_t offer) {
+        FakeCaptureAssessment assessment;
+        assessment.frontier = offer;
+        std::uint32_t ordinal = 1;
+        for (const std::uint32_t value : frontiers) {
+            assessment.private_replacement_candidates.push_back(
+                CheckpointRef{.kind = CheckpointKind::LongAnchor, .frontier = value,
+                              .ordinal = ordinal++});
+        }
+        return assessment;
+    };
+    // A redundant tail offer is skipped: the retained set is already uniformly spaced.
+    const auto redundant =
+        ninfer::runtime::select_uniform_private_anchor_replacement(assess({100, 200, 300}, 400));
+    require(!redundant.has_value(), "a redundant offered anchor forced a release of a uniform set");
+    // A dense tail cluster is thinned from the middle, never from the pinned head.
+    const auto victim = ninfer::runtime::select_uniform_private_anchor_replacement(
+        assess({100, 200, 300, 310, 320}, 400));
+    require(victim && victim->frontier == 310,
+            "the uniform-spacing policy did not thin the densest retained cluster");
+    // The head anchor is pinned even when its own gap is the densest one.
+    const auto pinned =
+        ninfer::runtime::select_uniform_private_anchor_replacement(assess({100, 110, 500}, 600));
+    require(pinned && pinned->frontier == 110, "the pinned head anchor was released");
+    // A single-slot budget always follows the conversation.
+    const auto single =
+        ninfer::runtime::select_uniform_private_anchor_replacement(assess({100}, 200));
+    require(single && single->frontier == 100,
+            "a single-slot budget did not track the offered anchor");
+}
+
 } // namespace
 
 int main() {
@@ -3439,6 +3475,7 @@ int main() {
     run_test("validate complete capture result before adoption",
              test_capture_result_is_validated_before_any_adoption);
     run_test("capture result owner identity", test_capture_result_is_adopted_by_owner_identity);
+    run_test("uniform private anchor replacement", test_uniform_private_anchor_replacement);
     run_test("terminal fallback", test_terminal_fallback_releases_failed_retention);
     run_test("terminal waits for resource transaction",
              test_terminal_settlement_waits_for_open_resource_transaction);

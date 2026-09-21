@@ -1405,9 +1405,12 @@ int test_image_resize_rejection_policy() {
 }
 
 // Engine-automatic private long anchors: ContextCacheHints::automatic_private_anchors = N must
-// yield PrivateLongAnchor opportunities at the boundaries after the last N messages, excluding
-// the boundary after the final message, without counting against the explicit marker limit
-// and without duplicating an explicit anchor at the same frontier.
+// yield PrivateLongAnchor opportunities only at the boundaries after user messages (turn
+// starts), taking the last N user boundaries newest first and excluding the boundary after the
+// final message. Tool-result and assistant boundaries inside a turn are not candidates: a
+// private conversation is re-entered at user turns, never mid-loop. Automatic anchors do not
+// count against the explicit marker limit and do not duplicate an explicit anchor at the same
+// frontier.
 int test_automatic_private_anchor_opportunities() {
     int failures               = 0;
     const Frontend frontend    = FrontendFactory::create_component(resources(), false);
@@ -1446,39 +1449,62 @@ int test_automatic_private_anchor_opportunities() {
                           "automatic private anchors appeared without being requested");
     }
 
-    // N = 2 on four messages: the boundaries after message 3 and message 2, nothing at the
-    // prompt end, and both strictly inside the token ledger below the rewrite checkpoint.
-    std::vector<std::uint32_t> two;
+    // N = 2 on [System, User, Assistant, User]: only the user-turn boundaries qualify. The
+    // boundary after the final user message is the prompt end (the endpoint covers the tail)
+    // and the System/Assistant boundaries are not turn starts, so exactly one anchor: after
+    // "first question", strictly inside the token ledger below the rewrite checkpoint.
+    std::vector<std::uint32_t> turn_anchors;
     {
         ninfer::PromptInput input                     = conversation();
         input.context_cache.automatic_private_anchors = 2;
         const auto prepared                           = frontend.prepare(std::move(input));
         const auto& data                              = FrontendFactory::inspect(prepared);
-        two                                           = anchors(data);
-        const bool inside = std::all_of(two.begin(), two.end(), [&](std::uint32_t frontier) {
-            return frontier != 0 && frontier < data.token_ids.size() &&
-                   (!data.identity.rewrite_checkpoint ||
-                    frontier < data.identity.rewrite_checkpoint->frontier);
-        });
-        failures += check(two.size() == 2 && two[0] < two[1] && inside,
-                          "automatic_private_anchors=2 did not yield two distinct anchors below "
-                          "the rewrite checkpoint");
+        turn_anchors                                  = anchors(data);
+        const bool inside = std::all_of(turn_anchors.begin(), turn_anchors.end(),
+                                        [&](std::uint32_t frontier) {
+                                            return frontier != 0 && frontier < data.token_ids.size() &&
+                                                   (!data.identity.rewrite_checkpoint ||
+                                                    frontier <
+                                                        data.identity.rewrite_checkpoint->frontier);
+                                        });
+        failures += check(turn_anchors.size() == 1 && inside,
+                          "automatic_private_anchors=2 did not yield the single user-turn anchor "
+                          "below the rewrite checkpoint");
     }
 
-    // N above the message count proposes every interior boundary (after messages 1..3) and
-    // stops there: the preamble boundary and the final boundary are never anchors.
+    // N above the user-turn count proposes every user-turn boundary and stops there: the
+    // preamble, assistant, and final boundaries are never anchors.
     {
         ninfer::PromptInput input                     = conversation();
         input.context_cache.automatic_private_anchors = 10;
         const auto prepared                           = frontend.prepare(std::move(input));
         const auto all                                = anchors(FrontendFactory::inspect(prepared));
-        failures += check(all.size() == 3 && all[1] == two[0] && all[2] == two[1],
-                          "automatic_private_anchors above the message count did not stop at the "
-                          "interior boundaries");
+        failures += check(all == turn_anchors,
+                          "automatic_private_anchors above the user-turn count did not stop at "
+                          "the user-turn boundaries");
     }
 
-    // An explicit PrivateLongAnchor marker at an automatic frontier merges instead of
-    // duplicating, and automatic anchors do not count toward the four-marker limit.
+    // Tool results and assistant messages inside a turn produce no automatic anchors, even
+    // when N covers the whole conversation.
+    {
+        ninfer::PromptInput input;
+        input.messages.push_back(text_message(ninfer::ChatRole::User, "run the build"));
+        input.messages.push_back(text_message(ninfer::ChatRole::Assistant, "starting the build"));
+        input.messages.push_back(text_message(ninfer::ChatRole::Tool, "build output"));
+        input.messages.push_back(text_message(ninfer::ChatRole::Tool, "test output"));
+        input.messages.push_back(text_message(ninfer::ChatRole::Assistant, "the build passed"));
+        input.messages.push_back(text_message(ninfer::ChatRole::User, "now run the tests"));
+        input.options.enable_thinking                = false;
+        input.context_cache.automatic_private_anchors = 10;
+        const auto prepared                          = frontend.prepare(std::move(input));
+        const auto all                               = anchors(FrontendFactory::inspect(prepared));
+        failures += check(all.size() == 1,
+                          "tool or assistant message boundaries produced automatic anchors");
+    }
+
+    // An explicit PrivateLongAnchor marker at a non-automatic frontier is kept alongside the
+    // automatic anchors (an explicit marker at the same frontier would merge instead), and
+    // automatic anchors do not count toward the four-marker limit.
     {
         ninfer::PromptInput input                     = conversation();
         input.context_cache.automatic_private_anchors = 2;
@@ -1489,8 +1515,10 @@ int test_automatic_private_anchor_opportunities() {
         });
         const auto prepared = frontend.prepare(std::move(input));
         const auto merged   = anchors(FrontendFactory::inspect(prepared));
-        failures += check(merged == two,
-                          "an explicit anchor at an automatic frontier was duplicated or lost");
+        const bool has_turn_anchor =
+            std::binary_search(merged.begin(), merged.end(), turn_anchors[0]);
+        failures += check(merged.size() == turn_anchors.size() + 1 && has_turn_anchor,
+                          "an explicit anchor at a non-automatic frontier was lost or duplicated");
     }
 
     // A single message has no interior boundary: nothing to anchor.

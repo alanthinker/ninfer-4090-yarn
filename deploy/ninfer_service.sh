@@ -100,8 +100,10 @@ start)
   # 根治在客户端 (compaction-basic 应当把会话档位带上), 这里是不改客户端的服务端兜底。
   DEFAULT_EFFORT="${NINFER_DEFAULT_EFFORT:-medium}"
   # 跨会话前缀缓存的关键: 自动长锚点窗口 + 保留上限。
-  # 引擎在每个 prompt 的「最后 N 个消息边界」上放置私有长锚点 (N=--auto-long-anchors),
-  # 而每条 continuation 最多保留 --max-long-anchors-per-continuation 个, 满了就替换最浅的那个。
+  # 引擎在每个 prompt 的「最后 N 个用户消息边界(用户轮起点)」上放置私有长锚点
+  # (N=--auto-long-anchors; 工具/助手消息边界不入候选——分叉/回访只发生在用户轮),
+  # 而每条 continuation 最多保留 --max-long-anchors-per-continuation 个, 满了就抽掉间距最挤
+  # (最冗余)的那个、钉住最浅的头锚, 使锚点大致等距铺满整个会话 (老消息也留有恢复点)。
   # 窗口是从结尾往前数的, 所以 N 太小 + 历史消息多时, 唯一对所有会话都相同的那条边界
   # (developer/system 之后, 即整个系统提示词的末尾) 会落在窗口之外 —— 于是每个新会话都 0 命中。
   # 实测 (本机, 同一份 DSH 历史会话 payload): N=4 时 7/21 条消息的会话全部 0 命中 (7.6-8.5s);

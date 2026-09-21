@@ -1121,11 +1121,12 @@ int exercise_private_long_anchor_capture_and_replacement(const char* artifact) {
 // Engine-automatic private long anchors, and their bound. The production failure was that no
 // HTTP request can place a PrivateLongAnchor marker, so long_anchors was always empty and a
 // rewrite below the rewrite checkpoint had no reuse candidate (path=root, full re-prefill).
-// ContextCacheHints::automatic_private_anchors makes the Frontend propose anchors itself. But
-// retention still evicts the SHALLOWEST anchor when the set is full, so coverage reaches back
-// exactly max_long_anchors_per_continuation message boundaries and no further: a shallow tail
-// rewrite reuses, a rewrite deeper than the cap still falls to root, and raising the cap (and
-// the automatic count with it) is what extends the reach. This exercise asserts all three.
+// ContextCacheHints::automatic_private_anchors makes the Frontend propose anchors itself, at
+// user-turn boundaries only. The proposal window reaches back exactly
+// max_long_anchors_per_continuation user-turn boundaries and no further (full-set retention
+// thins the most redundant member and pins the shallowest anchor), so a shallow tail rewrite
+// reuses, a rewrite deeper than the proposed window still falls to root, and raising the cap
+// (and the automatic count with it) is what extends the reach. This exercise asserts all three.
 int automatic_anchor_case(const char* artifact, std::uint32_t cap, std::uint32_t rewrite_index,
                           ninfer::PrefixReusePath expected, const char* label) {
     ninfer::EngineOptions options = private_long_anchor_engine_options(artifact);

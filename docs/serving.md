@@ -886,7 +886,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
-| `--auto-long-anchors N` | propose a private long anchor at each of the last N message boundaries of every prompt; clamped to the anchor limit, `0` disables | anchor limit |
+| `--auto-long-anchors N` | propose a private long anchor at each of the last N user message boundaries (turn starts) of every prompt; clamped to the anchor limit, `0` disables | anchor limit |
 | `--auto-anchor-spacing N` | also propose a private long anchor at the first message boundary at or after every N tokens of the prompt, so a divergence in the middle of a long history resumes nearby instead of from token zero; `0` disables | `0` |
 | `--fair-share-buckets N` | most recently active N idle private sessions are victim-protected: their checkpoint sets (state images plus KV pages) cannot be evicted by other sessions' pressure; a request that fits no other way releases them oldest first; `0` disables | `8` |
 | `--no-thinking` | disable thinking by default | thinking on |
@@ -903,14 +903,15 @@ Host StateImage slots >= retained sessions x (2 + --max-long-anchors-per-continu
 Device StateImage slots = --max-concurrency + --device-state-slots   (active lanes are separate)
 ```
 
-Size both anchor sets into that budget: `--auto-long-anchors` covers the last N message boundaries
-(recent edits), while `--auto-anchor-spacing` spreads further anchors across the whole prompt. The
-spread set is what makes a mid-history divergence cheap: session compaction is the common case,
-because it keeps a verbatim tail, drops the middle, and appends its summarization instruction at
-that cut - every checkpoint of the conversation that follows it (its endpoint and its tail anchors)
-then sits deeper than the cut and cannot serve the auxiliary call, which would otherwise re-prefill
-the whole prompt. `--max-long-anchors-per-continuation` must cover both sets, since a full anchor
-set evicts its shallowest member first.
+Size both anchor sets into that budget: `--auto-long-anchors` covers the last N user message
+boundaries (turn starts; recent edits), while `--auto-anchor-spacing` spreads further anchors
+across the whole prompt. The spread set is what makes a mid-history divergence cheap: session
+compaction is the common case, because it keeps a verbatim tail, drops the middle, and appends
+its summarization instruction at that cut - every checkpoint of the conversation that follows it
+(its endpoint and its tail anchors) then sits deeper than the cut and cannot serve the auxiliary
+call, which would otherwise re-prefill the whole prompt. `--max-long-anchors-per-continuation`
+must cover both sets; a full anchor set releases its most redundant member first to keep the
+anchors roughly evenly spread over the conversation (the shallowest anchor is pinned).
 
 A deficit does not fail; the planner simply drops checkpoints it cannot place, and the visible
 symptom is a deep session whose `cache` hit keeps collapsing to a shallower prefix and re-prefilling

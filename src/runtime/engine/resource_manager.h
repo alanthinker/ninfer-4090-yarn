@@ -59,6 +59,71 @@ struct CheckpointObservation {
     RetentionObservation observation;
 };
 
+// The long-anchor budget of a continuation is full and the capture offers a new anchor (in
+// practice the newest one): choose which retained anchor to release, or nothing, in which
+// case the offered anchor is skipped.
+//
+// A continuation's long anchors are its only restoration points for forks, branch-backs, and
+// rewritten turns anywhere in its history, so the retained set must stay spread over the whole
+// conversation span. Releasing the shallowest anchor (the previous policy) slides the set
+// forward one step every turn: in a long session only the newest anchors survive and every
+// older prefix loses its restoration point, so a fork from a mid-history state re-prefills
+// almost the entire prompt. Instead, the victim is the retained anchor whose release leaves
+// the set of retained anchors plus the offered one closest to uniform token spacing, measured
+// as the sum of squared deviations of consecutive gaps from the mean gap. Redundant offered
+// anchors (the retained set is already at least as uniform without them) are skipped instead
+// of forcing a release; the newest prefix is covered in real time by the endpoint either way.
+// The shallowest retained anchor is pinned: it is the last foothold for restoring from the
+// prompt head. With a single-slot budget there is nothing to spread, so the offered anchor
+// replaces the sole retained one.
+template <class Assessment>
+[[nodiscard]] std::optional<CheckpointRef>
+select_uniform_private_anchor_replacement(const Assessment& baseline) {
+    const auto& candidates = baseline.private_replacement_candidates;
+    if (candidates.size() < 2) {
+        return candidates.front();
+    }
+    const auto spacing_error = [](std::span<const std::uint32_t> set) {
+        if (set.size() < 2) { return 0.0; }
+        const double target =
+            static_cast<double>(set.back() - set.front()) / static_cast<double>(set.size() - 1);
+        double error = 0.0;
+        for (std::size_t index = 1; index < set.size(); ++index) {
+            const double gap = static_cast<double>(set[index] - set[index - 1]);
+            error += (gap - target) * (gap - target);
+        }
+        return error;
+    };
+    std::size_t head_index = 0;
+    for (std::size_t index = 1; index < candidates.size(); ++index) {
+        if (candidates[index].frontier < candidates[head_index].frontier) {
+            head_index = index;
+        }
+    }
+    std::vector<std::uint32_t> retained;
+    retained.reserve(candidates.size());
+    for (const auto& candidate : candidates) { retained.push_back(candidate.frontier); }
+    std::sort(retained.begin(), retained.end());
+    double best_error = spacing_error(retained);
+    std::optional<CheckpointRef> victim = std::nullopt;  // nullopt: skip the offered anchor
+    for (std::size_t index = 0; index < candidates.size(); ++index) {
+        if (index == head_index) { continue; }
+        auto outcome = retained;
+        const auto offer_position = std::lower_bound(outcome.begin(), outcome.end(),
+                                                     baseline.frontier);
+        outcome.insert(offer_position, baseline.frontier);
+        const auto victim_position = std::lower_bound(
+            outcome.begin(), outcome.end(), candidates[index].frontier);
+        outcome.erase(victim_position);
+        const double error = spacing_error(outcome);
+        if (error < best_error) {
+            best_error = error;
+            victim = candidates[index];
+        }
+    }
+    return victim;
+}
+
 // ResourceManager owns logical policy only.  Every physical feasibility decision and mutation is
 // represented by an opaque Package::ResourcePlan sealed against Program::resource_revision().
 template <class Package>
@@ -528,14 +593,11 @@ public:
         std::optional<CheckpointRef> private_replacement;
         if (!private_baseline.private_replacement_candidates.empty()) {
             private_replacement =
-                *std::min_element(private_baseline.private_replacement_candidates.begin(),
-                                  private_baseline.private_replacement_candidates.end(),
-                                  [](CheckpointRef lhs, CheckpointRef rhs) {
-                                      return std::tuple{lhs.kind, lhs.frontier, lhs.ordinal} <
-                                             std::tuple{rhs.kind, rhs.frontier, rhs.ordinal};
-                                  });
-            private_baseline =
-                program.inspect_capture(offer, nullptr, nullptr, private_replacement, false);
+                select_uniform_private_anchor_replacement(private_baseline);
+            if (private_replacement) {
+                private_baseline =
+                    program.inspect_capture(offer, nullptr, nullptr, private_replacement, false);
+            }
         }
 
         CaptureAssessment candidate =
