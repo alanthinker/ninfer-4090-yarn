@@ -12,8 +12,26 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <stdexcept>
+#include <string>
 
 namespace ninfer::runtime {
+
+/**
+ * A planning-time reference no longer exists: a checkpoint owner, a placement, or a publication
+ * destination the plan depended on was released or moved before the plan could run.
+ *
+ * The emergency capacity-release ladder may retire an idle owner at any point (storage doc 4.2),
+ * so the ResourceManager's catalog view can lag that retirement by one reconciliation. A planner
+ * that prices a checkpoint of such an owner must treat it as an unavailable candidate (its saving
+ * is no longer realizable) rather than failing the request: on 2026-09-21 an emergency retirement
+ * during one request made the next request's pricing throw, and the serve layer turned it into
+ * HTTP 500 "checkpoint recovery owner is stale".
+ */
+class StalePlanningReference : public std::logic_error {
+public:
+    explicit StalePlanningReference(const std::string& what) : std::logic_error(what) {}
+};
 
 using ::ninfer::FinishReason;
 using ::ninfer::KvCapacityMode;

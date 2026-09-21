@@ -1149,6 +1149,16 @@ private:
     // True when that continuation still holds the release-protected state anywhere in its retained
     // checkpoint set, so the ladder's final retirement step can skip it.
     [[nodiscard]] bool owner_holds_release_protected_state(std::uint32_t index) const;
+    // True only when a RUNNING (Active) sequence is using the state right now: its in-place
+    // read/write state, an open reservation or rewrite destination, or a long anchor of an Active
+    // continuation. A Catalogued (idle) continuation's retained checkpoints are cache, not live
+    // bindings, so the release ladder's non-destructive steps and the planner's relief credit must
+    // be allowed to reclaim them.
+    [[nodiscard]] bool state_bound_by_active_sequence(StateImageHandle state) const;
+    // Device and Host state replicas owned by the oldest retirable Catalogued continuation: what
+    // one call of the ladder's final step (`retire_oldest_idle_continuation`) frees.
+    [[nodiscard]] std::pair<std::uint32_t, std::uint32_t>
+    oldest_idle_retirement_relief() const noexcept;
     [[nodiscard]] bool
     protected_materialization_page(const MaterializationSourceProtection* protection,
                                    const KVAddressSpaceStore& addresses, std::uint32_t page_offset,

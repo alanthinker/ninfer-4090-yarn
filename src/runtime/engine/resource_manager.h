@@ -509,8 +509,20 @@ public:
         MaterializationRecord& open = std::get<MaterializationRecord>(transaction_);
         reserve_logical_materialization(open);
 
-        const ContextTransactionReserveStatus status = program.start_resource_transaction(
-            std::move(*choice.plan_), std::move(prompt), cancellation);
+        ContextTransactionReserveStatus status = ContextTransactionReserveStatus::Aborted;
+        try {
+            status = program.start_resource_transaction(std::move(*choice.plan_), std::move(prompt),
+                                                        cancellation);
+        } catch (const runtime::StalePlanningReference&) {
+            // The sealed plan referenced an owner, placement, or destination the emergency release
+            // ladder retired or moved after sealing. The request is still serviceable, so re-plan
+            // instead of failing it: the engine retries admission and the next plan sees the
+            // current catalog (typically falling back to root).
+            choice.plan_.reset();
+            rollback_logical_materialization(open);
+            transaction_.template emplace<std::monostate>();
+            return MaterializationReserveResult::Stale;
+        }
         choice.plan_.reset();
         if (status == ContextTransactionReserveStatus::Aborted) {
             rollback_logical_materialization(open);
@@ -707,14 +719,15 @@ public:
             const auto append_private_checkpoint = [&](PlanningOwnerId owner, std::uint32_t slot,
                                                        const auto& checkpoint) {
                 const CatalogEntry& entry = catalog_[slot];
+                const std::optional<std::uint64_t> baseline =
+                    try_price_checkpoint_recovery(program, *entry.handle, checkpoint.ref);
+                if (!baseline) { return; }
                 checkpoint_policies.push_back(typename CapturePlanner::CheckpointPolicy{
                     .owner                = owner,
                     .checkpoint           = checkpoint.ref,
                     .demand_mask          = committed_demand_mask_for(checkpoint.shortlist_key),
                     .rebuild_ns           = cost_model_.prefill_ns(checkpoint.rebuild_work),
-                    .baseline_recovery_ns = price_checkpoint_recovery_work(
-                        cost_model_,
-                        program.checkpoint_recovery_work(*entry.handle, checkpoint.ref)),
+                    .baseline_recovery_ns = *baseline,
                 });
             };
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
@@ -756,6 +769,12 @@ public:
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
                 const SharedCatalogEntry& entry = shared_catalog_[slot];
                 if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+                // Price before publishing this owner into the capture policy: an owner whose
+                // checkpoint the emergency ladder already released must not enter the domain at
+                // all (a policy row without a checkpoint would be a dangling owner).
+                const std::optional<std::uint64_t> baseline = try_price_checkpoint_recovery(
+                    program, *entry.handle, entry.summary.checkpoint.ref);
+                if (!baseline) { continue; }
                 const PlanningOwnerId owner{
                     .value = static_cast<std::uint32_t>(capture_owner_records.size())};
                 capture_owner_records.push_back(PlanningOwnerRecord{
@@ -777,14 +796,12 @@ public:
                     .explicit_shared_credit   = entry.explicit_credit,
                 });
                 checkpoint_policies.push_back(typename CapturePlanner::CheckpointPolicy{
-                    .owner      = owner,
-                    .checkpoint = entry.summary.checkpoint.ref,
+                    .owner                = owner,
+                    .checkpoint           = entry.summary.checkpoint.ref,
                     .demand_mask =
                         committed_demand_mask_for(entry.summary.checkpoint.shortlist_key),
-                    .rebuild_ns = cost_model_.prefill_ns(entry.summary.checkpoint.rebuild_work),
-                    .baseline_recovery_ns = price_checkpoint_recovery_work(
-                        cost_model_, program.checkpoint_recovery_work(
-                                         *entry.handle, entry.summary.checkpoint.ref)),
+                    .rebuild_ns           = cost_model_.prefill_ns(entry.summary.checkpoint.rebuild_work),
+                    .baseline_recovery_ns = *baseline,
                 });
             }
 
@@ -1571,6 +1588,22 @@ private:
         }
     }
 
+    // Price a checkpoint's recovery work, or report that its owner is gone. The Program's
+    // emergency release ladder may retire an idle owner between this catalog view and the pricing
+    // call; that checkpoint then has no realizable saving, so it is skipped instead of failing the
+    // request (see runtime::StalePlanningReference).
+    template <class Handle>
+    [[nodiscard]] std::optional<std::uint64_t>
+    try_price_checkpoint_recovery(const Program& program, const Handle& handle,
+                                  runtime::CheckpointRef checkpoint) const {
+        try {
+            return price_checkpoint_recovery_work(
+                cost_model_, program.checkpoint_recovery_work(handle, checkpoint));
+        } catch (const runtime::StalePlanningReference&) {
+            return std::nullopt;
+        }
+    }
+
     [[nodiscard]] static bool demand_matches(const PrefixDemandRecord& demand,
                                              const PrefixShortlistKey& key) noexcept {
         return std::find(demand.candidate_keys.begin(), demand.candidate_keys.end(), key) !=
@@ -2086,15 +2119,16 @@ private:
         projected_checkpoints.reserve(prefix_index_.size() + shared_candidates.size());
         const auto append_existing = [&](PlanningOwnerId owner, const auto& handle,
                                          const auto& checkpoint) {
-            const std::uint64_t rebuild  = cost_model_.prefill_ns(checkpoint.rebuild_work);
-            const std::uint64_t recovery = price_checkpoint_recovery_work(
-                cost_model_, program.checkpoint_recovery_work(handle, checkpoint.ref));
+            const std::uint64_t rebuild = cost_model_.prefill_ns(checkpoint.rebuild_work);
+            const std::optional<std::uint64_t> recovery =
+                try_price_checkpoint_recovery(program, handle, checkpoint.ref);
+            if (!recovery) { return; }
             projected_checkpoints.push_back(ContextPortfolioCheckpointValue{
                 .owner       = owner,
                 .demand_mask = demand_mask_for(checkpoint.shortlist_key, provisional_demand),
-                .rebuild_ns  = rebuild,
-                .baseline_recovery_ns = recovery,
-                .target_recovery_ns   = recovery,
+                .rebuild_ns           = rebuild,
+                .baseline_recovery_ns = *recovery,
+                .target_recovery_ns   = *recovery,
             });
         };
         for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
@@ -2304,18 +2338,19 @@ private:
                         throw std::logic_error("catalogued checkpoint has no policy observation");
                     }
                     selected_hits = std::max(selected_hits, observation->selected_hit_count);
+                    const std::optional<std::uint64_t> baseline =
+                        try_price_checkpoint_recovery(program, *entry.handle, checkpoint.ref);
+                    if (!baseline) { return; }
                     checkpoint_policies.push_back(MaterializationCheckpointPolicy{
-                        .owner              = owner,
-                        .checkpoint         = checkpoint.ref,
-                        .retention_class    = observation->retention_class,
-                        .selected_hit_count = observation->selected_hit_count,
-                        .last_hit_epoch     = observation->last_hit_epoch,
+                        .owner                = owner,
+                        .checkpoint           = checkpoint.ref,
+                        .retention_class      = observation->retention_class,
+                        .selected_hit_count   = observation->selected_hit_count,
+                        .last_hit_epoch       = observation->last_hit_epoch,
                         .demand_mask =
                             demand_mask_for(checkpoint.shortlist_key, provisional_demand),
                         .rebuild_ns           = cost_model_.prefill_ns(checkpoint.rebuild_work),
-                        .baseline_recovery_ns = price_checkpoint_recovery_work(
-                            cost_model_,
-                            program.checkpoint_recovery_work(*entry.handle, checkpoint.ref)),
+                        .baseline_recovery_ns = *baseline,
                     });
                 };
                 if (entry.summary.endpoint) { append_checkpoint(*entry.summary.endpoint); }

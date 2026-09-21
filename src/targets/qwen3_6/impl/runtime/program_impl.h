@@ -6647,6 +6647,67 @@ bool ProgramImplCore::state_bound_by_live_sequence(StateImageHandle state) const
     return false;
 }
 
+bool ProgramImplCore::state_bound_by_active_sequence(StateImageHandle state) const {
+    if (!state.valid()) { return false; }
+    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
+        const ContinuationSlotRole role = continuation_slots[index].role;
+        if (role == ContinuationSlotRole::Free) { continue; }
+        const SequenceState& sequence = continuation_states[index];
+        if (sequence.reserved_state && *sequence.reserved_state == state) { return true; }
+        if (sequence.rewrite_state && *sequence.rewrite_state == state) { return true; }
+        if (role != ContinuationSlotRole::Active) { continue; }
+        if (sequence.state.read == state || sequence.state.write == state) { return true; }
+        if (std::any_of(sequence.long_anchors.begin(), sequence.long_anchors.end(),
+                        [state](const LongAnchorCheckpoint& anchor) {
+                            return anchor.state == state;
+                        })) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::pair<std::uint32_t, std::uint32_t>
+ProgramImplCore::oldest_idle_retirement_relief() const noexcept {
+    if (!state_store) { return {0, 0}; }
+    std::optional<std::uint32_t> oldest;
+    std::uint64_t oldest_age = std::numeric_limits<std::uint64_t>::max();
+    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
+        if (continuation_slots[index].role != ContinuationSlotRole::Catalogued) { continue; }
+        if (!can_release_continuation_slot_strict(index)) { continue; }
+        if (owner_holds_release_protected_state(index)) { continue; }
+        const std::uint64_t age = state_store->last_touched(continuation_states[index].state.read);
+        if (!oldest || age < oldest_age) {
+            oldest     = index;
+            oldest_age = age;
+        }
+    }
+    if (!oldest) { return {0, 0}; }
+    const SequenceState& sequence = continuation_states[*oldest];
+    std::array<StateImageHandle, 128> handles{};
+    std::size_t count = 0;
+    const auto add_handle = [&](std::optional<StateImageHandle> handle) {
+        if (!handle || !handle->valid()) { return; }
+        for (std::size_t index = 0; index < count; ++index) {
+            if (handles[index] == *handle) { return; }
+        }
+        if (count < handles.size()) { handles[count++] = *handle; }
+    };
+    add_handle(sequence.state.read);
+    if (sequence.state.write != sequence.state.read) { add_handle(sequence.state.write); }
+    add_handle(sequence.reserved_state);
+    add_handle(sequence.rewrite_state);
+    for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) { add_handle(anchor.state); }
+    std::uint32_t device = 0;
+    std::uint32_t host   = 0;
+    for (std::size_t index = 0; index < count; ++index) {
+        if (!state_store->valid(handles[index])) { continue; }
+        if (state_store->has_device_replica(handles[index])) { ++device; }
+        if (state_store->has_host_replica(handles[index])) { ++host; }
+    }
+    return {device, host};
+}
+
 bool ProgramImplCore::release_state_capacity_step() {
     if (release_one_device_state_slot()) { return true; }
     return retire_oldest_idle_continuation();
@@ -7123,9 +7184,9 @@ bool ProgramImplCore::release_one_device_state_slot() {
             StateImageStore::SlotReleaseKind::DropDeviceReplica, keep_all)) {
         if (state_store->drop_device_replica(*victim)) { return true; }
     }
-    const auto demote_one = [this]() {
+    const auto demote_one = [&]() {
         const std::optional<StateImageHandle> victim = state_store->select_slot_release_victim(
-            StateImageStore::SlotReleaseKind::CopyToHost, [](StateImageHandle) { return false; });
+            StateImageStore::SlotReleaseKind::CopyToHost, keep_live_states);
         if (!victim) { return false; }
         std::optional<StateImageTransfer> transfer =
             state_store->begin_device_to_host(*victim, device.transfer_stream);
@@ -7183,11 +7244,8 @@ detail::PhysicalResources ProgramImplCore::physical_occupancy() const noexcept {
 std::uint32_t
 ProgramImplCore::state_slot_relief(std::uint32_t planned_host_state_release) const noexcept {
     if (!state_store) { return 0; }
-    // Conservative on purpose: crediting the idle (Catalogued) owners' replicas needs the restore
-    // path below to survive a ladder-provided destination first (see the note at the end of this
-    // function).
     const auto keep_bound = [this](StateImageHandle handle) {
-        return state_bound_by_live_sequence(handle);
+        return state_bound_by_active_sequence(handle);
     };
     const auto counts = state_store->count_state_relief(keep_bound);
     const auto limits   = admission_capacity();
@@ -7210,9 +7268,11 @@ ProgramImplCore::state_slot_relief(std::uint32_t planned_host_state_release) con
     // (program_impl.h, "Host retained Fork destination was not published"). Fixing that restore
     // path is the prerequisite for crediting retirement relief; until then the credit would trade
     // a slow-but-correct cold prefill for a failed request.
+    const auto [retire_device, retire_host] = oldest_idle_retirement_relief();
     const std::uint32_t host_budget =
-        sat_u32(sat_u32(free_host, planned_host_state_release), counts.host_evictable);
-    return sat_u32(counts.drop_device_replica,
+        sat_u32(sat_u32(free_host, planned_host_state_release),
+                sat_u32(counts.host_evictable, retire_host));
+    return sat_u32(sat_u32(counts.drop_device_replica, retire_device),
                    std::min(counts.demote_candidates, host_budget));
 }
 
@@ -8065,7 +8125,7 @@ std::vector<runtime::CheckpointRecoveryAlternativeWork>
 ProgramImplCore::checkpoint_recovery_work(const ContinuationHandle& owner,
                                           runtime::CheckpointRef checkpoint) const {
     if (!valid_continuation(owner)) {
-        throw std::logic_error("checkpoint recovery owner is stale");
+        throw runtime::StalePlanningReference("checkpoint recovery owner is stale");
     }
     const SequenceState& sequence = continuation_states[ContractAccess::index(owner)];
     if (!sequence.kv) { throw std::logic_error("checkpoint recovery owner has no KV bundle"); }
@@ -8127,7 +8187,7 @@ std::vector<runtime::CheckpointRecoveryAlternativeWork>
 ProgramImplCore::checkpoint_recovery_work(const SharedPrefixHandle& owner,
                                           runtime::CheckpointRef checkpoint) const {
     if (!valid_shared_prefix(owner)) {
-        throw std::logic_error("shared checkpoint recovery owner is stale");
+        throw runtime::StalePlanningReference("shared checkpoint recovery owner is stale");
     }
     const SharedPrefixState& shared = shared_prefix_states[ContractAccess::index(owner)];
     if (!shared.kv) { throw std::logic_error("shared checkpoint recovery owner has no KV bundle"); }
@@ -10186,6 +10246,21 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             const StateImageHandle current = transaction.reserved_states[0];
             if (state_store->residency(selected) == StateReplicaResidency::HostOnly) {
                 if (state_store->role(current) != StateImageRole::ActiveMutable) {
+                    // Permanent diagnostic: this fires only when a plan's placement assumptions
+                    // were broken after sealing, so the numbers are what identify the later fix.
+                    std::fprintf(stderr,
+                                 "[capture] retained Fork source=%u is HostOnly but its reserved "
+                                 "destination role=%d was not published (reserved_count=%u "
+                                 "state_slots=%u restore=%d fork_dest=%d split=%d protected=%d)\n",
+                                 state_store->debug_index(selected),
+                                 static_cast<int>(state_store->residency(selected)),
+                                 static_cast<int>(state_store->role(current)),
+                                 transaction.reserved_state_count, state_slots,
+                                 transaction.state_restore.has_value() ? 1 : 0,
+                                 transaction.state_fork_destination.has_value() ? 1 : 0,
+                                 transaction.split_state_identity ? 1 : 0,
+                                 (release_protected_state &&
+                                  *release_protected_state == selected) ? 1 : 0);
                     throw std::logic_error("Host retained Fork destination was not published");
                 }
                 sequence.state = ActiveStateBinding{.read = current, .write = current};
