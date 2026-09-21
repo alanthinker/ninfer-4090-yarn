@@ -16,6 +16,16 @@ run the CLI or HTTP server.
 
 The executable `--help` output is the exact source for command-line option spelling and defaults.
 
+## Fork-local builds and ports
+
+| Document | Purpose |
+|---|---|
+| [Merged build: sm_89 + INT8 tensor-core prefill](merge/README.md) | The fork's merged build - Tensorninja INT8 prefill and SM-adaptive grids fused into this base, with its measured A/B evidence |
+| [End-to-end deployment and test report](merge/端到端部署与测试报告.md) | Same-config A/B against the pristine base, plus the CLI-compatibility test on the production command line |
+| [Multi-branch source analysis and fusion plan](merge/多分支源码深度分析与融合方案报告.md) | Per-branch capability inventory, take matrix, adaptation points, and the revised priority plan |
+
+The YaRN long-context deployment guide is [README_部署说明.md](../README_部署说明.md) (Chinese).
+
 ## Model artifacts
 
 | Model | Weights | Download | Versioned model card source |

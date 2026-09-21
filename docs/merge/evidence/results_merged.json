@@ -1,0 +1,78 @@
+{
+  "a": {
+    "completion_tokens": 10121,
+    "wall_s": 106.7,
+    "finish": "stop",
+    "timings": {
+      "cache_n": 83,
+      "draft_n": 13422,
+      "draft_n_accepted": 5648,
+      "predicted_ms": 106504.489692,
+      "predicted_n": 10121,
+      "predicted_per_second": 95.01946846809929,
+      "predicted_per_token_ms": 10.52415906047431,
+      "prompt_ms": 97.441592,
+      "prompt_n": 5,
+      "prompt_per_second": 51.312790538151305,
+      "prompt_per_token_ms": 19.4883184,
+      "ttft_ms": 119.124392
+    }
+  },
+  "b": {
+    "prompt_chars": 110619,
+    "wall_s": 33.0,
+    "timings": {
+      "cache_n": 0,
+      "draft_n": 63,
+      "draft_n_accepted": 34,
+      "predicted_ms": 572.1016129999999,
+      "predicted_n": 54,
+      "predicted_per_second": 92.64088545752799,
+      "predicted_per_token_ms": 10.794370056603773,
+      "prompt_ms": 30199.712009,
+      "prompt_n": 70221,
+      "prompt_per_second": 2325.220849095283,
+      "prompt_per_token_ms": 0.43006667533928594,
+      "ttft_ms": 32405.788253000006
+    }
+  },
+  "c": {
+    "wall_s": 23.0,
+    "content_chars": 11007,
+    "timings": {
+      "cache_n": 40,
+      "draft_n": 2889,
+      "draft_n_accepted": 2385,
+      "predicted_ms": 22899.64667,
+      "predicted_n": 3347,
+      "predicted_per_second": 146.11579157609773,
+      "predicted_per_token_ms": 6.843887229527794,
+      "prompt_ms": 75.10950600000001,
+      "prompt_n": 7,
+      "prompt_per_second": 93.19725788104637,
+      "prompt_per_token_ms": 10.72992942857143,
+      "ttft_ms": 101.00607000000001
+    }
+  },
+  "d": {
+    "prompt_chars": 223640,
+    "needle": "7391",
+    "answer": "7391",
+    "match": true,
+    "wall_s": 98.6,
+    "timings": {
+      "cache_n": 0,
+      "draft_n": 3,
+      "draft_n_accepted": 3,
+      "predicted_ms": 32.831722,
+      "predicted_n": 5,
+      "predicted_per_second": 121.83339028029052,
+      "predicted_per_token_ms": 8.2079305,
+      "prompt_ms": 82223.354641,
+      "prompt_n": 144040,
+      "prompt_per_second": 1751.8137107017967,
+      "prompt_per_token_ms": 0.5708369525201333,
+      "ttft_ms": 98499.15836300001
+    }
+  }
+}

@@ -267,10 +267,80 @@ so an oversized context fails fast instead of at request time.
 
 For a native build, follow the [Linux build guide](docs/rtx-3090-linux.md) with
 `CMAKE_CUDA_ARCHITECTURES=89` (the default in this fork). The build requires CUDA 12.8 or newer,
-GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
+GCC 13, and CMake 3.28 or newer; the Dockerfile in this fork's merged build uses CUDA 13.2 to
+match the RTX 4090 D host stack it was validated against (the base image used CUDA 13.1).
+
+## Merged build: INT8 tensor-core prefill (RTX 4090 D)
+
+This fork's base ships only an FP8 prefill plan for the Q4/Q5 groupwise weights of Qwen3.8-27B,
+and no Ada consumer card has FP8 tensor cores. The merged build closes that gap by fusing in the
+**INT8 tensor-core prefill routes** (six A8 routes across `linear_swiglu` q4, `linear_add` q5,
+`attn_input_proj` q4_q5 and `gdn_input_proj` q4_q5) from the Tensorninja `ninfer-4090` line,
+plus **SM-count-adaptive launch grids** in place of the inherited RTX 5090 `170` literals.
+
+Measured on an RTX 4090 D (49 GB), identical server configuration on both builds, server-side
+`timings` counters, greedy decoding, `rk4v4-e8` KV at `--max-context 262144`, MTP3:
+
+| Metric | Pristine base | Merged build | Delta |
+|---|---:|---:|---:|
+| Prefill, 70,221-token prompt | 1,507.7 tok/s | **2,325.2 tok/s** | **+54.2%** |
+| Prefill, 145,240-token prompt | 1,228.8 tok/s | **1,751.8 tok/s** | **+42.6%** |
+| Wall time, 145K prompt end to end | 118.6 s | 98.6 s | -16.9% |
+| Decode, MTP3 code generation | 144.4 tok/s | 146.1 tok/s | +1.2% (noise) |
+| MTP acceptance, code generation | 82.2% | 82.6% | - |
+| Needle retrieval at 145K | exact | exact | no regression |
+| Long-form output (10,121 tokens) | complete | complete | no regression |
+
+The gain is concentrated in prefill because the port only touches prefill routes; decode is
+unchanged, which is both expected and the evidence that no decode regression was introduced.
+Two caveats. First, the gain is the combined effect of the INT8 routes and the SM-adaptive
+grids; this build does not separate them. Second, the merged build **does not yet carry the
+sibling branch's GQA attention-decode wave fix**, measured upstream at -38.8% decode at 6.5-7k
+context with six query tokens, and the A/B above does not exercise that shape.
+
+The merged build also keeps **CLI compatibility** with the Tensorninja spellings, so an existing
+launch script runs unchanged: `--prefix-checkpoint-policy rolling-tool` maps to
+`--auto-long-anchors 2`, `--continuation-cache l1-l2-l3` runs the device+host tiers and notes the
+absence of a disk tier, and `--continuation-cache-l2-mib` maps to `--host-kv-mib`. Every mapping
+prints a `note:` line on stderr; unmatched disk-tier tuning flags are accepted and ignored. This
+was verified by starting the image with a production command line byte-for-byte.
+
+Build and run it the same way as the base - the model is mounted, not baked in:
+
+```bash
+docker build --tag ninfer-4090-merged:sm89 .
+docker run --rm --gpus all --publish 8080:8080 \
+  --volume "$PWD/models:/models:ro" \
+  ninfer-4090-merged:sm89 \
+  ninfer-serve /models/qwen3_8_27b.ninfer --model-id orcarouter \
+  --host 0.0.0.0 --port 8080 \
+  --max-context 262144 --kv-capacity 262144 --kv-dtype rk4v4-e8 \
+  --max-concurrency 4 --max-pending-requests 16 --pending-timeout-ms 600000 \
+  --prefill-chunk 1024 --spec mtp --draft-tokens 3 --lm-head-draft \
+  --preserve-thinking --vision --vision-max-tokens 32768
+```
+
+Full evidence, method, and the plan review: [docs/merge/](docs/merge/README.md).
 
 ## What this fork changes
 
+- **INT8 tensor-core prefill (merged from the Tensorninja line).** Six A8 routes -
+  `linear_swiglu` q4, `linear_add` q5, `attn_input_proj` q4_q5, `gdn_input_proj` q4_q5 - run the
+  Q4/Q5 groupwise weights through INT8 tensor cores during prefill, with the policy pushed down
+  to the ops the way the existing FP8 routes already do it. Measured on the RTX 4090 D against
+  the pristine base: prefill 1,507.7 to 2,325.2 tok/s at 70K tokens and 1,228.8 to 1,751.8 tok/s
+  at 145K, decode unchanged. See [the merged build section](#merged-build-int8-tensor-core-prefill-rtx-4090-d)
+  and [docs/merge/](docs/merge/README.md). Not yet ported: the sibling branch's GQA
+  attention-decode wave fix.
+- **SM-count-adaptive launch grids.** The five launch sites that transcribed the RTX 5090's 170
+  SMs as a literal (rmsnorm prefetch gate, rope large-block wave capacity, GDN chunked-output CTA
+  target, sparse-MoE decode/prefill persistent blocks) now read `device_sm_count()` at runtime.
+  These are tuning thresholds, not correctness gates: on a 128-SM part the inherited literals
+  produced partial straggler waves, not launch failures. See the
+  [end-to-end report](docs/merge/端到端部署与测试报告.md) for why the crash hypothesis was dropped.
+- **Tensorninja CLI compatibility.** The Tensorninja spellings of the continuation-cache and
+  prefix-checkpoint flags are accepted and mapped onto this build's long-anchor and device/host
+  context-cache mechanisms, so an existing launch script runs unchanged.
 - **`sm_89` retarget.** The CMake architecture pin, the runtime compute-capability check, and the
   NVFP4 stub gate now select `sm_89`. Most SM86 kernel schedules run unmodified on Ada; the
   INT8 attention prefill schedule is retuned (below).

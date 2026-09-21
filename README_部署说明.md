@@ -12,6 +12,72 @@
 | kernel 数值测试 | `tests/ops/test_scale_positions_yarn.cu` |
 | 部署脚本 | `deploy/ninfer_service.sh`（start/stop/status）/ `deploy/run_bench.sh` / `deploy/test_yarn_niah.py` |
 
+---
+
+## 本仓库的合并构建：INT8 张量核预填充（RTX 4090 D）
+
+除了上面的 YaRN 长上下文部署，本仓库还带一份**合并构建**：把兄弟分支（Tensorninja 的 INT8
+张量核预填充、UDPSendToFailed 的 SM 数自适应）融合进本基底，专治「基底只给 Q4/Q5 权重配了
+FP8 预填充计划，而 Ada 消费级卡没有 FP8 张量核」这一缺口。
+
+| 项 | 值 |
+|---|---|
+| 镜像 | `ninfer-4090-merged:sm89`（容器化，模型外挂不烧录） |
+| 部署脚本 | `deploy/ninfer_merged_service.sh`（start/stop/status，Docker） |
+| 端到端验证 | `deploy/verify_merged.sh`（起 merged + 基线对照 + 4 项用例，服务端 `timings` 口径） |
+| 实测报告 | [`docs/merge/端到端部署与测试报告.md`](docs/merge/端到端部署与测试报告.md) |
+| 方案与取用矩阵 | [`docs/merge/多分支源码深度分析与融合方案报告.md`](docs/merge/多分支源码深度分析与融合方案报告.md) |
+
+### 实测收益（merged vs 纯净基线，同参数 A/B）
+
+| 指标 | 基线 | merged | 变化 |
+|---|---:|---:|---:|
+| 预填充 @ 70,221 token | 1,507.7 tok/s | **2,325.2 tok/s** | **+54.2%** |
+| 预填充 @ 145,240 token | 1,228.8 tok/s | **1,751.8 tok/s** | **+42.6%** |
+| 145K 提示词端到端墙钟 | 118.6 s | 98.6 s | −16.9% |
+| MTP3 解码（浅上下文） | 144.4 tok/s | 146.1 tok/s | +1.2%（噪声内） |
+| 144K 上下文针探 | 精确命中 | 精确命中 | 无回归 |
+| 长文输出（10,121 token） | 完成 | 完成 | 无回归 |
+
+`nvidia-smi`（merged，`rk4v4-e8` / 262,144 / 4 路 / vision / MTP）：**24,845 / 49,140 MiB 已用**
+（余 23.7 GiB）。注意该服务与一套 int8 KV 生产服务（~30 GB）**无法在同一张 49 GB 卡上共存**。
+
+### 用 Tensorninja 拼写的启动脚本无需改动
+
+合并构建接受 Tensorninja 的参数拼写并映射到本构建机制，**已用生产容器的原始命令行逐字节实测通过**：
+
+| Tensorninja 拼写 | 本构建处理 |
+|---|---|
+| `--prefix-checkpoint-policy rolling-tool` | → `--auto-long-anchors 2`（生效） |
+| `--continuation-cache l1-l2-l3` | 接受 → 运行 l1-l2，打印「无 L3 磁盘层」note |
+| `--continuation-cache-l2-mib N` | → `--host-kv-mib N`（生效） |
+| `--continuation-cache-l1-mib` / `-l3-mib` / `-dir` / `-namespace` / `-filesystem-reserve-mib` / `-*-idle-seconds` / `-*-ttl-seconds` / `-persist-*` | 接受并忽略（device 池按空闲显存自动定尺） |
+| `--turn-checkpoints N` | 退役告警 + 忽略（由 long anchors 覆盖） |
+
+每条映射都会在 stderr 打印一行 `note:`。
+
+### 两个必须知道的结论（否则会误判）
+
+1. **「GDN 长输出崩溃」没有复现。** 基线在同样的长文用例下完整跑完 13,474 token，日志 0 条
+   CUDA 错误。170-SM 字面量造成的是**拖尾波/利用率**问题，不是启动失败。因此 SM 自适应应定位为
+   **调优可移植性**，不要写成「崩溃修复」。
+2. **GQA attention decode 的波尺寸修正尚未移植。** 上游该提交实测该路径**解码 −38.8%**
+   （6.5–7k 上下文 / 6 query token），且本次 A/B 未覆盖该形状。补它是当前最高优先级的后续项。
+
+### 提示词长度必须按 token 计
+
+中文重复文本在此分词器下约 **1.57 字符/token**。按「字符数 ≈ token 数」估算会**高估约 57%**，
+很容易触发：
+
+```json
+{"error":{"code":"context_length_exceeded",
+          "message":"prepared prompt exceeds Engine max_context 262144"}}
+```
+
+选提示词长度请以服务端 `timings.prompt_n` 为准（也可先用 `/v1/models` 的 `context_window` 自查）。
+
+---
+
 ## 当前生效配置（推荐，已实测）
 
 ```bash
