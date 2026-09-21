@@ -11,8 +11,11 @@
 // local form "YYYY-MM-DDTHH:MM:SS±HH:MM" (local wall clock plus its explicit UTC offset) at
 // the front. The offset makes the parse pure arithmetic, so a name written on a UTC+8 host
 // must mean the same instant on a UTC+14 host — the tests below verify that by switching the
-// process timezone between write and parse. Names written by older builds
-// ("req-<number>-<time>-<route>.json") must keep parsing so a directory outlives the change.
+// process timezone between write and parse. The number is the request's own pre-assigned id,
+// identical in the pending name ("req-<unix-ms>-s<id>-<route>.json") and the finalized name,
+// so same-second captures can never collide. Names written by older builds
+// ("req-<number>-<time>-<route>.json" finalized, "req-<unix-ms>-<route>.json" pending) must
+// keep parsing so a directory outlives the change.
 
 #include <chrono>
 #include <cstdio>
@@ -72,11 +75,21 @@ struct Harness {
     bool present_legacy(std::int64_t number, std::int64_t capture_ms) {
         return std::filesystem::exists(directory / legacy_finalized_name(number, capture_ms));
     }
-    void add_pending(std::int64_t capture_ms) {
-        // Pending files are named req-<unix-ms>-<route>.json: the stamp is the number.
+    void add_pending(std::int64_t capture_ms, std::uint64_t id) {
+        // Current pending name: req-<unix-ms>-s<id>-<route>.json (the stamp is the number).
+        std::ofstream(directory / ("req-" + std::to_string(capture_ms) + "-s" +
+                                   std::to_string(id) + "-chat.json"))
+            .put('x');
+    }
+    bool present_pending(std::int64_t capture_ms, std::uint64_t id) {
+        return std::filesystem::exists(directory / ("req-" + std::to_string(capture_ms) + "-s" +
+                                                    std::to_string(id) + "-chat.json"));
+    }
+    void add_legacy_pending(std::int64_t capture_ms) {
+        // Older-build pending name: req-<unix-ms>-<route>.json.
         std::ofstream(directory / ("req-" + std::to_string(capture_ms) + "-chat.json")).put('x');
     }
-    bool present_pending(std::int64_t capture_ms) {
+    bool present_legacy_pending(std::int64_t capture_ms) {
         return std::filesystem::exists(directory / ("req-" + std::to_string(capture_ms) +
                                                     "-chat.json"));
     }
@@ -144,7 +157,8 @@ int main() {
         harness.add(9, now_ms - 2 * hour);
         harness.add(20, now_ms - 1 * hour);
         harness.add_legacy(500, now_ms - 30 * hour);  // 26 h old: named by an older build
-        harness.add_pending(now_ms - day - 12 * hour);  // 36 h-old pending file
+        harness.add_pending(now_ms - day - 12 * hour, 7);  // 36 h-old pending file, current name
+        harness.add_legacy_pending(now_ms - day - 6 * hour);  // 30 h-old, older-build pending name
 
         ninfer::serve::prune_dump_directory(harness.directory.string(), now_ms);
 
@@ -159,8 +173,10 @@ int main() {
         assert(!harness.present(370, now_ms - 10 * hour));
         // 26 h-old legacy-name file: the older format is still ordered by its embedded time.
         assert(!harness.present_legacy(500, now_ms - 30 * hour));
-        // 36 h-old pending file: removed by the age rule through its unix-ms stamp.
-        assert(!harness.present_pending(now_ms - day - 12 * hour));
+        // 36 h-old pending file (current name): removed through its unix-ms stamp.
+        assert(!harness.present_pending(now_ms - day - 12 * hour, 7));
+        // 30 h-old pending file (older build's name): still parsed and pruned.
+        assert(!harness.present_legacy_pending(now_ms - day - 6 * hour));
     }
     std::printf("ok\n");
     return 0;

@@ -22,7 +22,8 @@ std::string sse_error_event(const ApiError& error) {
 
 } // namespace
 
-void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
+void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res,
+                                         std::uint64_t req_id) {
     OpenAIChatRequest request;
     try {
         RequestLimits limits;
@@ -34,7 +35,6 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         return;
     }
 
-    const std::uint64_t req_id = ++request_seq_;
     const RequestLogMetadata metadata{.model                  = request.model,
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};

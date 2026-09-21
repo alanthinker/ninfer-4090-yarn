@@ -237,7 +237,8 @@ Json paginated_input_items(const httplib::Request& request, const std::vector<Js
 
 } // namespace
 
-void HttpServer::handle_responses(const httplib::Request& req, httplib::Response& res) {
+void HttpServer::handle_responses(const httplib::Request& req, httplib::Response& res,
+                                  std::uint64_t req_id) {
     OpenAIResponsesCreateRequest request;
     OpenAIResponsesResolvedPrompt resolved;
     const std::string id = new_openai_response_id();
@@ -259,7 +260,6 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         return;
     }
 
-    const std::uint64_t req_id = ++request_seq_;
     const RequestLogMetadata metadata{
         .model                             = request.prompt.model,
         .stream                            = request.stream,

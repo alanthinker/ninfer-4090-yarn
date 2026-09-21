@@ -115,8 +115,10 @@ bool parse_dump_file_name(const std::string& name, DumpFile& out) {
     const char* end = name.data() + name.size() - suffix.size();
     if (name.starts_with("req-")) {
         // Pending names of every build and the finalized names written by older builds:
-        // req-<number>[-<timestamp>]-<route>.json with the request id (or the unix-ms
-        // capture stamp while pending) as the leading number.
+        // req-<number>…-<route>.json.  Current pending files are "req-<unix-ms>-s<id>-…":
+        // the leading number is the unix-ms capture stamp (the -s<id> segment is ignored
+        // here); older builds wrote "req-<unix-ms>-<route>.json"; older finalized names
+        // are "req-<id>-<time>-<route>.json" with the request id first.
         const char* cursor = name.data() + 4;
         auto result = std::from_chars(cursor, end, out.number);
         if (result.ec != std::errc() || result.ptr == end) { return false; }
@@ -285,25 +287,22 @@ struct DumpCapture {
     std::string pending_path;
 };
 
-DumpCapture dump_request_body(const httplib::Request& request, const char* route) {
+DumpCapture dump_request_body(const httplib::Request& request, const char* route,
+                              std::uint64_t request_id) {
     static const std::string directory = [] {
         const char* value = std::getenv("NINFER_DUMP_REQUESTS");
         return value == nullptr ? std::string() : std::string(value);
     }();
     if (directory.empty()) { return {}; }
     try {
-        static std::mutex mutex;
-        static std::uint64_t next_sequence = 0;
-        std::lock_guard lock(mutex);
         const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
                                std::chrono::system_clock::now().time_since_epoch())
                                .count();
         // A client can fire several requests in one millisecond (a message plus its side
-        // calls), so the pending name carries a process-unique sequence: a name shared by
-        // two captures would let the later write truncate the earlier body, and the
-        // finalize rename race would then decide which request's file survives.
+        // calls), so the pending name carries the request's own pre-assigned id: a name
+        // shared by two captures would let the later write truncate the earlier body.
         const std::string path = directory + "/req-" + std::to_string(stamp) + "-s" +
-                                 std::to_string(next_sequence++) + "-" + route + ".json";
+                                 std::to_string(request_id) + "-" + route + ".json";
         std::FILE* file = std::fopen(path.c_str(), "wb");
         if (file == nullptr) { return {}; }
         (void)std::fwrite(request.body.data(), 1, request.body.size(), file);
@@ -820,14 +819,23 @@ void HttpServer::register_routes() {
     });
     server_.Post("/v1/chat/completions",
                  [this](const httplib::Request& req, httplib::Response& res) {
-                     const DumpCapture dump = dump_request_body(req, "chat");
-                     handle_chat_completions(req, res);
-                     finalize_dump_file(dump, request_seq_.load(), "chat");
+                     // The id is assigned at route entry and carried through the whole dump
+                     // lifetime: both the pending and the finalized name must carry this
+                     // request's own number.  Reading the shared counter at finalize time
+                     // is wrong — a streaming request that settles after later requests
+                     // arrived would inherit one of their numbers, and two same-second
+                     // captures would collide on the same final name (later rename
+                     // overwrites the earlier body).
+                     const std::uint64_t id = ++request_seq_;
+                     const DumpCapture dump = dump_request_body(req, "chat", id);
+                     handle_chat_completions(req, res, id);
+                     finalize_dump_file(dump, id, "chat");
                  });
     server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
-        const DumpCapture dump = dump_request_body(req, "responses");
-        handle_responses(req, res);
-        finalize_dump_file(dump, request_seq_.load(), "responses");
+        const std::uint64_t id = ++request_seq_;
+        const DumpCapture dump = dump_request_body(req, "responses", id);
+        handle_responses(req, res, id);
+        finalize_dump_file(dump, id, "responses");
     });
     server_.Post("/v1/responses/input_tokens",
                  [this](const httplib::Request& req, httplib::Response& res) {
@@ -858,9 +866,10 @@ void HttpServer::register_routes() {
                      handle_count_tokens(req, res);
                  });
     server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
-        const DumpCapture dump = dump_request_body(req, "messages");
-        handle_messages(req, res);
-        finalize_dump_file(dump, request_seq_.load(), "messages");
+        const std::uint64_t id = ++request_seq_;
+        const DumpCapture dump = dump_request_body(req, "messages", id);
+        handle_messages(req, res, id);
+        finalize_dump_file(dump, id, "messages");
     });
 }
 

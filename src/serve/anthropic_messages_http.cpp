@@ -36,7 +36,8 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
     }
 }
 
-void HttpServer::handle_messages(const httplib::Request& req, httplib::Response& res) {
+void HttpServer::handle_messages(const httplib::Request& req, httplib::Response& res,
+                                 std::uint64_t req_id) {
     const std::string request_id = new_anthropic_request_id();
     res.set_header("request-id", request_id);
 
@@ -59,7 +60,6 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         return;
     }
 
-    const std::uint64_t req_id = ++request_seq_;
     const RequestLogMetadata metadata{.model                  = request.model,
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};

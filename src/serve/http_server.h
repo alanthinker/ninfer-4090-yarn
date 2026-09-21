@@ -76,10 +76,13 @@ private:
     [[nodiscard]] std::shared_ptr<RequestLifecycle> begin_request(RequestLogContext context);
 
     void register_routes();
-    void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
-    void handle_messages(const httplib::Request& req, httplib::Response& res);
+    void handle_chat_completions(const httplib::Request& req, httplib::Response& res,
+                                 std::uint64_t req_id);
+    void handle_messages(const httplib::Request& req, httplib::Response& res,
+                         std::uint64_t req_id);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
-    void handle_responses(const httplib::Request& req, httplib::Response& res);
+    void handle_responses(const httplib::Request& req, httplib::Response& res,
+                          std::uint64_t req_id);
     void handle_response_input_tokens(const httplib::Request& req, httplib::Response& res);
     void handle_response_get(const httplib::Request& req, httplib::Response& res);
     void handle_response_delete(const httplib::Request& req, httplib::Response& res);
