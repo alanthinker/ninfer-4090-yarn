@@ -870,7 +870,16 @@ PreparedContextCache prepare_context_cache(
     if (hints.automatic_private_anchors != 0 && message_count > 1) {
         std::uint32_t remaining = hints.automatic_private_anchors;
         for (std::size_t after = message_count - 1U; after != 0 && remaining != 0; --after) {
-            if (message_roles[after - 1] != ChatRole::User) { continue; }
+            // The boundary immediately before the final message is anchored whatever role the
+            // message it closes has. A client that edits, rewrites, or branches its final user
+            // message can only ever resume from there, and in an alternating conversation that
+            // boundary is the end of the assistant reply - not a user boundary, so the role filter
+            // below used to drop it and every edit re-prefilled that whole reply (measured
+            // 2026-09-22: editing the last user message reused 981 of 1,365 tokens with the filter,
+            // 1,169 without it). It costs one anchor per request and never displaces a user-turn
+            // anchor, because it is the newest one.
+            const bool before_final_message = after + 1U == message_count;
+            if (!before_final_message && message_roles[after - 1] != ChatRole::User) { continue; }
             if (after >= message_boundaries.size() || !message_boundaries[after] ||
                 *message_boundaries[after] >= full_prompt_frontier) {
                 --remaining;
