@@ -390,6 +390,25 @@ public:
         const std::uint64_t guided_watchdog_ns =
             std::min(search_budget_ns,
                      std::max<std::uint64_t>(5'000'000ULL, candidate_floor_ns));
+        // Assessing one pressure target costs on the order of a millisecond of host CPU (measured:
+        // 3,968 targets in 5.36 s on 2026-09-21), so the arena is also bounded by what the time at
+        // stake can pay for at a 20x leverage: refining a plan whose saving is a fraction of a
+        // second is not worth thousands of exact assessments. kTargetBudget stays the hard ceiling.
+        constexpr std::uint64_t kTargetAssessmentCostNs = 1'000'000ULL;  // ~1 ms
+        // The floor has to cover each candidate's guided closure plus the bounded seed probe
+        // (kSeedProbeSteps) that turns a seed into an early acceptance; starving that phase made
+        // the search stop on the target budget before the probe could accept (2026-09-21 unit test).
+        constexpr std::uint32_t kMinimumTargetBudget    = 256U;
+        const std::uint64_t at_stake_ns =
+            incumbent.cost.total_ns > incumbent.cost.lower_bound_ns
+                ? incumbent.cost.total_ns - incumbent.cost.lower_bound_ns
+                : 0;
+        const std::uint64_t affordable_targets =
+            at_stake_ns / (20ULL * kTargetAssessmentCostNs);
+        const std::uint32_t effective_target_budget = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(kTargetBudget,
+                                    std::max<std::uint64_t>(kMinimumTargetBudget,
+                                                            affordable_targets)));
         std::uint64_t maximum_step_ns          = 0;
         std::uint32_t optional_targets         = 0;
         std::uint32_t guided_assessments       = 0;
@@ -454,7 +473,8 @@ public:
 
         const auto assess_target =
             [&](PressureTargetHandle target, std::uint32_t expected_candidate,
-                std::uint32_t expected_ordinal) -> std::optional<QueueEntry> {
+                std::uint32_t expected_ordinal,
+                bool from_guided_closure = false) -> std::optional<QueueEntry> {
             AssessedPressureTarget assessed            = session.assess(target);
             const PressureTargetAssessment& assessment = assessed.assessment();
             if (assessment.candidate != candidates[expected_candidate].id ||
@@ -479,6 +499,7 @@ public:
             if (goal && cost.less(incumbent.cost)) {
                 incumbent = make_incumbent(target, expected_candidate, assessment,
                                            std::move(assessed), cost, *goal);
+                incumbent.guided_closure = from_guided_closure;
             }
             if (!assessment.expandable) { return std::nullopt; }
             QueueEntry entry = make_queue_entry(target, expected_candidate, assessment, cost);
@@ -488,9 +509,9 @@ public:
 
         const auto expand_target = [&](const QueueEntry& parent) {
             if (target_marked(parent.stable_target_ordinal, kTargetExpanded)) { return true; }
-            if (optional_targets >= kTargetBudget) { return false; }
+            if (optional_targets >= effective_target_budget) { return false; }
             auto prepared = session.prepare_expansion(parent.target);
-            if (prepared.new_canonical_count() > kTargetBudget - optional_targets) {
+            if (prepared.new_canonical_count() > effective_target_budget - optional_targets) {
                 session.discard_expansion(std::move(prepared));
                 return false;
             }
@@ -580,7 +601,7 @@ public:
         for (const IdentityRoot& root : closure_order) {
             if (!candidate_needs_seed(root.candidate_index) ||
                 elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns ||
-                optional_targets >= kTargetBudget) {
+                optional_targets >= effective_target_budget) {
                 continue;
             }
             const Clock::time_point step_started              = Clock::now();
@@ -607,7 +628,8 @@ public:
             }
             const Clock::time_point assessment_started = Clock::now();
             (void)assess_target(*closure, root.candidate_index,
-                                closure_guidance.stable_target_ordinal);
+                                closure_guidance.stable_target_ordinal,
+                                /*from_guided_closure=*/true);
             ++guided_assessments;
             ++guided_closures_ok;
             maximum_step_ns =
@@ -675,8 +697,18 @@ public:
                 [](const PressureOwnerOutcome& outcome) {
                     return outcome.disposition == VictimDisposition::Evicted;
                 });
+            // A guided-closure seed already applied victims in the planner's value order (coldest,
+            // least reused, lowest retention weight first), so its release set is the greedy
+            // minimal one. Accept it after the bounded probe instead of refining for seconds: the
+            // 2026-09-21 production case spent 5.36 s of a 6.66 s TTFT evaluating 3,968 targets
+            // and settled on a three-unit degradation anyway, while a request that had already hit
+            // 89% of its prefix waited in the queue.
+            constexpr std::uint32_t kGuidedSeedMaxEvictions = 8U;
             if (seed_has_no_eviction) {
                 seed_acceptable = incumbent.cost.total_ns < search_budget_ns / 4U;
+            } else if (incumbent.guided_closure &&
+                       incumbent.cost.owner_evictions <= kGuidedSeedMaxEvictions) {
+                seed_acceptable = incumbent.cost.total_ns < search_budget_ns;
             } else if (session.retention_infeasible(candidates[incumbent.candidate_index].id)) {
                 // Certified: even maximal retention pressure cannot close the device
                 // shortfall, so an evicting seed is a safe acceptance candidate after the
@@ -742,7 +774,7 @@ public:
                                         next.guidance.stable_target_ordinal);
                 }
             } else {
-                if (optional_targets >= kTargetBudget) {
+                if (optional_targets >= effective_target_budget) {
                     stop_reason      = MaterializationStopReason::TargetBudget;
                     budget_exhausted = true;
                     break;
@@ -894,6 +926,9 @@ private:
         std::vector<PressureCheckpointOutcome> checkpoint_outcomes;
         std::uint32_t degradation_units = 0;
         bool root_maximal               = false;
+        // True when the guided closure produced this incumbent. The closure applies victims in the
+        // planner's own value order, so its release set is the greedy minimal one.
+        bool guided_closure = false;
     };
 
     struct IdentityRoot {

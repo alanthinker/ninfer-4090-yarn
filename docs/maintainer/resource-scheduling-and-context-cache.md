@@ -787,6 +787,16 @@ Materialization 与 shared capture 使用两个 typed entrypoint。Materializati
 evaluator。不存在另一套 source/victim eligibility 规则，也不存在 synthetic capture
 `AdmissionCandidate` 跨越 common planner 边界。
 
+**搜索的工作量同时受"时间预算"和"收益预算"约束（2026-09-21 补充）。** 除墙钟预算外，可评估的
+target 数还按"有风险的收益"折算：一次精确评估约 1 ms，一个整体重放只值几百毫秒的请求不该为此
+评估数千个方案（生产实例：一条已命中 89% 前缀的消息在池子近满时耗掉 5.36 s/3,968 个 target，
+占其 6.66 s TTFT 的 94%）。有效上限 = `clamp(可挽回时间 / 20 / 1ms, 256, kTargetBudget)`；
+下限 256 是为了给"每个候选的 guided closure + 有界种子探针"留出空间，否则探针会被上限提前打断
+而失去早停。同时，**由 guided closure 产生、且驱逐 owner 数不超过 8 的种子方案可以在有界探针后
+被接受**：闭包本身已按价值序（最冷、最少复用、最低保留权重优先）贪心挑选 victim，其释放集合就是
+贪心最小集合，继续搜索通常只是在同一档位上细化。实测该规则把生产满池下的规划从 5.36 s 降到
+亚毫秒级，命中率不变（96.5%）。
+
 Search management 使用 ordinal-indexed `BoundedTargetLedger`。Program target choices 存放在
 planning-session-owned flat arena；每个 target 只保存 offset/count，canonical lookup 使用 flat hash。Prepare
 expansion 在 arena 尾部建立 scratch，commit 只保留新 canonical targets，discard 回卷到原 mark。Session
