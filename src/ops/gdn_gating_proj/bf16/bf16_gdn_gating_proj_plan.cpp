@@ -68,9 +68,13 @@ static_assert(catalog_is_closed(k35Routes, kAnyCols));
 
 // Device-wide resident-CTA budgets for the sm_89 build: the per-SM occupancy measured on sm_86
 // carries over unchanged (identical register counts and per-SM limits), scaled from 82 to the
-// RTX 4090's 128 SMs. These are the single source of truth: both the runtime residency
-// predicates and the compile-time catalog guard below read them, so a retuned constant cannot
-// silently disagree with the route table it is meant to bound.
+// RTX 4090's 128 SMs. They bound the compile-time catalog guard below, so a retuned route table
+// cannot silently claim more residency than the 4090 has. They are NOT the runtime source of
+// truth: a device with fewer SMs has a smaller budget, so the launch path measures residency for
+// the exact specialization on the running device
+// (bf16_gdn_gating_proj_kernels.cu:resident_ctas_per_sm) and splits the token range or falls back
+// to the unsplit schedule when a cooperative grid would not fit (docs/maintainer/port-ledger.md,
+// the `7afc8e17` item).
 constexpr std::int32_t resident_ctas_27(Bf16GdnGatingScheduleId schedule) noexcept {
     return schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit8 ? 256 : 128;
 }

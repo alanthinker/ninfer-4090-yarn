@@ -56,18 +56,30 @@ re-examine the same commits. Survey date: 2026-08-29.
 | Don-Chad `db076d67`, remove CUDA forward-compat libraries | `ff925039` | Ported. Our `Dockerfile` uses the same `nvidia/cuda:13.1.2` base and carried the same latent failure. The deployed `ninfer-dev:runtime` image is built by hand, so no rebuild is forced |
 | Don-Chad `ccb20680`, qualify Qwen3.8 on SM89 | not applicable | `layouts_impl.h` already gates on `device.sm() != 89`. The upstream form admits 86 or 89 and would loosen our gate |
 | jomcgi `1513de5a`, ghcr image workflow | declined | Hardwired to `ghcr.io/jomcgi` and to a `runAsNonRoot` cluster policy. We deploy hand-built local images |
-| Don-Chad `7afc8e17`, resident-CTA budget from the runtime SM count | open | Not a cherry-pick. See the note below |
+| Don-Chad `7afc8e17`, resident-CTA budget from the runtime SM count | ported 2026-09-22 | Same principle, our own figures: the launch fit check now measures per-SM residency for the exact specialization with `cudaOccupancyMaxActiveBlocksPerMultiprocessor` and multiplies the runtime SM count, so a smaller device makes the op split the token range or fall back to the unsplit schedule instead of submitting a cooperative grid the driver rejects. See the note below |
 
 The `7afc8e17` principle applies to us, but its constants do not. That fix
 separates per-SM occupancy from the device-wide budget for sm_86, where the
 supported range is 82 to 84 SMs. Our `bf16_gdn_gating_proj_plan.cpp` hardcodes
 the 128-SM budget of the RTX 4090 and feeds the same constants to a
 `static_assert`. The number is correct for the RTX 4090 and wrong for every
-other Ada device: the RTX 4080 has 76 SMs and the L40S has 142. On a card with
-fewer SMs the budget is overstated. A cooperative launch that does not fit is
-then accepted, and the driver rejects it with
-`cudaErrorCooperativeLaunchTooLarge`. A port needs `DeviceContext::sm_count()`,
-our own per-SM occupancy figures, and a `kMinSupportedSmCount` value for sm_89.
+other Ada device: the RTX 4080 has 76 SMs, the 4080 SUPER 80, and the L40S 142.
+On a card with fewer SMs the budget is overstated, a cooperative launch that
+does not fit is accepted, and the driver rejects it with
+`cudaErrorCooperativeLaunchTooLarge`.
+
+Landed 2026-09-22: the launch fit check measures per-SM residency for the exact
+specialization at runtime (`resident_ctas_per_sm` in
+`bf16_gdn_gating_proj_kernels.cu`) instead of reading a per-geometry constant,
+and multiplies it by the SM count the caller passes, so a 2048-token 27B prefill
+on this 80-SM RTX 4080 SUPER now splits into tile ranges that fit rather than
+aborting the process. Two per-geometry constants had been wrong in the same
+direction (the 27B `2` was qualified on sm_120a; the 35B figure was lowered from
+four to three in `a4c3e440` after the same failure). Still open from the port
+item: a `kMinSupportedSmCount`-based compile-time guard so the route table itself
+is legal on the smallest supported sm_89 device, and route tuning for devices
+below 128 SMs - today those cases are legal but pay for a split cooperative
+launch or the unsplit schedule.
 
 ## Inbound sweep 2026-09-01 (UDP fork)
 
@@ -86,9 +98,10 @@ from their messages:
 The ~15 perf commits are subject to the standing rule from `docs/udp-fork-comparison.md`:
 kernel-bench before any perf pick, because their dequant micro-optimisations lost on
 measurement here. Start with `45a5ae57` ("size CTA waves from the target SM count, not
-an RTX 5090"): it may be the sm_89 form of the Don-Chad `7afc8e17` row still open above,
-which needs `DeviceContext::sm_count()`, our own per-SM occupancy figures and a
-`kMinSupportedSmCount`.
+an RTX 5090"): it is the wave-sizing counterpart of the Don-Chad `7afc8e17` row above,
+which landed on 2026-09-22 for the GDN gating cooperative budget (measured per-SM
+residency x runtime SM count). The same row still wants a `kMinSupportedSmCount`
+compile-time guard for the route table itself.
 
 ## Upstream catch-up 2026-09-05: `neroued/master` `ad0f3d38` merged
 

@@ -256,25 +256,43 @@ void require_shape35(const Weight& w, const char* name) {
     }
 }
 
-template <class Geometry, int SplitK>
-constexpr std::int32_t cooperative_resident_ctas_per_sm() noexcept {
-    static_assert(SplitK > 1);
-    if constexpr (std::is_same_v<Geometry, Bf16Gdn27Geometry>) {
-        static_assert(SplitK == 8 || SplitK == 4 || SplitK == 2);
-        // Qualified on the sm_120a build: BN128 split-8 uses 256 threads and split-4/2 use
-        // 512 threads; registers and 40-KiB shared memory admit two resident CTAs per SM.
-        return 2;
-    } else {
-        static_assert(std::is_same_v<Geometry, Bf16Gdn35Geometry>);
-        static_assert(SplitK == 32 || SplitK == 16 || SplitK == 8 || SplitK == 4 || SplitK == 2);
-        // BN64 residency is a per-SM kernel fact (identical on every sm_89 device): all
-        // specializations use 256 threads and 24-KiB shared memory. split-8/4/2 use 74
-        // registers, which the 64-K register file caps at three resident CTAs per SM (not
-        // four - that overestimate let a 256-CTA grid pass the fit check on a 72-SM device,
-        // where the driver's real limit is 216, and reject the cooperative launch); split-16
-        // uses 56 registers and admits four; split-32 is register-limited to two.
-        return SplitK == 32 ? 2 : (SplitK == 16 ? 4 : 3);
+// Cooperative launches require every CTA of the grid to be resident at once, so the device-wide
+// budget is (resident CTAs per SM) x SM count. How many CTAs a specialization admits per SM is a
+// property of its register and shared-memory footprint *on the running device and build*, so it is
+// measured rather than assumed. Per-geometry constants were wrong twice: the 27B figure (2 CTAs/SM)
+// was qualified on the sm_120a build, where the same kernel uses a different register budget,
+// and the 35B figure had to be lowered from four to three after a launch was rejected on a
+// 72-SM device. On this sm_86/sm_89 lane the 27B split-4/2 specialization needs 74 registers at 512
+// threads (1 CTA/SM), so the stale constant let a legal 27B prefill of 2048 tokens submit a 96-CTA
+// cooperative grid to an 80-SM device, and the driver aborted the process with
+// cudaErrorCooperativeLaunchTooLarge instead of taking the tile-split or unsplit fallback
+// (2026-09-22, RTX 4080 SUPER; tracked as the `7afc8e17` port item in docs/maintainer/port-ledger.md).
+template <class Kernel>
+std::int32_t resident_ctas_per_sm(Kernel kernel, int block_threads,
+                                  int dynamic_smem_bytes) noexcept {
+    struct Measurement {
+        Kernel kernel          = nullptr;
+        int block_threads      = 0;
+        int dynamic_smem_bytes = 0;
+        std::int32_t blocks    = 1;
+    };
+    static Measurement measured{};
+    if (measured.kernel != kernel || measured.block_threads != block_threads ||
+        measured.dynamic_smem_bytes != dynamic_smem_bytes) {
+        int blocks = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, block_threads,
+                                                          dynamic_smem_bytes) != cudaSuccess) {
+            (void)cudaGetLastError();
+            // Unmeasurable: assume the minimum, so the fit check below errs toward splitting the
+            // token range instead of submitting a cooperative grid that cannot be resident.
+            blocks = 1;
+        }
+        measured = Measurement{.kernel              = kernel,
+                               .block_threads       = block_threads,
+                               .dynamic_smem_bytes  = dynamic_smem_bytes,
+                               .blocks              = std::max(1, blocks)};
     }
+    return measured.blocks;
 }
 
 template <class Geometry, int SplitK, int Warps = kBf16GdnWarps, bool NormalizeInput = false,
@@ -360,10 +378,21 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
     } else {
         constexpr std::int64_t kCtasPerTokenTile =
             static_cast<std::int64_t>(Geometry::kHeads / kBf16GdnBlockM) * SplitK;
-        constexpr std::int32_t kResidentCtasPerSm =
-            cooperative_resident_ctas_per_sm<Geometry, SplitK>();
+        // The fit check prices the exact specialization this call would launch, because residency
+        // depends on its register file and shared-memory use. The variant is known here (the token
+        // count decides it for every launch below), so both cases are resolved at compile time.
+        const auto resident_ctas_per_sm_for_variant = [&]<bool FullTokens>() {
+            return resident_ctas_per_sm(
+                &bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
+                                                      NormalizeInput, NormTokenCapacity>,
+                static_cast<int>(block.x), static_cast<int>(kSmemBytes));
+        };
+        const std::int32_t per_sm =
+            variant == Bf16GdnGatingTokenVariant::Full
+                ? resident_ctas_per_sm_for_variant.template operator()<true>()
+                : resident_ctas_per_sm_for_variant.template operator()<false>();
         const std::int64_t resident_ctas =
-            static_cast<std::int64_t>(multiprocessor_count) * kResidentCtasPerSm;
+            static_cast<std::int64_t>(multiprocessor_count) * per_sm;
         const std::int64_t max_token_tiles = resident_ctas / kCtasPerTokenTile;
         if (max_token_tiles < 1) { return false; }
 
