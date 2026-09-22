@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <unordered_map>
 #include <span>
 #include <stdexcept>
 #include <tuple>
@@ -85,6 +86,7 @@ public:
     [[nodiscard]] std::optional<Result>
     plan(Program& program, const ContextMachineCostModel& machine_cost, const Input& input) {
         validate(input);
+        build_portfolio_base(input, machine_cost);
         queue_.clear();
         target_ledger_.reset(static_cast<std::size_t>(input.target_budget) + 1U);
 
@@ -277,10 +279,12 @@ private:
     [[nodiscard]] TransitionValue fold_target(const Input& input,
                                               const PressureTargetAssessment& assessment,
                                               const ContextMachineCostModel& machine_cost) {
+        // The target's own recovery costs, keyed by checkpoint: the only rows that differ from the
+        // plan-wide base. `impact_scratch_` stays small (the checkpoints this target breaks), so a
+        // linear duplicate check over it is fine; the lookups into the portfolio use the index.
         impact_scratch_.clear();
         for (const PressureCheckpointRecoveryImpact& impact : assessment.checkpoint_impacts) {
-            if (checkpoint_policy_for(input.checkpoint_policies, impact.owner, impact.checkpoint) ==
-                nullptr) {
+            if (checkpoint_index_for(impact.owner, impact.checkpoint) == nullptr) {
                 throw std::logic_error("capture pressure impact has no portfolio checkpoint");
             }
             const auto found = std::find_if(
@@ -302,55 +306,17 @@ private:
             }
         }
 
-        owner_scratch_.clear();
-        for (const OwnerPolicy& policy : input.owner_policies) {
-            owner_scratch_.push_back(ContextPortfolioOwnerPolicy{
-                .owner                    = policy.owner,
-                .private_retention_weight = policy.private_retention_weight,
-                .explicit_shared_credit   = policy.explicit_shared_credit,
-            });
-        }
-        const PlanningOwnerId candidate_owner = next_candidate_owner(input.owner_policies);
-        const bool candidate_credit =
-            has_shared_candidate_evidence(input.capture->shared_evidence,
-                                          SharedCandidateEvidence::ExplicitBoundary) ||
-            has_shared_candidate_evidence(input.capture->shared_evidence,
-                                          SharedCandidateEvidence::RequestedAutomatic);
-        owner_scratch_.push_back(ContextPortfolioOwnerPolicy{
-            .owner                    = candidate_owner,
-            .private_retention_weight = 0,
-            .explicit_shared_credit   = candidate_credit,
-        });
-
-        checkpoint_scratch_.clear();
-        for (const CheckpointPolicy& policy : input.checkpoint_policies) {
-            std::uint64_t target_recovery = policy.baseline_recovery_ns;
-            if (input.direct_shared_victim == policy.owner) {
-                target_recovery = policy.rebuild_ns;
-            } else {
-                const auto impact = std::find_if(impact_scratch_.begin(), impact_scratch_.end(),
-                                                 [&](const CombinedImpact& value) {
-                                                     return value.owner == policy.owner &&
-                                                            value.checkpoint == policy.checkpoint;
-                                                 });
-                if (impact != impact_scratch_.end()) { target_recovery = impact->target_ns; }
+        owner_scratch_      = owner_base_;
+        checkpoint_scratch_ = checkpoint_base_;
+        for (const CombinedImpact& impact : impact_scratch_) {
+            const std::size_t* index = checkpoint_index_for(impact.owner, impact.checkpoint);
+            if (index == nullptr) {
+                throw std::logic_error("capture pressure impact lost its portfolio checkpoint");
             }
-            checkpoint_scratch_.push_back(ContextPortfolioCheckpointValue{
-                .owner                = policy.owner,
-                .demand_mask          = policy.demand_mask,
-                .rebuild_ns           = policy.rebuild_ns,
-                .baseline_recovery_ns = policy.baseline_recovery_ns,
-                .target_recovery_ns   = target_recovery,
-            });
+            // A direct shared victim keeps its rebuild cost by policy, not the target's recovery.
+            if (input.direct_shared_victim == impact.owner) { continue; }
+            checkpoint_scratch_[*index].target_recovery_ns = impact.target_ns;
         }
-        checkpoint_scratch_.push_back(ContextPortfolioCheckpointValue{
-            .owner                = candidate_owner,
-            .demand_mask          = input.candidate_demand_mask,
-            .rebuild_ns           = input.candidate_rebuild_ns,
-            .baseline_recovery_ns = input.candidate_rebuild_ns,
-            .target_recovery_ns   = price_checkpoint_recovery_work(
-                machine_cost, input.capture->projected_recovery_work),
-        });
 
         const ContextPortfolioValueResult portfolio =
             portfolio_value_.fold(owner_scratch_, checkpoint_scratch_);
@@ -423,6 +389,88 @@ private:
     std::vector<CombinedImpact> impact_scratch_;
     std::vector<ContextPortfolioOwnerPolicy> owner_scratch_;
     std::vector<ContextPortfolioCheckpointValue> checkpoint_scratch_;
+    // Target-independent portfolio rows, built once per plan() and patched per target through an
+    // index. Rebuilding them inside the fold made each target cost O(owners x checkpoints) linear
+    // scans: at a saturated pool that is 64 owners and ~1,100 checkpoints over hundreds of targets
+    // per scenario, measured as 6.7 s of TTFT inside one capture reservation (2026-09-22).
+    std::vector<ContextPortfolioOwnerPolicy> owner_base_;
+    std::vector<ContextPortfolioCheckpointValue> checkpoint_base_;
+    struct CheckpointKey {
+        PlanningOwnerId owner;
+        CheckpointRef checkpoint;
+        [[nodiscard]] friend bool operator==(const CheckpointKey&,
+                                             const CheckpointKey&) noexcept = default;
+    };
+    struct CheckpointKeyHash {
+        [[nodiscard]] std::size_t operator()(const CheckpointKey& key) const noexcept {
+            const std::uint64_t owner = key.owner.value;
+            const std::uint64_t ref = (static_cast<std::uint64_t>(key.checkpoint.frontier) << 16U) |
+                                      (static_cast<std::uint64_t>(key.checkpoint.kind) << 8U) |
+                                      key.checkpoint.ordinal;
+            return static_cast<std::size_t>((owner * 0x9E3779B97F4A7C15ULL) ^
+                                            (ref * 0xC2B2AE3D27D4EB4FULL));
+        }
+    };
+    std::unordered_map<CheckpointKey, std::size_t, CheckpointKeyHash> checkpoint_index_;
+
+    // Portfolio rows for this input: `owner_base_` carries every owner plus the candidate,
+    // `checkpoint_base_` every checkpoint plus the candidate's, with the direct-shared-victim
+    // override already applied. Only the target's impacted checkpoints differ per target.
+    void build_portfolio_base(const Input& input, const ContextMachineCostModel& machine_cost) {
+        owner_base_.clear();
+        owner_base_.reserve(input.owner_policies.size() + 1U);
+        for (const OwnerPolicy& policy : input.owner_policies) {
+            owner_base_.push_back(ContextPortfolioOwnerPolicy{
+                .owner                    = policy.owner,
+                .private_retention_weight = policy.private_retention_weight,
+                .explicit_shared_credit   = policy.explicit_shared_credit,
+            });
+        }
+        const PlanningOwnerId candidate_owner = next_candidate_owner(input.owner_policies);
+        const bool candidate_credit =
+            has_shared_candidate_evidence(input.capture->shared_evidence,
+                                          SharedCandidateEvidence::ExplicitBoundary) ||
+            has_shared_candidate_evidence(input.capture->shared_evidence,
+                                          SharedCandidateEvidence::RequestedAutomatic);
+        owner_base_.push_back(ContextPortfolioOwnerPolicy{
+            .owner                    = candidate_owner,
+            .private_retention_weight = 0,
+            .explicit_shared_credit   = candidate_credit,
+        });
+
+        checkpoint_base_.clear();
+        checkpoint_base_.reserve(input.checkpoint_policies.size() + 1U);
+        checkpoint_index_.clear();
+        checkpoint_index_.reserve(input.checkpoint_policies.size() + 1U);
+        for (const CheckpointPolicy& policy : input.checkpoint_policies) {
+            const std::uint64_t target_recovery =
+                input.direct_shared_victim == policy.owner ? policy.rebuild_ns
+                                                           : policy.baseline_recovery_ns;
+            checkpoint_index_.emplace(CheckpointKey{policy.owner, policy.checkpoint},
+                                      checkpoint_base_.size());
+            checkpoint_base_.push_back(ContextPortfolioCheckpointValue{
+                .owner                = policy.owner,
+                .demand_mask          = policy.demand_mask,
+                .rebuild_ns           = policy.rebuild_ns,
+                .baseline_recovery_ns = policy.baseline_recovery_ns,
+                .target_recovery_ns   = target_recovery,
+            });
+        }
+        checkpoint_base_.push_back(ContextPortfolioCheckpointValue{
+            .owner                = candidate_owner,
+            .demand_mask          = input.candidate_demand_mask,
+            .rebuild_ns           = input.candidate_rebuild_ns,
+            .baseline_recovery_ns = input.candidate_rebuild_ns,
+            .target_recovery_ns   = price_checkpoint_recovery_work(
+                machine_cost, input.capture->projected_recovery_work),
+        });
+    }
+
+    [[nodiscard]] const std::size_t* checkpoint_index_for(PlanningOwnerId owner,
+                                                          CheckpointRef checkpoint) const {
+        const auto found = checkpoint_index_.find(CheckpointKey{owner, checkpoint});
+        return found == checkpoint_index_.end() ? nullptr : &found->second;
+    }
 };
 
 } // namespace ninfer::runtime

@@ -704,6 +704,15 @@ public:
 
         std::optional<SelectedCapture> selected;
         std::vector<PlanningOwnerRecord> capture_owner_records;
+        // Name the phases of a capture reservation: this path runs inside a request's prefill
+        // resolve and at a saturated pool it evaluates a scenario per shared candidate over a domain
+        // of tens of owners and hundreds of checkpoints (2026-09-22: 6.7 s TTFT, which the coarse
+        // host-phase ledger could only report as "host time in commit-output").
+        const auto capture_plan_started = std::chrono::steady_clock::now();
+        double owner_records_seconds     = 0.0;
+        double scenarios_seconds         = 0.0;
+        std::size_t scenario_count       = 0;
+        auto scenarios_started           = capture_plan_started;
         if (candidate.publishes_shared) {
             const bool pressure_evidence =
                 has_shared_candidate_evidence(candidate.shared_evidence,
@@ -862,6 +871,11 @@ public:
                     ? 0
                     : std::max<std::uint32_t>(1U, CapturePlanner::kTargetBudget /
                                                       static_cast<std::uint32_t>(scenarios.size()));
+            owner_records_seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - capture_plan_started)
+                    .count();
+            scenarios_started = std::chrono::steady_clock::now();
+            scenario_count    = scenarios.size();
             for (CaptureScenario& scenario : scenarios) {
                 std::vector<const ContinuationHandle*> private_owners;
                 std::vector<PlanningOwnerId> private_owner_ids;
@@ -965,6 +979,19 @@ public:
             }
         }
 
+        scenarios_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - scenarios_started)
+                .count();
+        const double capture_plan_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - capture_plan_started)
+                .count();
+        if (capture_plan_seconds >= 0.1) {
+            std::fprintf(stderr,
+                         "[slow] capture-plan owners=%.3fs scenarios=%zu planner=%.3fs total=%.3fs\n",
+                         owner_records_seconds, scenario_count, scenarios_seconds,
+                         capture_plan_seconds);
+            std::fflush(stderr);
+        }
         if (!selected) {
             if (!private_baseline.publishes_private) {
                 std::fprintf(stderr,

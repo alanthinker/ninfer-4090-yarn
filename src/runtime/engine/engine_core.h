@@ -1771,7 +1771,18 @@ private:
         cumulative_stats_.prefill_seconds_total +=
             std::chrono::duration<double>(Clock::now() - prefill_started).count();
         program_call.finish(progress.timing);
+        // The capture reservation lives here, so this is where a saturated pool's reclaim cost lands
+        // (2026-09-22: 7-9 s TTFT on a 99.7% hit was host time in commit-output, and the prefill
+        // itself was 0.1 s).
+        const auto resolve_started = Clock::now();
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
+        const double resolve_seconds =
+            std::chrono::duration<double>(Clock::now() - resolve_started).count();
+        if (resolve_seconds >= 0.1) {
+            std::fprintf(stderr, "[slow] engine-unit=resolve-prefill-progress elapsed=%.3fs\n",
+                         resolve_seconds);
+            std::fflush(stderr);
+        }
         publish_runtime_stats();
     }
 

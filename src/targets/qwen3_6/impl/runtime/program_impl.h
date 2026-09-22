@@ -6820,12 +6820,27 @@ bool ProgramImplCore::owner_holds_release_protected_state(std::uint32_t index) c
 std::optional<StateImageHandle>
 ProgramImplCore::reserve_state_destination_with_release(bool allow_retire) {
     // Each step either frees something or reports that nothing more can be freed, so the loop is
-    // bounded by the number of releasable entries rather than by an arbitrary retry count.
+    // bounded by the number of releasable entries rather than by an arbitrary retry count. The
+    // elapsed/iteration record exists because a device-slot reclaim that keeps making progress
+    // without producing a usable slot is invisible everywhere else (2026-09-22: 7-9 s TTFT on a
+    // 99.7% hit, with the ledger showing only "host time in commit-output").
+    const auto started       = std::chrono::steady_clock::now();
+    std::uint32_t iterations = 0;
     for (;;) {
         std::optional<StateImageHandle> state = state_store->reserve_destination();
         if (state) { return state; }
+        ++iterations;
         if (!release_state_capacity_step("state-destination", allow_retire)) {
-            return state_store->reserve_destination();
+            std::optional<StateImageHandle> last = state_store->reserve_destination();
+            const double seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            if (seconds >= 0.1) {
+                std::fprintf(stderr,
+                             "[slow] state-destination iterations=%u elapsed=%.3fs ok=%d\n",
+                             iterations, seconds, last.has_value() ? 1 : 0);
+                std::fflush(stderr);
+            }
+            return last;
         }
     }
 }
