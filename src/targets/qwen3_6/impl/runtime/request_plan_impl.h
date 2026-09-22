@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <limits>
 #include <stdexcept>
@@ -375,6 +377,19 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
                       return std::tie(left.frontier, left.input_order) <
                              std::tie(right.frontier, right.input_order);
                   });
+        if (const char* reuse_diag = std::getenv("NINFER_REUSE_DIAG");
+            reuse_diag != nullptr && *reuse_diag != '\0' && *reuse_diag != '0') {
+            // Paired with the `capture:` decision lines: this is what the plan OFFERED, so a deep
+            // boundary that never reaches the pool is distinguishable from one that was offered as
+            // a turn closure only.
+            for (const CaptureGroup& group : base->capture_groups) {
+                std::fprintf(stderr,
+                             "capture-plan: frontier=%u rewrite=%d anchor=%d shared=%d order=%u\n",
+                             group.frontier, group.rewrite ? 1 : 0, group.long_anchor ? 1 : 0,
+                             group.shared ? 1 : 0, group.input_order);
+            }
+            std::fflush(stderr);
+        }
         std::shared_ptr<const PreparedCaptureBacking> capture_backing;
         if (!base->capture_groups.empty() || !base->shared_candidates.empty()) {
             auto backing = std::make_shared<PreparedCaptureBacking>();
@@ -1311,22 +1326,37 @@ void ProgramImplCore::select_shared_captures(AdmissionCandidate& candidate,
     // tokens apart, re-prefilling that gap is cheap, so the nearer one buys no reuse value yet
     // still forces a prefill chunk boundary (a full device sync + workspace reset in
     // prefill_impl). Keep a checkpoint only when it is at least one prefill_chunk beyond the
-    // last kept one (always keeping the first and the final). This bounds prefill splits by
-    // prompt length / prefill_chunk rather than by turn count, so many short-turn conversations
-    // prefill at full rate while reuse granularity degrades by at most one chunk.
+    // last kept one, plus the first and the final. This bounds prefill splits by prompt length /
+    // prefill_chunk rather than by turn count, so many short-turn conversations prefill at full
+    // rate while reuse granularity degrades by at most one chunk.
+    //
+    // The spacing is measured BACKWARD from the newest boundary, and the deepest long anchor is
+    // retained unconditionally. A client that re-sends the same conversation with a fresh final
+    // user message (the live serving shape) can only ever resume from the boundary immediately
+    // before its newest message, so that boundary is the one checkpoint whose absence is paid for
+    // on every following request. Spacing forward from the shallowest boundary instead dropped it
+    // whenever the newest turn was shorter than a prefill chunk, and each request then advanced the
+    // reusable depth by exactly one boundary: measured on 2026-09-22, consecutive sibling messages
+    // hit 89.3%, 95.9%, 96.9% and 99.9% instead of reaching the newest boundary on the first one.
     if (prefill_chunk > 0 && plan.capture_groups.size() > 2) {
-        const auto& groups = plan.capture_groups;
-        std::vector<CaptureGroup> kept;
-        kept.reserve(groups.size());
-        std::uint32_t last = 0;
-        for (std::size_t i = 0; i < groups.size(); ++i) {
-            const bool first       = kept.empty();
-            const bool final_point = (i + 1 == groups.size());
-            if (first || final_point || groups[i].frontier >= last + prefill_chunk) {
-                kept.push_back(groups[i]);
-                last = groups[i].frontier;
+        const std::vector<CaptureGroup>& groups = plan.capture_groups;
+        std::size_t newest_anchor                  = groups.size();
+        for (std::size_t index = groups.size(); index-- > 0;) {
+            if (groups[index].long_anchor) {
+                newest_anchor = index;
+                break;
             }
         }
+        std::vector<CaptureGroup> kept;
+        kept.reserve(groups.size());
+        for (std::size_t index = groups.size(); index-- > 0;) {
+            const bool mandatory =
+                index == 0 || index + 1 == groups.size() || index == newest_anchor;
+            const bool spaced =
+                kept.empty() || groups[index].frontier + prefill_chunk <= kept.back().frontier;
+            if (mandatory || spaced) { kept.push_back(groups[index]); }
+        }
+        std::reverse(kept.begin(), kept.end());
         plan.capture_groups = std::move(kept);
     }
 

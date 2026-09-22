@@ -738,6 +738,11 @@ public:
     // continuation offers just its endpoint frontier.
     [[nodiscard]] std::uint32_t
     continuation_depth(const ContinuationHandle& continuation) const noexcept;
+    // Catalog-repair query for the resource manager: the Program reclaims capacity at reservation
+    // time and may retire an idle catalogued owner the caller still lists, so a caller that holds
+    // owner handles must confirm liveness before using one as a reuse source or a victim.
+    [[nodiscard]] bool continuation_is_live(const ContinuationHandle& continuation) const noexcept;
+    [[nodiscard]] bool shared_prefix_is_live(const SharedPrefixHandle& shared) const noexcept;
     [[nodiscard]] std::string continuation_digest(const ContinuationHandle& continuation) const;
     [[nodiscard]] std::vector<SlotCheckpoint>
     continuation_checkpoints(const ContinuationHandle& continuation) const;

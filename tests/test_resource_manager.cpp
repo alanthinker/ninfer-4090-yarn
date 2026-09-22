@@ -658,6 +658,17 @@ public:
         return std::nullopt;
     }
 
+    // Retired owners are reported by the Program so the catalog can repair itself; a fake that
+    // never retires keeps every catalogued handle live.
+    [[nodiscard]] bool continuation_is_live(const FakeContinuationHandle& handle) const noexcept {
+        return std::none_of(retired_continuation_ids.begin(), retired_continuation_ids.end(),
+                            [&](std::uint32_t id) { return id == handle.id; });
+    }
+    [[nodiscard]] bool shared_prefix_is_live(const FakeSharedPrefixHandle& handle) const noexcept {
+        return std::none_of(retired_shared_ids.begin(), retired_shared_ids.end(),
+                            [&](std::uint32_t id) { return id == handle.id; });
+    }
+
     [[nodiscard]] std::optional<FakeAdmissionCandidate>
     inspect_admission(const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base, LaneId,
                       const FakeContinuationHandle* source,
@@ -1208,6 +1219,9 @@ public:
     std::uint32_t started_source_id           = 0;
     PrivateSourceMode started_source_mode     = PrivateSourceMode::ConsumeToActive;
     std::vector<std::uint32_t> inspected_private_sources;
+    // Owners the Program retired behind the catalog's back (capacity reclamation).
+    std::vector<std::uint32_t> retired_continuation_ids;
+    std::vector<std::uint32_t> retired_shared_ids;
     std::vector<std::uint32_t> inspected_shared_sources;
     std::vector<std::vector<std::uint64_t>> seal_attempts;
     std::vector<std::uint64_t> started_action_ids;
@@ -2554,6 +2568,31 @@ void test_stale_revision_is_retryable() {
             "known-stale plan changed logical lane state");
 }
 
+void test_retired_owner_is_not_offered_as_reuse_source() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest seed      = start_active(manager, program, 7, make_base(7), 1);
+    const FakeFinishResult finish = finish_active(manager, program, seed);
+    require(finish.disposition == FinishDisposition::Catalogued,
+            "seed continuation was not catalogued");
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "seed owner is not resident before retirement");
+    // The Program reclaims capacity at reservation time for the newest request's own capture and may
+    // retire an idle owner this catalog still lists. Offering that owner as a reuse source used to
+    // abort the whole request ('admission source continuation is stale', 2026-09-22 harness); the
+    // planning pass must repair the catalog instead.
+    program.retired_continuation_ids.push_back(seed.sequence.id);
+    const auto inspection = manager.inspect(program, FakePreparedPrompt{7}, make_base(7), 2);
+    require(inspection.readiness == Readiness::Ready && inspection.choice,
+            "retired owner made the request unplannable");
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Vacant,
+            "retired owner was not cleared from the catalog");
+    require(std::none_of(program.inspected_private_sources.begin(),
+                         program.inspected_private_sources.end(),
+                         [&](std::uint32_t id) { return id == seed.sequence.id; }),
+            "retired owner was offered to the Program as a reuse source");
+}
+
 void test_materialization_abort_preserves_source() {
     FakeManager manager = make_manager(1, 2);
     FakeProgram program;
@@ -3566,6 +3605,7 @@ int main() {
     run_test("certified evicting seed acceptance",
              test_evicting_seed_accepted_when_retention_proven_infeasible);
     run_test("root lifecycle and prefix reuse", test_root_lifecycle_and_prefix_reuse);
+    run_test("retired owner catalog repair", test_retired_owner_is_not_offered_as_reuse_source);
     run_test("stale revision is retryable", test_stale_revision_is_retryable);
     run_test("materialization abort preserves source", test_materialization_abort_preserves_source);
     run_test("committed victim survives abort", test_committed_victim_survives_transaction_abort);

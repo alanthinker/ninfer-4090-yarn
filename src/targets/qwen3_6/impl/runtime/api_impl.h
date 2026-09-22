@@ -606,6 +606,18 @@ Program<Variant>::continuation_depth(const ContinuationHandle<Variant>& continua
 }
 
 template <>
+bool Program<Variant>::continuation_is_live(
+    const ContinuationHandle<Variant>& continuation) const noexcept {
+    return impl_->continuation_is_live(continuation);
+}
+
+template <>
+bool Program<Variant>::shared_prefix_is_live(
+    const SharedPrefixHandle<Variant>& shared) const noexcept {
+    return impl_->shared_prefix_is_live(shared);
+}
+
+template <>
 std::string
 Program<Variant>::continuation_digest(const ContinuationHandle<Variant>& continuation) const {
     return impl_->continuation_digest(continuation);

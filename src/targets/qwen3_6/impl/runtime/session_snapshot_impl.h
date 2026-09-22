@@ -324,6 +324,14 @@ ProgramImplCore::continuation_depth(const ContinuationHandle& continuation) cons
     return static_cast<std::uint32_t>(sequence.ledger.size());
 }
 
+bool ProgramImplCore::continuation_is_live(const ContinuationHandle& continuation) const noexcept {
+    return valid_continuation(continuation);
+}
+
+bool ProgramImplCore::shared_prefix_is_live(const SharedPrefixHandle& shared) const noexcept {
+    return valid_shared_prefix(shared);
+}
+
 std::string ProgramImplCore::continuation_digest(const ContinuationHandle& continuation) const {
     if (!valid_continuation(continuation)) { return {}; }
     const SequenceState& sequence = continuation_states[ContractAccess::index(continuation)];

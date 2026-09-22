@@ -986,6 +986,13 @@ public:
     // continuation-addressed calls carry the disk-slot capability on top of it.
     [[nodiscard]] std::uint32_t
     continuation_depth(const ContinuationHandle<Variant>& continuation) const noexcept;
+    // Whether a catalogued owner still exists in the Program. The Program reclaims capacity at
+    // reservation time (scheduling doc 6.2) and may retire an idle owner that a caller still lists,
+    // so an owner-based plan must confirm the handle before it is used as a source or a victim.
+    [[nodiscard]] bool
+    continuation_is_live(const ContinuationHandle<Variant>& continuation) const noexcept;
+    [[nodiscard]] bool
+    shared_prefix_is_live(const SharedPrefixHandle<Variant>& shared) const noexcept;
     // Stable identifier (FNV-1a 64 hex) of the continuation's resident token ledger; empty for
     // an invalid handle.
     [[nodiscard]] std::string

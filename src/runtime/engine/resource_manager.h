@@ -398,9 +398,20 @@ public:
                 if (!incoming || *incoming != index.key) { continue; }
 
                 if (!index.shared) {
-                    const CatalogEntry& entry = catalog_[index.slot];
+                    CatalogEntry& entry = catalog_[index.slot];
                     if (entry.state != CatalogState::Catalogued || !entry.handle ||
                         private_has_active_edge(index.slot)) {
+                        continue;
+                    }
+                    // An owner the Program retired while reclaiming capacity for a capture is gone
+                    // even though this catalog still lists it. Clearing it here keeps retention
+                    // accounting honest and keeps a dead handle out of admission, which otherwise
+                    // fails the whole request ('admission source continuation is stale').
+                    if (!program.continuation_is_live(*entry.handle)) {
+                        std::fprintf(stderr,
+                                     "catalog: clear retired private owner slot=%u frontier=%u\n",
+                                     index.slot, index.key.frontier);
+                        clear_catalog_entry(entry);
                         continue;
                     }
                     const bool retain =
@@ -439,8 +450,15 @@ public:
                     continue;
                 }
 
-                const SharedCatalogEntry& entry = shared_catalog_[index.slot];
+                SharedCatalogEntry& entry = shared_catalog_[index.slot];
                 if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+                if (!program.shared_prefix_is_live(*entry.handle)) {
+                    std::fprintf(stderr,
+                                 "catalog: clear retired shared owner slot=%u frontier=%u\n",
+                                 index.slot, index.key.frontier);
+                    clear_shared_entry(entry);
+                    continue;
+                }
                 std::optional<AdmissionCandidate> plan = program.inspect_admission(
                     prompt, base, *destination, nullptr, &*entry.handle, index.checkpoint, false);
                 if (!plan) { continue; }

@@ -19,6 +19,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <iterator>
@@ -8388,15 +8389,32 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
     if (has_context_transaction() || has_unsettled_state_fork() || !valid_capture_offer(offer)) {
         throw std::logic_error("capture transaction is not reservable");
     }
+    // A capture decision names the identities the offered group would publish: the same frontier can
+    // carry a turn closure and a prefix-keyed long anchor, and only the anchor is reusable by a
+    // sibling prompt. Without this the 2026-09-22 depth analysis could not tell a deep anchor that
+    // was never offered from one that was offered and then dropped.
+    const std::uint32_t offered_lane = ContractAccess::lane(offer).value;
+    const auto identities            = [&]() -> std::string {
+        if (!requests[offered_lane].prefill) { return {}; }
+        const RequestControl::Prefill& pending = *requests[offered_lane].prefill;
+        if (pending.next_capture >= pending.capture_groups.size()) { return {}; }
+        const CaptureGroup& pending_group = pending.capture_groups[pending.next_capture];
+        if (!pending_group.rewrite && !pending_group.long_anchor && !pending_group.shared) {
+            return {};
+        }
+        return std::string(" identities") + (pending_group.rewrite ? "+closure" : "") +
+               (pending_group.long_anchor ? "+anchor" : "") +
+               (pending_group.shared ? "+shared" : "");
+    };
     if (cancellation.requested()) {
-        log_capture_decision("skip", 0, "cancelled", {});
+        log_capture_decision("skip", 0, "cancelled", identities());
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
     CaptureAssessment assessment = inspect_capture(
         offer, exact_shared, replacement, private_replacement, permit_shared_publication);
     if (!assessment.publishes_private && !assessment.publishes_shared) {
-        log_capture_decision("skip", assessment.frontier, "no-publication", {});
+        log_capture_decision("skip", assessment.frontier, "no-publication", identities());
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
@@ -8424,11 +8442,12 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
          !physical_peak_fits(pressure_details->demand.physical_peak_additional))) {
         log_capture_decision(
             "skip", assessment.frontier, "pressure-invalid",
-            pressure_details == nullptr
-                ? std::string()
-                : physical_peak_dimension_detail(
-                      pressure_details->demand.physical_peak_additional, physical_occupancy(),
-                      admission_capacity()));
+            (pressure_details == nullptr
+                 ? std::string()
+                 : physical_peak_dimension_detail(
+                       pressure_details->demand.physical_peak_additional, physical_occupancy(),
+                       admission_capacity())) +
+                identities());
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
@@ -8436,7 +8455,8 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
         log_capture_decision(
             "skip", assessment.frontier, "static-infeasible",
             physical_peak_dimension_detail(assessment.implementation->demand.physical_peak_additional,
-                                           physical_occupancy(), admission_capacity()));
+                                           physical_occupancy(), admission_capacity()) +
+                identities());
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
@@ -8558,7 +8578,7 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
                                  : "device-fork",
                              std::string("private=") +
                                  (assessment.publishes_private ? "1" : "0") + " shared=" +
-                                 (assessment.publishes_shared ? "1" : "0"));
+                                 (assessment.publishes_shared ? "1" : "0") + identities());
         return runtime::ContextTransactionReserveStatus::Reserved;
     } catch (...) {
         abort_active_capture(transaction);
@@ -12280,6 +12300,23 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
     RequestControl::Prefill& staged = *request.prefill;
     if (staged.pending_capture_offer != 0) {
         throw std::logic_error("prefill cannot advance while a capture offer is pending");
+    }
+    if (const char* reuse_diag = std::getenv("NINFER_REUSE_DIAG");
+        reuse_diag != nullptr && *reuse_diag != '\0' && *reuse_diag != '0') {
+        // Pairs with `capture-plan:`/`capture:`: a request that resumes its prefill deeper than a
+        // planned capture frontier dropped that capture, which is the difference between "the deep
+        // anchor was never planned" and "the deep anchor was planned and then passed over".
+        std::fprintf(stderr,
+                     "prefill-step: cursor=%u base=%u prompt=%u next_capture=%zu/%zu",
+                     staged.cursor, staged.base, staged.prompt_tokens, staged.next_capture,
+                     staged.capture_groups.size());
+        for (std::size_t index = staged.next_capture; index < staged.capture_groups.size();
+             ++index) {
+            std::fprintf(stderr, " %u%s", staged.capture_groups[index].frontier,
+                         staged.capture_groups[index].frontier < staged.cursor ? "(passed)" : "");
+        }
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
     }
     const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
                                         .reused_prompt_tokens = staged.base,

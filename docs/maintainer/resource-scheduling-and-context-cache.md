@@ -70,6 +70,12 @@ Capability generation 是 planning/transaction 的瞬时结构快照；owner edg
 settlement 的逻辑 lease。另一个 reader 改变同一 owner 的 Device/Host residency 时可以推进 generation，但不
 使已有 owner edge stale。所有 active logical reference counts 都从这些 edges 派生。
 
+catalog 中的 owner handle 在用于复用 source 之前必须重新确认 Program 侧仍然存在
+（`continuation_is_live` / `shared_prefix_is_live`）。Program 会在预留时回收容量（§6.2）并因此退休空闲
+owner，这种退休不经过 ResourceManager 的 pressure transaction，所以 catalog 可能短暂列出一个已经不存在的
+owner。把它当作 source 会以 `admission source continuation is stale` 让整条请求 500（2026-09-22
+harness）；现在在 candidate 循环里发现即清除该 entry（保留量随之修正），请求继续按其余 candidate 规划。
+
 ### 2.3 Program
 
 Program 是唯一物理 authority，拥有：
@@ -509,6 +515,16 @@ ResourceManager 为已选 request 建立有界 candidate 集合：
 决定 Move/Fork、victims 或最终 placements。
 
 Root 始终存在。它不复用 continuation state，代表从 prompt 开始正常 prefill。
+
+Candidate 的 capture frontier 集合由 Frontend 的 markers 与 Engine 自动锚点组成，并在 admission 阶段
+合并：相隔不足一个 `prefill_chunk` 的 checkpoint 只保留间距内的代表，因为重新 prefill 这段空隙很便宜，
+而每个 checkpoint 都会强制一次 prefill split（`prefill_impl` 中一次完整的 device sync + workspace
+reset）。合并**从最新边界向旧边界**计算，并且无条件保留最新边界之前的那一个 long anchor：重新发送同一段
+会话、只替换最后一条 user message 的客户端（线上 serving 的常态）只能从"最新消息之前"的边界恢复，漏掉
+它的代价在之后**每一条**请求上重复支付。旧实现从最浅边界向后合并，只要最新 turn 短于一个 chunk 就会丢
+掉这个锚点，于是每条消息只把可复用深度推进一个边界：2026-09-22 实测连续兄弟消息命中率
+89.3% → 95.9% → 96.9% → 99.9%（TTFT 864 → 515 → 463 → 151 ms），修复后**第一条**兄弟消息即命中最新
+边界（99.8%，TTFT 150 ms 量级）。
 
 ### 7.2 Shared publication candidate
 
