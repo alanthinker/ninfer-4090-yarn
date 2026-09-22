@@ -11,9 +11,13 @@ prefix). Used to reproduce a crash from the request dumps the Engine writes itse
 client shape that failed can be re-sent instead of approximated.
 """
 import json
+import os
 import sys
 import time
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from harness_paths import cached_prompt_tokens  # noqa: E402  (tools/smoke/harness_paths.py)
 
 port = sys.argv[1]
 files = [a for a in sys.argv[2:] if not a.startswith("--")]
@@ -41,7 +45,7 @@ def send(path: str) -> None:
         text = (out["choices"][0]["message"].get("content") or "")[:40].replace("\n", " ")
         print(
             f"{path.split('/')[-1][:34]:36} prompt={usage.get('prompt_tokens')} "
-            f"cached={usage.get('cached_tokens')} {time.time() - started:6.2f}s | {text}",
+            f"cached={cached_prompt_tokens(usage)} {time.time() - started:6.2f}s | {text}",
             flush=True,
         )
     except Exception as exc:  # noqa: BLE001 - the harness reports whatever the service did

@@ -96,10 +96,13 @@ def main() -> None:
     print(f"start occupancy: host_state={o.get('host')}/{320} device_state={o.get('device')} "
           f"pinned={o.get('pinned')} kv_pages={o.get('kv_pages')} host_kv={o.get('host_kv_mb')}MB", flush=True)
     t0 = time.time()
+    # FILL_SESSION_BASE shifts the generated conversations, so a later round creates NEW sessions
+    # instead of replaying the previous round's (which would all hit the cache and occupy nothing).
+    session_base = int(os.environ.get("FILL_SESSION_BASE", "0"))
     s = 0
     while s < max_sessions:
         s += 1
-        msgs = build_session(s - 1, corpus)
+        msgs = build_session(session_base + s - 1, corpus)
         try:
             r = post(base, msgs)
         except Exception as e:

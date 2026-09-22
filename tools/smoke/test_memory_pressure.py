@@ -17,7 +17,11 @@ import random
 import string
 import sys
 import time
+import os
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from harness_paths import cached_prompt_tokens  # noqa: E402  (tools/smoke/harness_paths.py)
 
 
 def random_text(n_words):
@@ -49,7 +53,7 @@ def send_request(base_url, messages, max_tokens=30, timeout=300):
             return {
                 "content": content,
                 "prompt_tokens": usage.get("prompt_tokens", 0),
-                "cached_tokens": (usage.get("prompt_tokens_details", {}) or {}).get("cached_tokens", 0),
+                "cached_tokens": cached_prompt_tokens(usage),
                 "total_tokens": usage.get("total_tokens", 0),
             }
     except Exception as e:

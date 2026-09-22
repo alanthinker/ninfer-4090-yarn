@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from harness_paths import HARNESS_DIR  # noqa: E402
+from harness_paths import HARNESS_DIR, cached_prompt_tokens  # noqa: E402
 from fill_anchors import build_session, occupancy, load_corpus  # noqa: E402
 
 SERVE_LOG = Path(os.environ.get("NINFER_SERVE_LOG") or HARNESS_DIR / "ninfer_serve.log")
@@ -34,7 +34,7 @@ def ask(base: str, msgs: list, timeout: int = 600) -> dict:
         out = json.loads(r.read())
     u = out.get("usage", {})
     p = u.get("prompt_tokens") or 0
-    c = u.get("cached_tokens") or u.get("prompt_cache_hit_tokens") or 0
+    c = cached_prompt_tokens(u)
     return {"prompt": p, "cached": c, "cache_pct": round(100.0 * c / p, 1) if p else 0,
             "elapsed": round(time.time() - t0, 1)}
 

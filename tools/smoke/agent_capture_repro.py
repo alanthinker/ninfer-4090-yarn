@@ -30,7 +30,7 @@ BASE = "http://127.0.0.1:30002"
 PORT = os.environ.get("AGENT_PORT", "30002")
 BASE = f"http://127.0.0.1:{PORT}"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness_paths import REQDUMP_DIR  # noqa: E402  (tools/smoke/harness_paths.py)
+from harness_paths import REQDUMP_DIR, cached_prompt_tokens  # noqa: E402  (tools/smoke/harness_paths.py)
 
 
 def synthetic_template():
@@ -133,7 +133,7 @@ def post(messages, tools, timeout=600, max_tokens=1):
         out = json.loads(response.read())
     usage = out["usage"]
     prompt = usage["prompt_tokens"]
-    cached = usage.get("cached_tokens", 0)
+    cached = cached_prompt_tokens(usage)
     elapsed = time.time() - started
     print(
         f"  prompt={prompt} cached={cached} ({100.0 * cached / max(prompt, 1):.1f}%) "

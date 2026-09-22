@@ -29,7 +29,11 @@ import random
 import string
 import sys
 import time
+import os
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from harness_paths import cached_prompt_tokens  # noqa: E402  (tools/smoke/harness_paths.py)
 
 
 def words(count: int, seed: int) -> str:
@@ -54,10 +58,9 @@ def chat(base_url: str, messages, max_tokens: int = 8, timeout: float = 600.0):
     with urllib.request.urlopen(request, timeout=timeout) as response:
         payload = json.loads(response.read())
     usage = payload.get("usage", {})
-    details = usage.get("prompt_tokens_details", {}) or {}
     return (
         time.monotonic() - started,
-        details.get("cached_tokens", 0),
+        cached_prompt_tokens(usage),
         usage.get("prompt_tokens", 0),
     )
 
