@@ -39,6 +39,9 @@ namespace fi = frontend_internal;
 constexpr std::size_t kPatchFeatures        = 1536;
 constexpr std::string_view kThinkClose      = "</think>";
 constexpr std::string_view kUtf8Replacement = "\xef\xbf\xbd";
+// Closest two automatic private long anchors may sit: one host state slot is worth about a second
+// of prefill, which is 1,024 tokens at the measured ~1.1k tok/s prefill rate.
+constexpr std::uint32_t kMinimumAutomaticAnchorSpacing = 1'024;
 constexpr std::string_view kThinkingControl =
     "\n\n Considering the limited time by the user, I have to give the solution based on the "
     "thinking directly now.\n</think>\n\n";
@@ -858,7 +861,7 @@ PreparedContextCache prepare_context_cache(
 
     std::uint32_t engine_order = static_cast<std::uint32_t>(hints.markers.size());
     // Engine-automatic private long anchors: the boundary immediately BEFORE each of the last N user
-    // messages, newest first, at least `automatic_first_anchor_spacing` apart.
+    // messages, newest first, at least one window step apart.
     //
     // Before, not after: a client re-enters a conversation by rewriting, editing, or branching a
     // user message, and the prefix it can reuse is everything that precedes that message - including
@@ -870,22 +873,39 @@ PreparedContextCache prepare_context_cache(
     // The spacing matters as much as the count: consecutive user messages in a working conversation
     // are often tens of tokens apart, and an anchor every 23 tokens spends the whole per-session
     // anchor budget (--max-long-anchors-per-continuation) on the tail of the conversation, evicting
-    // the spread anchors that make a deep divergence cheap. Only boundaries at least
-    // `automatic_first_anchor_spacing` below the newest kept anchor become anchors; the newest
-    // boundary is always kept, because it is the only one a client editing its final message can
-    // resume from.
+    // the spread anchors that make a deep divergence cheap. Only boundaries at least one window step
+    // below the newest kept anchor become anchors; boundaries that are skipped for being too close
+    // cost nothing, so the N positions buy N anchors spread over the conversation instead of N
+    // candidates in its last few hundred tokens. The newest boundary is always kept, because it is
+    // the only one a client editing its final message can resume from.
+    //
+    // The step is scaled to the conversation rather than fixed: with a fixed step and turns shorter
+    // than it - the normal shape of a working conversation - every candidate but the newest is
+    // skipped and the window collapses to a single tail anchor, so a divergence in the middle of
+    // the conversation falls back to the spread anchor and re-prefills everything below it
+    // (measured 2026-09-22 on a 23K conversation: a fork at 14.2K reused 5.3K of its 14.2K prompt,
+    // 37 %, because the newest boundary and the first spread anchor were the only anchors). Slots
+    // are reserved for the whole conversation, so covering it is what the N positions are for.
+    //
+    // The floor keeps one slot worth roughly the second of prefill it saves: 1,024 tokens is about
+    // 0.9 s at the measured ~1.1k tok/s prefill, which is the cost of the host state slot it holds.
     //
     // The preamble boundary (index 0) and the boundary after the final message (the prompt
     // frontier) are never anchors. Unresolved user boundaries (a folded instruction message) still
     // consume one of the N positions, so the count is "the last N user boundaries", not "N anchors".
     if (hints.automatic_private_anchors != 0 && message_count > 1) {
-        const std::uint32_t minimum_spacing =
+        const std::uint32_t configured_spacing =
             hints.automatic_first_anchor_spacing != 0
                 ? (hints.automatic_anchor_spacing != 0
                        ? std::min(hints.automatic_first_anchor_spacing,
                                   hints.automatic_anchor_spacing)
                        : hints.automatic_first_anchor_spacing)
                 : hints.automatic_anchor_spacing;
+        const std::uint32_t window_span = full_prompt_frontier;
+        const std::uint32_t window_step =
+            std::max(kMinimumAutomaticAnchorSpacing,
+                     std::min(configured_spacing,
+                              window_span / (hints.automatic_private_anchors + 1U)));
         std::uint32_t remaining = hints.automatic_private_anchors;
         std::optional<std::uint32_t> newest_kept;
         for (std::size_t message = message_count; message-- > 1 && remaining != 0;) {
@@ -900,9 +920,9 @@ PreparedContextCache prepare_context_cache(
                 --remaining;
                 continue;
             }
-            if (newest_kept && minimum_spacing != 0 &&
-                *newest_kept - frontier < minimum_spacing) {
-                --remaining;
+            // Too close to the newest kept anchor to add a resume point: skipped, and the position
+            // stays available for a boundary further down the conversation.
+            if (newest_kept && window_step != 0 && *newest_kept - frontier < window_step) {
                 continue;
             }
             --remaining;

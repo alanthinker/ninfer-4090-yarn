@@ -116,9 +116,13 @@ std::string serve_usage_text(const char* argv0) {
            "away in a later release\n"
            "       --auto-long-anchors N proposes a private long anchor at the boundary "
            "immediately before each of the last N user messages of every prompt (default 5), at "
-           "least --first-anchor-spacing apart, so a client that rewrites or branches a recent "
+           "least one window step apart, so a client that rewrites or branches a recent "
            "user message restores at the anchor before the edit - including the assistant reply "
-           "that precedes it - instead of re-prefilling from zero; when the retained set is full "
+           "that precedes it - instead of re-prefilling from zero. The step is "
+           "--first-anchor-spacing scaled down to the prompt, so the window spans the "
+           "conversation instead of collapsing onto its last few hundred tokens, and never "
+           "closer than 1024 tokens (about the second of prefill one host state slot is worth); "
+           "when the retained set is full "
            "the most redundant member is released to keep "
            "the anchors spread over the whole conversation (the shallowest anchor is pinned), "
            "so raise --max-long-anchors-per-continuation and --host-state-slots for deeper "
@@ -495,7 +499,9 @@ std::uint32_t resolve_automatic_anchor_spacing(const ServeOptions& options,
 // rewrites or branches without spending the per-session anchor budget on the tail of a conversation
 // whose messages are a few dozen tokens apart (2026-09-22: with the default equal to the retention
 // cap, a short-message conversation produced an anchor every 23 tokens and evicted the spread
-// anchors). The window is also subject to `--first-anchor-spacing`, so a dense tail cannot flood it.
+// anchors). The window step is `--first-anchor-spacing` scaled down to the prompt (floor 1024
+// tokens), so a dense tail cannot flood it and a short conversation still gets anchors spread over
+// its whole span rather than one at its end.
 constexpr std::uint32_t kDefaultAutomaticPrivateAnchors = 5;
 
 std::uint32_t resolve_automatic_private_anchors(const ServeOptions& options,

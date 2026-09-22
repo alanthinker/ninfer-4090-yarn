@@ -1558,6 +1558,96 @@ int test_automatic_private_anchor_opportunities() {
     return failures;
 }
 
+// The last-N window has to span the conversation. A fixed step plus turns shorter than it leaves
+// every candidate but the newest skipped, so the window collapses to a single tail anchor and a
+// divergence in the middle of the conversation re-prefills everything below the spread anchor
+// (2026-09-22: a fork at 14.2K of a 23K conversation reused 5.3K, 37 %). The step therefore scales
+// down with the conversation, and a boundary skipped for being too close to the newest anchor does
+// not consume one of the N positions.
+int test_automatic_anchor_window_covers_the_conversation() {
+    int failures            = 0;
+    const Frontend frontend = FrontendFactory::create_component(resources(), false);
+    // 'x' runs tokenize at about one token per character, so `chars` is the turn size in tokens.
+    const auto conversation = [](int rounds, int chars) {
+        ninfer::PromptInput input;
+        ninfer::ChatMessage system;
+        system.role = ninfer::ChatRole::System;
+        system.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = "system preamble", .media = {}});
+        input.messages.push_back(std::move(system));
+        for (int round = 0; round < rounds; ++round) {
+            for (const ninfer::ChatRole role : {ninfer::ChatRole::User, ninfer::ChatRole::Assistant}) {
+                ninfer::ChatMessage message;
+                message.role = role;
+                message.parts.push_back(ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text,
+                                                            .text = std::string(chars, 'x'),
+                                                            .media = {}});
+                input.messages.push_back(std::move(message));
+            }
+        }
+        input.options.enable_thinking                      = false;
+        input.context_cache.automatic_private_anchors      = 5;
+        input.context_cache.automatic_first_anchor_spacing = 4'096;
+        // The spread mechanism is a different coverage shape; this test is about the last-N window.
+        input.context_cache.automatic_anchor_spacing = 0;
+        return input;
+    };
+    const auto window = [&](int rounds, int chars, std::vector<std::uint32_t>& frontiers) {
+        const auto prepared = frontend.prepare(conversation(rounds, chars));
+        const auto& data    = FrontendFactory::inspect(prepared);
+        for (const auto& opportunity : data.context_cache.opportunities) {
+            if (opportunity.kind == ninfer::PromptCacheMarkerKind::PrivateLongAnchor) {
+                frontiers.push_back(opportunity.frontier);
+            }
+        }
+        std::sort(frontiers.begin(), frontiers.end());
+        return static_cast<std::uint32_t>(data.token_ids.size());
+    };
+
+    // Turns far shorter than the configured 4,096-token step: the step has to scale down to the
+    // conversation, otherwise every boundary but the newest is skipped and the window is one anchor.
+    {
+        std::vector<std::uint32_t> frontiers;
+        const std::uint32_t span  = window(12, 800, frontiers);
+        const std::uint32_t step  = std::max<std::uint32_t>(1'024, std::min<std::uint32_t>(4'096, span / 6));
+        failures += check(frontiers.size() >= 4,
+                          ("the last-N window did not place an anchor per position in a "
+                           "short-turn conversation: span=" + std::to_string(span) + " step=" +
+                           std::to_string(step) + " anchors=" + std::to_string(frontiers.size()))
+                              .c_str());
+        if (frontiers.size() >= 4) {
+            bool spaced = true;
+            for (std::size_t index = 1; index < frontiers.size(); ++index) {
+                spaced = spaced && frontiers[index] - frontiers[index - 1] >= step;
+            }
+            failures += check(spaced, "two anchors from the last-N window sat closer than its step");
+            // The window reaches the beginning of the conversation rather than clustering at the
+            // end. One turn of slack: anchors sit on user-message boundaries, so the deepest one is
+            // the last boundary at or above the step.
+            constexpr std::uint32_t kTurnTokens = 2 * 800;
+            failures += check(frontiers.front() <= step + kTurnTokens,
+                              ("the anchor window collapsed into the tail instead of spanning the "
+                               "conversation: deepest=" + std::to_string(frontiers.front()) +
+                               " span=" + std::to_string(span))
+                                  .c_str());
+            failures += check(frontiers.back() < span,
+                              "the newest automatic anchor was placed at the prompt frontier");
+        }
+    }
+
+    // Turns just under the configured step: the boundaries skipped for being too close to the newest
+    // anchor must not spend one of the N positions, or the window keeps roughly half of them.
+    {
+        std::vector<std::uint32_t> frontiers;
+        const std::uint32_t span = window(12, 2'000, frontiers);
+        failures += check(frontiers.size() == 5,
+                          ("boundaries skipped for spacing consumed the last-N budget: span=" +
+                           std::to_string(span) + " anchors=" + std::to_string(frontiers.size()))
+                              .c_str());
+    }
+    return failures;
+}
+
 int test_explicit_leading_instruction_cache_boundary() {
     const Frontend frontend           = FrontendFactory::create_component(resources(), false);
     constexpr std::string_view stable = "stable cache section.";
@@ -2487,6 +2577,7 @@ int main() {
     failures += test_image_resize_rejection_policy();
     failures += test_explicit_leading_instruction_cache_boundary();
     failures += test_automatic_private_anchor_opportunities();
+    failures += test_automatic_anchor_window_covers_the_conversation();
     failures += test_media_admission_uses_aggregate_resources(frontend);
     failures += test_vision_budgets_are_per_item(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
