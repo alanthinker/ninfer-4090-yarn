@@ -5,7 +5,7 @@
 #
 # Requires:
 #   - ninja binary built (cmake --build build -j)
-#   - Service running: deploy-yarn/ninfer_service.sh start
+#   - Service running: deploy/ninfer_service.sh start
 #   - Python 3.11+
 set -euo pipefail
 

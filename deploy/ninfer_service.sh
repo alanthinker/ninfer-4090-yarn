@@ -378,8 +378,9 @@ start)
   ;;
 stop)
   # 只匹配 "二进制路径 + 本模型路径", 不会误杀 35B 服务 (不同二进制+模型)。
-  # 注意: _ninfer_repos/deploy-yarn/ninfer_service.sh 用的是同一份二进制+同一模型,
-  # 命令行特征相同, 两个实例互可见 —— 日常启停只认其中一份, 别两边都用来操作。
+  # 注意: 迁移前 (脚本还在 _ninfer_repos/deploy-yarn/) 启动的旧实例, 命令行里是旧路径,
+  # pgrep 特征匹配不到, 只能靠 $PIDF 收 —— 所以 PID 文件丢了要手工按端口/显存找进程。
+  # 用本脚本重新 start 一次后, 命令行特征与本脚本一致, pgrep 兜底重新可用。
   if [ -f "$PIDF" ]; then
     PID=$(cat "$PIDF")
     kill "$PID" 2>/dev/null || true
