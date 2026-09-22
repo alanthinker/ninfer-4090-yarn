@@ -37,12 +37,6 @@ out/
 models/
 vcpkg_installed/
 
-# deploy/ runtime artifacts (pid, logs incl. archives, request logs, request dumps)
-deploy/*.pid
-deploy/*.log*
-deploy/request_log*
-deploy/reqdump/
-
 # Local workspace and transient runtime output
 /.local/
 /temp/

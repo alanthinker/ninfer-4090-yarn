@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # NInfer-YaRN 服务管理 (Qwen3.8-27B, E8 4-bit KV, YaRN 线性位置缩放, MTP3, Vision)
-#   本仓库 (ninfer-4090-yarn) 的部署脚本: 二进制来自本仓库 build/, 日志/PID 落在本目录 (deploy/)。
+#   本仓库 (ninfer-4090-yarn) 的部署脚本: 二进制来自本仓库 build/; 运行时文件
+#   (服务日志/PID/请求 JSONL/reqdump) 仍落在 _ninfer_repos/deploy-yarn/ (历史数据与在用的文件都在这, 不搬)。
 #   ./ninfer_service.sh start | stop | status   (缺省 status)
 #
 # 前置: 必须先停掉 vLLM (myai, :30000) —— 它是本会话 AI 的模型后端:
@@ -21,7 +22,7 @@
 #                        都相同的边界。见 README 前缀缓存一节。
 #   NINFER_MAX_SHARED_PREFIXES  共享前缀目录容量, 默认 4 (实测调大不解决长会话问题)
 #   NINFER_FAIR_SHARE_BUCKETS  公平份额桶数: 最近活跃的 N 个空闲会话被驱逐硬保护, 默认 8, 0 关闭
-#   NINFER_DUMP_REQUESTS  请求体落盘目录, 默认 $HERE/reqdump (每次 start 自动开启)。服务把每个推理
+#   NINFER_DUMP_REQUESTS  请求体落盘目录, 默认 $RUNTIME_DIR/reqdump (每次 start 自动开启)。服务把每个推理
 #                        请求的原始 JSON body 写进该目录, 是服务端排查"为什么前缀缓存没命中"的唯一
 #                        原始证据(相邻两次请求的 body 可逐字节 diff)。设为 0 或空字符串关闭。
 #                        自动清理(默认开启, 每次写入时清理一次, 不会无限增长):
@@ -43,7 +44,7 @@
 #                        (更旧的 .1→.2 依次后移), 最多保留 NINFER_LOG_KEEP 份归档(默认 2)。
 #   NINFER_LOG_KEEP      归档份数, 默认 2 (即 log + log.1 + log.2 三个文件)。
 #   NINFER_REQUEST_LOG_JSONL
-#                        机器可读请求日志 (jsonl), 默认 $HERE/request_log.jsonl (每次 start 自动开启)。
+#                        机器可读请求日志 (jsonl), 默认 $RUNTIME_DIR/request_log.jsonl (每次 start 自动开启)。
 #                        每行一个 JSON 事件: server_start (启动配置/内存/参数快照)、
 #                        request_start / request_done / request_error / request_rejected
 #                        (单请求全精度: queue/prefill/decode 分段, 引擎 CPU 五分解
@@ -68,11 +69,14 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NINFER_DIR="$HERE/.."
+# 运行时文件(服务日志/PID/请求 JSONL/请求体落盘)仍放原 deploy-yarn/ 目录:
+# 历史日志、滚动归档和正在被运行中服务打开的文件都在那, 换目录会切断状态连续性。
+RUNTIME_DIR="$HERE/../../deploy-yarn"
 BIN="$NINFER_DIR/build/apps/ninfer-serve"
 MODEL="${NINFER_MODEL:-$HERE/../../ninfer-4090/models/qwen3_8_27b.ninfer}"
 PORT="${NINFER_PORT:-30000}"
-LOG="$HERE/ninfer_serve.log"
-PIDF="$HERE/ninfer_serve.pid"
+LOG="$RUNTIME_DIR/ninfer_serve.log"
+PIDF="$RUNTIME_DIR/ninfer_serve.pid"
 # 该模型对应的进程特征 (pgrep -f / pkill -f): 二进制路径 + 模型路径都在命令行里,
 # 用它可以在 27B / 35B 两个服务共用同一份二进制时精确区分、避免误杀。
 PROC_RE="$BIN $MODEL"
@@ -277,7 +281,7 @@ start)
   echo "== 启动服务 (kv=$KV_DTYPE / ctx=$MAX_CTX / YaRN: $YARN_DESC / 并发 $CONCURRENCY / 长锚点 auto=$AUTO_ANCHORS max=$MAX_ANCHORS / 共享前缀 $SHARED_PREFIXES / 公平份额桶 $FAIR_SHARE_BUCKETS) =="
   # 请求体落盘(默认开启)。二进制是直接 getenv("NINFER_DUMP_REQUESTS") 读的(非命令行参数),
   # 所以这里必须 export, 保证 setsid nohup 起的服务进程一定继承到该目录。
-  DUMP_REQUESTS="${NINFER_DUMP_REQUESTS:-$HERE/reqdump}"
+  DUMP_REQUESTS="${NINFER_DUMP_REQUESTS:-$RUNTIME_DIR/reqdump}"
   if [ -n "$DUMP_REQUESTS" ] && [ "$DUMP_REQUESTS" != "0" ]; then
     export NINFER_DUMP_REQUESTS="$DUMP_REQUESTS"
     # 二进制内置缺省只留 100 个(全局, 不分会话): 本服务实测 ~75 req/h, 100 个仅覆盖 ~1.5 小时,
@@ -306,7 +310,7 @@ start)
   # 机器可读请求日志 (jsonl): 单请求全精度计时 (queue/CPU 五分解/复用路径/物化规划)
   # + 每 5 秒调度器与 host_work 采样, 是 TTFT 归因的事后数据源; 文本日志只有单行摘要。
   # 只追加, 启动前与文本日志同样滚动 (共用 NINFER_LOG_MAX_BYTES / NINFER_LOG_KEEP)。
-  REQUEST_LOG_JSONL="${NINFER_REQUEST_LOG_JSONL:-$HERE/request_log.jsonl}"
+  REQUEST_LOG_JSONL="${NINFER_REQUEST_LOG_JSONL:-$RUNTIME_DIR/request_log.jsonl}"
   JSONL_ARGS=()
   if [ -n "$REQUEST_LOG_JSONL" ] && [ "$REQUEST_LOG_JSONL" != "0" ]; then
     if [ -f "$REQUEST_LOG_JSONL" ] && [ "$(stat -c%s "$REQUEST_LOG_JSONL")" -gt "$LOG_MAX_BYTES" ]; then
