@@ -1034,6 +1034,14 @@ public:
                                     std::span<const PlanningOwnerId> shared_owner_ids) {
         capture_pressure_candidate_       = std::make_unique<FakeAdmissionCandidate>();
         FakeAdmissionCandidate& candidate = *capture_pressure_candidate_;
+        capture_private_owner_ids.clear();
+        capture_shared_owner_ids.clear();
+        for (const FakeContinuationHandle* owner : private_owners) {
+            capture_private_owner_ids.push_back(owner->id);
+        }
+        for (const FakeSharedPrefixHandle* owner : shared_owners) {
+            capture_shared_owner_ids.push_back(owner->id);
+        }
         candidate.value.prompt_tokens     = assessment.shortlist_key.frontier;
         for (const ContextTransferRequirement& transfer : assessment.transfer_requirements) {
             const std::size_t direction = static_cast<std::size_t>(transfer.direction);
@@ -1222,6 +1230,9 @@ public:
     // Owners the Program retired behind the catalog's back (capacity reclamation).
     std::vector<std::uint32_t> retired_continuation_ids;
     std::vector<std::uint32_t> retired_shared_ids;
+    // Owners handed to the capture planner as victims in the last capture planning pass.
+    std::vector<std::uint32_t> capture_private_owner_ids;
+    std::vector<std::uint32_t> capture_shared_owner_ids;
     std::vector<std::uint32_t> inspected_shared_sources;
     std::vector<std::vector<std::uint64_t>> seal_attempts;
     std::vector<std::uint64_t> started_action_ids;
@@ -3044,6 +3055,46 @@ void test_in_progress_adoption_and_private_capture() {
     (void)finish_active(manager, program, active, 24);
 }
 
+void test_capture_planning_repairs_retired_owner() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    // A catalogued owner that the Program retired while reclaiming capacity for an earlier capture:
+    // the catalog still lists it, and before 2026-09-22 capture planning threw
+    // "capture owner has no planning ID" for exactly this disagreement. That throw reached the
+    // engine's fatal path, wiped every session and left the service answering 503 until restart.
+    const ActiveRequest seed = start_active(manager, program, 21, make_base(21), 1);
+    (void)finish_active(manager, program, seed);
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "seed owner is not catalogued before retirement");
+    program.retired_continuation_ids.push_back(seed.sequence.id);
+
+    const ActiveRequest active = start_active(manager, program, 22, make_base(22), 2);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key     = FakeShortlistKey{.digest = 22, .frontier = 24},
+        .publishes_private = true,
+    };
+    program.capture_summary.endpoint = endpoint(22, 24);
+    const auto reserved =
+        manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 5}, true, {});
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+            "a retired owner made the capture unreservable");
+    require(std::none_of(program.capture_private_owner_ids.begin(),
+                         program.capture_private_owner_ids.end(),
+                         [&](std::uint32_t id) { return id == seed.sequence.id; }),
+            "capture planning offered a retired owner as a victim");
+    auto outcome = [&]() -> FakeManager::ActiveCaptureOutcome {
+        auto progress = manager.progress_context_transaction(program, {});
+        if (std::holds_alternative<ContextTransactionInProgress>(progress)) {
+            auto completed = manager.progress_context_transaction(program, {});
+            return std::get<FakeManager::ActiveCaptureOutcome>(std::move(completed));
+        }
+        return std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+    }();
+    require(outcome.status == ContextTransactionStatus::Published,
+            "capture did not publish after the retired owner was repaired");
+    (void)finish_active(manager, program, active, 24);
+}
+
 void test_projected_nested_shared_candidates_use_marginal_value() {
     FakeManager manager = make_manager(1, 2, 2);
     FakeProgram program;
@@ -3632,6 +3683,8 @@ int main() {
     run_test("combined target exact repricing",
              test_combined_target_reprices_cancelled_pressure_copy);
     run_test("in-progress and capture", test_in_progress_adoption_and_private_capture);
+    run_test("capture planning repairs retired owners",
+             test_capture_planning_repairs_retired_owner);
     run_test("projected shared marginal value",
              test_projected_nested_shared_candidates_use_marginal_value);
     run_test("observed shared independent domains",
