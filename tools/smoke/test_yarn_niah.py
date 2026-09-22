@@ -17,7 +17,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from harness_paths import BENCH_MESSAGES as MANIFEST_DIR  # noqa: E402
+from harness_paths import BENCH_MESSAGES as MANIFEST_DIR, HARNESS_DIR  # noqa: E402
 BASE = "http://127.0.0.1:30000/v1/chat/completions"
 MODEL = "myai"
 
@@ -82,8 +82,11 @@ def ask(prompt: str, timeout: int = 3600) -> dict:
         return json.loads(resp.read())
 
 
-RESULTS_PATH = Path(__file__).resolve().parent / "yarn_niah_results.jsonl"
-PID_PATH = Path(__file__).resolve().parent / "ninfer_serve.pid"
+# Results and the service pid file belong to the harness state directory, not the source tree:
+# the launchers in this directory write both there (tools/smoke/harness_env.sh), and the pid file is
+# read to recover the configuration the result was measured under.
+RESULTS_PATH = HARNESS_DIR / "yarn_niah_results.jsonl"
+PID_PATH = HARNESS_DIR / "ninfer_serve.pid"
 
 
 def snapshot_config() -> dict:

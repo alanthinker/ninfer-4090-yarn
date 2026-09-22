@@ -10,7 +10,8 @@
 | 编译产物 | `build/apps/{ninfer,ninfer-serve,ninfer-perplexity}` |
 | 模型（与原版共用，未复制） | `../ninfer-4090/models/qwen3_8_27b.ninfer` |
 | kernel 数值测试 | `tests/ops/test_scale_positions_yarn.cu` |
-| 部署脚本 | `deploy/ninfer_service.sh`（start/stop/status）/ `deploy/run_bench.sh` / `deploy/test_yarn_niah.py` |
+| 部署脚本 | `deploy/ninfer_service.sh`（start/stop/status） |
+| 测试脚本 | `tools/smoke/`（`test_yarn_niah.py`、`test_yarn_vision.py`、`test_prefix_reuse.py`、`test_concurrency_decode.py`、`sweep_concurrency.sh` …，路径经 `tools/smoke/harness_paths.py` 解析，日志与结果写入 `build/harness/`）、`tools/bench/run_bench.sh` |
 
 ## 当前生效配置（推荐，已实测）
 
@@ -410,19 +411,19 @@ NINFER_MAX_CTX=262144 NINFER_YARN_FACTOR=1.0 bash deploy/ninfer_service.sh start
 NINFER_CONCURRENCY=1 NINFER_NO_VISION=1 NINFER_MAX_CTX=780000 NINFER_YARN_FACTOR=2.98 bash deploy/ninfer_service.sh start
 
 # 超原生上下文检索验证（这是 YaRN 的核心验收项）
-python3 deploy/test_yarn_niah.py 300000 50
-python3 deploy/test_yarn_niah.py 700000 10
+python3 tools/smoke/test_yarn_niah.py 300000 50
+python3 tools/smoke/test_yarn_niah.py 700000 10
 
 # 多模态回归（验证 MRoPE 的 [len,3] 路径没被破坏）
-python3 deploy/test_yarn_vision.py
+python3 tools/smoke/test_yarn_vision.py
 
 # 并发度 ↔ 池子容量扫描（换端口 30001，不打扰生产）
-bash deploy/sweep_concurrency.sh
+bash tools/smoke/sweep_concurrency.sh
 
 # 性能 bench（已内置 1800s 单请求超时，256K fixture 需要 6-10 分钟 prefill）
-bash deploy/run_bench.sh niah
-bash deploy/run_bench.sh scenario
-bash deploy/run_bench.sh decode
+bash tools/bench/run_bench.sh niah
+bash tools/bench/run_bench.sh scenario
+bash tools/bench/run_bench.sh decode
 
 # 停止
 bash deploy/ninfer_service.sh stop
