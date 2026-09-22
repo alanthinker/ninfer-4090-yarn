@@ -580,6 +580,14 @@ Shared candidate 必须在 prefill 前决定是否增加 split，而物理状态
 实际 planner 的 baseline 是同一 frontier 的 private-only policy。Shared publication 是可选投资：没有可行
 且严格正收益的 target 时执行 private baseline 或 Skip。
 
+Capture 搜索的预算是**工作量预算**而不是 target 数量：每个 target 的评估要遍历全部 owner 及其全部
+checkpoint（满池实测 64 owner × ~1,100 checkpoint），所以 `plan()` 把预算折算为
+`kTargetWorkBudget / (owners × checkpoints)`，并夹在 `[kMinimumTargetBudget, input.target_budget]`。
+否则 4,096 个 target × 1,100 个 checkpoint 会把一次捕获预留拖到 6.6 s（2026-09-22：99.7% 命中的请求
+TTFT 6.7–7.5 s，全部落在 `resolve-prefill-progress` 内的 `capture_planner_.plan()`；改成工作量预算后
+同一请求 152–250 ms）。portfolio 行本身按 plan 构建一次（`owner_base_`/`checkpoint_base_`），每个 target
+只按 (owner, checkpoint) 哈希索引打补丁，不再线性扫描。
+
 ### 7.3 Target
 
 Planner 的搜索节点是完整 target，而不是一条孤立 eviction action。一个 target 同时确定：
