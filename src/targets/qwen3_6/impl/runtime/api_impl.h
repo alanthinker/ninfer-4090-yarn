@@ -401,6 +401,11 @@ std::optional<PersistentBackfillProof<Variant>> Program<Variant>::prove_persiste
 }
 
 template <>
+PreparedPrompt Program<Variant>::take_failed_materialization_prompt() {
+    return PreparedPromptAccess::wrap(impl_->take_failed_materialization_prompt());
+}
+
+template <>
 ContextTransactionProgress<Variant>
 Program<Variant>::progress_context_transaction(runtime::CancellationFlagView cancellation) {
     return impl_->progress_context_transaction(cancellation);

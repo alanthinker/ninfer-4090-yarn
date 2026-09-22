@@ -342,8 +342,11 @@ public:
         }
     }
 
+    // `allow_reuse` false plans the request from root: the caller sets it after a materialization it
+    // sealed could not get capacity, so the request is served by recomputing instead of failing.
     [[nodiscard]] Inspection inspect(Program& program, const PreparedPrompt& prompt,
-                                     const RequestBasePlan& base, std::uint64_t publication_order) {
+                                     const RequestBasePlan& base, std::uint64_t publication_order,
+                                     bool allow_reuse = true) {
         if (!std::holds_alternative<std::monostate>(transaction_) ||
             program.has_context_transaction()) {
             return {.readiness = Readiness::TemporarilyBlocked};
@@ -391,7 +394,9 @@ public:
         if (!root) { throw std::logic_error("Program rejected isolated root planning"); }
         candidates.push_back(Candidate{.plan = std::move(*root)});
 
-        if (cache_enabled_) {
+        // A request that already failed to place its reuse is planned from root: recomputing is the
+        // documented fallback, and re-selecting the same reuse would repeat the same capacity miss.
+        if (cache_enabled_ && allow_reuse) {
             for (const PrefixIndexEntry& index : prefix_index_) {
                 if (!valid_prefix_index_entry(index)) { continue; }
                 const std::optional<PrefixShortlistKey> incoming =

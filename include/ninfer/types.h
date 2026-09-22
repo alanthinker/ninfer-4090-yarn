@@ -811,6 +811,11 @@ struct MaterializationDiagnostics {
     bool budget_exhausted                    = false;
     std::uint32_t selected_degradation_units = 0;
     bool selected_maximal_fallback           = false;
+    // Capacity misses spent after admission: the sealed plan asked for state or KV the pools could
+    // not produce, so the materialization was rolled back and the request re-planned (typically from
+    // root). A request-log line showing a root prefill with a nonzero count here is a degradation,
+    // not a silent fallback: the alternative was HTTP 500 'prepared prompt is empty'.
+    std::uint32_t capacity_replans           = 0;
 
     /**
      * Shape of the bounded search, to separate "the arena stopped the search inside its first
@@ -1003,6 +1008,10 @@ struct RuntimeStats {
     std::uint32_t capture_pending_requests  = 0;
     std::uint32_t terminal_pending_requests = 0;
     std::uint64_t active_captures_completed = 0;
+    // Materializations that failed on capacity after admission and were re-planned (typically from
+    // root). Engine-wide, visible in the periodic stats: a rising count is a cache the pools refused
+    // to make room for, never a silent fallback.
+    std::uint64_t materialization_capacity_replans = 0;
     std::uint64_t active_captures_aborted   = 0;
 
     std::uint64_t root_selections                    = 0;

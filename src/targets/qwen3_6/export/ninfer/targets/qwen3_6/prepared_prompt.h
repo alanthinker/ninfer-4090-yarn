@@ -166,6 +166,7 @@ class PreparedPromptAccess {
 public:
     [[nodiscard]] static const PreparedPromptData& view(const PreparedPrompt& prompt);
     [[nodiscard]] static PreparedPromptData take(PreparedPrompt&& prompt);
+    [[nodiscard]] static PreparedPrompt wrap(std::unique_ptr<PreparedPromptData> data);
 };
 
 } // namespace ninfer::targets::qwen3_6

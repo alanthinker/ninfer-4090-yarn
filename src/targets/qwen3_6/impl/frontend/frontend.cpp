@@ -1497,6 +1497,11 @@ PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
     return std::move(*data);
 }
 
+PreparedPrompt PreparedPromptAccess::wrap(std::unique_ptr<PreparedPromptData> data) {
+    if (data == nullptr) { return PreparedPrompt(); }
+    return PreparedPrompt(std::move(data));
+}
+
 const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prompt) {
     return PreparedPromptAccess::view(prompt);
 }

@@ -1821,7 +1821,7 @@ private:
 
     [[nodiscard]] ResourceInspection inspect_admission(const std::shared_ptr<Request>& request) {
         return resources_.inspect(*instance_.program, request->prompt, *request->base_plan,
-                                  request->publication_order);
+                                  request->publication_order, !request->reuse_suppressed);
     }
 
     [[nodiscard]] AdmissionProgress remove_pending_error(const std::shared_ptr<Request>& request,
@@ -1832,6 +1832,70 @@ private:
         publish_runtime_stats();
         return AdmissionProgress::ControlProgress;
     }
+
+    // Re-plan a request whose materialization failed on capacity after admission. The in-flight
+    // transaction is rolled back and the prepared prompt - which the materialization consumed - is
+    // taken back from the Program, because re-planning needs it and it is move-only. Without this a
+    // capacity miss surfaced as HTTP 500 ('prepared prompt is empty' / the raw exhaustion message)
+    // for a request a root prefill would have served.
+    [[nodiscard]] AdmissionProgress retry_materialization_after_capacity_miss(const char* what) {
+        if (!materializing_) { throw std::logic_error("capacity miss has no materializing request"); }
+        const std::shared_ptr<Request> request = materializing_->request;
+        if (request == nullptr) { throw std::logic_error("capacity miss lost its request"); }
+        std::fprintf(stderr, "materialization: re-admit after progress capacity miss site=%s\n", what);
+        std::fflush(stderr);
+        // Counted, so a degradation shows up in the request log instead of only on stderr: a root
+        // prefill with a nonzero count here was a reuse the pools refused, not a silent fallback.
+        ++request->materialization_diagnostics.capacity_replans;
+        ++cumulative_stats_.materialization_capacity_replans;
+        // Recompute rather than repeat: the next admission plans this request from root, so a pool
+        // that cannot make room costs one cold prefill instead of a failed request.
+        request->reuse_suppressed = true;
+        std::atomic<bool> abort{true};
+        (void)resources_.progress_context_transaction(*instance_.program,
+                                                      CancellationFlagView{&abort});
+        materializing_.reset();
+        restore_failed_materialization_prompt(request);
+        if (++request->admission_replans > kMaximumAdmissionReplans) {
+            std::fprintf(stderr, "[engine] request %llu gave up after %u re-plans\n",
+                         static_cast<unsigned long long>(request->id), request->admission_replans);
+            std::fflush(stderr);
+            complete_error(request,
+                           std::make_exception_ptr(std::runtime_error(
+                               "no admissible plan fits the available context cache capacity")));
+            request_admission_check();
+            publish_runtime_stats();
+            return AdmissionProgress::ControlProgress;
+        }
+        // The failed materialization produced no token, so this generation never started: clear what
+        // the abandoned admission published so the next one can publish it again.
+        request->admitted_begin.reset();
+        request->admitted_at.reset();
+        {
+            std::lock_guard lock(request->mutex);
+            request->stream_start.reset();
+            request->stream_progress.reset();
+        }
+        request->model_state = EngineRequestState::Waiting;
+        {
+            std::lock_guard lock(queue_mutex_);
+            pending_.push_back(request);
+        }
+        request_admission_check();
+        publish_runtime_stats();
+        return AdmissionProgress::ControlProgress;
+    }
+
+    // Give the request its prepared prompt back after a failed materialization consumed it.
+    void restore_failed_materialization_prompt(const std::shared_ptr<Request>& request) {
+        if (request == nullptr || request->prompt) { return; }
+        request->prompt = instance_.program->take_failed_materialization_prompt();
+    }
+
+    // Consecutive re-plans one request may spend before it is reported as unplaceable. Every attempt
+    // re-plans against the pool the release ladder just produced, so a healthy pool needs one; the
+    // bound only stops a request the pools genuinely cannot serve.
+    static constexpr std::uint32_t kMaximumAdmissionReplans = 8;
 
     [[nodiscard]] AdmissionProgress progress_context_transaction(bool yield_requested) {
         const std::optional<ContextTransactionKind> kind = resources_.context_transaction_kind();
@@ -1871,7 +1935,20 @@ private:
             break;
         }
 
-        auto outcome = resources_.progress_context_transaction(*instance_.program, cancellation);
+        std::optional<typename ResourceManagement::ContextTransactionOutcome> terminal_outcome;
+        try {
+            terminal_outcome.emplace(
+                resources_.progress_context_transaction(*instance_.program, cancellation));
+        } catch (const core::SiteBadAlloc& exhaustion) {
+            // Capacity ran out after admission: the plan's own release ladder could not produce what
+            // its commit needs. A request that fits the pools (every request does - a root prefill
+            // needs no reuse capacity) must not fail over that, so roll the materialization back and
+            // put the request back in the FIFO to be re-planned, typically from root.
+            return retry_materialization_after_capacity_miss(exhaustion.what());
+        } catch (const runtime::StalePlanningReference&) {
+            return retry_materialization_after_capacity_miss("stale planning reference");
+        }
+        auto outcome = std::move(*terminal_outcome);
         return std::visit(
             [&](auto&& terminal) -> AdmissionProgress {
                 using Outcome = std::decay_t<decltype(terminal)>;
@@ -1996,14 +2073,13 @@ private:
             .started          = Clock::now(),
         };
 
-        // Consecutive re-plans one request may spend before it is reported as unplaceable. Every
-        // attempt re-plans against the pool the release ladder just produced, so a healthy pool
-        // needs one; the bound only stops a request the pools genuinely cannot serve.
-        constexpr std::uint32_t kMaximumAdmissionReplans = 8;
         const auto reserved = resources_.reserve_materialization(
             *instance_.program, std::move(choice), std::move(request->prompt),
             CancellationFlagView{&request->cancelled});
         if (reserved == ResourceManagement::MaterializationReserveResult::Stale) {
+            // Re-planning needs the prompt the reserve consumed; the Program kept it when the
+            // reservation failed on capacity.
+            restore_failed_materialization_prompt(request);
             if (++request->admission_replans > kMaximumAdmissionReplans) {
                 // No admissible plan fits the pools this request can see, even after the release
                 // ladder ran on each attempt. Fail this request with a stated reason and keep the

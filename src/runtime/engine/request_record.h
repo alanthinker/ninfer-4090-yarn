@@ -169,6 +169,9 @@ struct RequestRecord {
     bool queue_wait_recorded = false;
     std::optional<GenerationBudget> budget;
     std::optional<BeginSummary> admitted_begin;
+    // Set when a materialization this request sealed could not get capacity: the next admission
+    // plans from root (recompute) instead of re-selecting the same reuse.
+    bool reuse_suppressed = false;
     std::optional<BeginSummary> begin;
     std::vector<TokenId> generated;
     std::string content;

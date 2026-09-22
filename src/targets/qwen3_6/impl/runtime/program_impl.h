@@ -4675,6 +4675,13 @@ void ProgramImplCore::release_materialization_staging(
     MaterializationTransaction& transaction) noexcept {
     const std::uint32_t lane = transaction.destination.value;
     if (lane < max_concurrency && requests[lane].lifecycle == Lifecycle::Empty) {
+        // Keep the prepared prompt. It is move-only and expensive to rebuild, and the engine needs
+        // it to serve this request from root after a capacity miss: dropping it here is why a
+        // capacity miss ended as HTTP 500 'prepared prompt is empty' instead of a root prefill.
+        if (requests[lane].prefill) {
+            failed_materialization_prompt_ =
+                std::make_unique<PreparedPromptData>(std::move(requests[lane].prefill->prompt));
+        }
         requests[lane].prefill.reset();
     }
     for (std::size_t position = transaction.shared_pressure_cursor;
@@ -6759,12 +6766,18 @@ std::uint32_t ProgramImplCore::host_slot_relief() const noexcept {
     const auto keep_bound = [this](StateImageHandle handle) {
         return release_protected_state && *release_protected_state == handle;
     };
-    // Only redundant (Both-resident) Host replicas are credited. Retirement is NOT credited: a plan
-    // built on capacity that only retirement can deliver is an over-promise, and the runtime then
-    // destroyed owner state a live reference still held ('StateImage handle is stale', 2026-09-21
-    // harness). A private capture that needs capacity reclaims it at reservation time instead, so
-    // the assessment is always made against the pool the ladder has already produced.
-    return state_store->count_state_relief(keep_bound).host_evictable;
+    // Redundant (Both-resident) Host replicas are the cheap relief. When the pool holds none - the
+    // steady state of a full pool is a Host pool of HostOnly checkpoints and a Device pool of
+    // DeviceOnly ones - the ladder still returns a Host slot by deleting the least valuable cached
+    // session, and that is what this credit counts. Refusing to credit it made the planner reject a
+    // reuse the runtime ladder would have placed (production 2026-09-22: reuse offered 8,453 planned
+    // from root with 177 HostOnly and 22 DeviceOnly checkpoints and no Both-resident replica, so
+    // every cheap step was ineligible). Bounded to one owner, and deliverable: the ladder runs with
+    // allow_retire at the state-restore site, and a plan it cannot deliver is re-planned from root
+    // after a counted capacity miss instead of failing the request.
+    const std::uint32_t cheap = state_store->count_state_relief(keep_bound).host_evictable;
+    if (cheap != 0) { return cheap; }
+    return retirable_host_state_slots();
 }
 
 bool ProgramImplCore::release_state_capacity_step(const char* site, bool allow_retire,
@@ -6858,12 +6871,17 @@ ProgramImplCore::reserve_logical_destination_with_release(bool allow_retire) {
     }
 }
 
-bool ProgramImplCore::retire_oldest_idle_continuation() {
-    if (!state_store) { return false; }
+std::unique_ptr<PreparedPromptData> ProgramImplCore::take_failed_materialization_prompt() noexcept {
+    return std::move(failed_materialization_prompt_);
+}
+
+ProgramImplCore::RetireVictim ProgramImplCore::select_retire_victim() const noexcept {
+    RetireVictim victim;
+    if (!state_store) { return victim; }
     // The state's own touch time is the session's last-use time, so it ages idle entries without a
     // parallel recency record. Continuations and shared prefixes both own their state.
-    std::optional<std::uint32_t> best_continuation;
-    std::optional<std::uint32_t> best_shared;
+    std::optional<std::uint32_t>& best_continuation = victim.continuation;
+    std::optional<std::uint32_t>& best_shared       = victim.shared;
     std::uint64_t best_age = std::numeric_limits<std::uint64_t>::max();
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
         if (continuation_slots[index].role != ContinuationSlotRole::Catalogued) { continue; }
@@ -6893,19 +6911,34 @@ bool ProgramImplCore::retire_oldest_idle_continuation() {
             best_age    = age;
         }
     }
-    if (best_continuation) {
-        std::fprintf(stderr,
-                     "[exhaust] drop oldest idle continuation slot=%u age_ns=%llu\n",
-                     *best_continuation, static_cast<unsigned long long>(best_age));
+    return victim;
+}
+
+std::uint32_t ProgramImplCore::retirable_host_state_slots() const noexcept {
+    const RetireVictim victim = select_retire_victim();
+    if (victim.continuation) {
+        return owner_exclusive_resources(continuation_states[*victim.continuation]).host.state_slots;
+    }
+    if (victim.shared) {
+        return owner_exclusive_resources(shared_prefix_states[*victim.shared]).host.state_slots;
+    }
+    return 0;
+}
+
+bool ProgramImplCore::retire_oldest_idle_continuation() {
+    if (!state_store) { return false; }
+    const RetireVictim victim = select_retire_victim();
+    if (victim.continuation) {
+        std::fprintf(stderr, "[exhaust] drop oldest idle continuation slot=%u\n",
+                     *victim.continuation);
         std::fflush(stderr);
-        release_continuation_slot_strict(*best_continuation);
+        release_continuation_slot_strict(*victim.continuation);
         return true;
     }
-    if (best_shared) {
-        std::fprintf(stderr, "[exhaust] drop oldest idle shared prefix slot=%u age_ns=%llu\n",
-                     *best_shared, static_cast<unsigned long long>(best_age));
+    if (victim.shared) {
+        std::fprintf(stderr, "[exhaust] drop oldest idle shared prefix slot=%u\n", *victim.shared);
         std::fflush(stderr);
-        (void)release_shared_prefix_state_strict(*best_shared, shared_prefix_slots[*best_shared].role);
+        (void)release_shared_prefix_state_strict(*victim.shared, shared_prefix_slots[*victim.shared].role);
         return true;
     }
     return false;
@@ -6917,13 +6950,29 @@ bool ProgramImplCore::can_release_continuation_slot_strict(std::uint32_t index) 
         return false;
     }
     const SequenceState& sequence = continuation_states[index];
-    if (sequence.state.fork_pending || !sequence.shared_prefix_references.empty() || !sequence.kv ||
+    if (sequence.state.fork_pending || !sequence.kv ||
         !text_kv_addresses->can_release(sequence.kv->text)) {
         std::fprintf(stderr, "[can_release_strict] FAIL slot=%u: fork=%d shared=%zu kv=%d\n",
                      index, (int)sequence.state.fork_pending, sequence.shared_prefix_references.size(),
                      (int)sequence.kv.has_value());
         std::fflush(stderr);
         return false;
+    }
+    // A retained reference to a shared prefix does not block retirement - it is released together
+    // with the session (`release_continuation_slot_strict`) - but every reference must be releasable
+    // or that release would terminate: the slot must still be catalogued and hold enough active
+    // references for the repeats this session recorded (mirrors the Active-side check).
+    for (std::size_t position = 0; position < sequence.shared_prefix_references.size(); ++position) {
+        const std::uint32_t shared = sequence.shared_prefix_references[position];
+        if (shared >= shared_prefix_capacity ||
+            shared_prefix_slots[shared].role != SharedPrefixSlotRole::Catalogued) {
+            return false;
+        }
+        const std::uint32_t required = static_cast<std::uint32_t>(std::count(
+            sequence.shared_prefix_references.begin(),
+            sequence.shared_prefix_references.begin() + static_cast<std::ptrdiff_t>(position + 1U),
+            shared));
+        if (shared_prefix_states[shared].active_references < required) { return false; }
     }
     if (sequence.kv->backend) {
         if (!backend_kv_addresses || !backend_kv_pages ||
@@ -7029,6 +7078,10 @@ void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index) noex
                      sequence.ledger[1], sequence.ledger[2], sequence.ledger[3]);
     }
     std::fflush(stderr);
+    // Retiring a session releases the retained shared-prefix references it holds: they are cache
+    // bookkeeping, not a live binding, and refusing to retire at all (which is what the guard used
+    // to do) left a full pool with nothing it was allowed to delete.
+    release_active_shared_references_strict(sequence);
     release_sequence_kv_strict(sequence);
     release_sequence_state_strict(sequence);
     retire_continuation_slot(index);
@@ -7396,8 +7449,17 @@ ProgramImplCore::state_slot_relief(std::uint32_t planned_host_state_release) con
     // runtime then retired an idle session on nearly every request, and retention collapsed from
     // ~320 retained states to ~29 during a 2026-09-21 fill (20 retirements in 12 requests). The
     // non-destructive steps below are enough for the reuse the incident needed.
-    const std::uint32_t host_budget =
+    // Two levels, and the second level always has something to give while cache remains: what the
+    // Device pool cannot hold is demoted to Host, and what Host cannot hold is deleted, least
+    // valuable first. The cheap steps above cover the demotion; the deletion is one owner's worth
+    // and is credited only when the cheap steps have nothing - crediting it unconditionally once
+    // retired a session on nearly every request (2026-09-21: retention 320 -> 29). Startup
+    // parameters size the working set, so everything this deletion touches is cache.
+    std::uint32_t host_budget =
         sat_u32(sat_u32(free_host, planned_host_state_release), counts.host_evictable);
+    if (host_budget == 0 && counts.demote_candidates != 0) {
+        host_budget = retirable_host_state_slots();
+    }
     return sat_u32(counts.drop_device_replica,
                    std::min(counts.demote_candidates, host_budget));
 }

@@ -911,6 +911,10 @@ public:
                               std::span<const SequenceHandle<Variant>> persistent_borrowers) const;
     [[nodiscard]] ContextTransactionProgress<Variant>
     progress_context_transaction(runtime::CancellationFlagView cancellation);
+
+    // Prepared prompt of a materialization that failed on capacity: the engine re-plans the request
+    // from root with it instead of failing the request. Null when there is none.
+    [[nodiscard]] PreparedPrompt take_failed_materialization_prompt();
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] PrefillProgress<Variant>

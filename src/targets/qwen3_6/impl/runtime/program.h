@@ -763,6 +763,10 @@ public:
 
     qwen3_6::SessionSnapshotTraffic snapshot_traffic_;
 
+    // The prepared prompt of a materialization that failed on capacity, kept instead of destroyed so
+    // the engine can re-plan the request from root. Null when there is none.
+    [[nodiscard]] std::unique_ptr<PreparedPromptData> take_failed_materialization_prompt() noexcept;
+
 private:
     void advance_resource_revision() noexcept {
         if (++resource_revision_.value == 0) { ++resource_revision_.value; }
@@ -1246,6 +1250,16 @@ private:
     // touched longest ago, and with it the state object it owns. Returns false when no idle
     // continuation can be retired.
     [[nodiscard]] bool retire_oldest_idle_continuation();
+    // The owner that step would delete, without deleting it, and the Host state slots deleting it
+    // would return. Split out so the capacity-relief credit prices what the ladder can actually
+    // deliver instead of guessing (storage doc 4.2).
+    struct RetireVictim {
+        std::optional<std::uint32_t> continuation;
+        std::optional<std::uint32_t> shared;
+    };
+    [[nodiscard]] RetireVictim select_retire_victim() const noexcept;
+    [[nodiscard]] std::uint32_t retirable_host_state_slots() const noexcept;
+    std::unique_ptr<PreparedPromptData> failed_materialization_prompt_;
     // One step of Device/Host StateImage capacity release, least destructive first: demote a
     // retained state to Host, then retire the oldest idle continuation. Returns false when no
     // further step can free anything.
