@@ -886,7 +886,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
-| `--auto-long-anchors N` | propose a private long anchor at each of the last N user message boundaries (turn starts) of every prompt; clamped to the anchor limit, `0` disables | anchor limit |
+| `--auto-long-anchors N` | propose a private long anchor at the boundary immediately before each of the last N user messages of every prompt (default 5), at least `--first-anchor-spacing` apart; clamped to the anchor limit, `0` disables | anchor limit |
 | `--auto-anchor-spacing N` | also propose a private long anchor at the first message boundary at or after every N tokens of the prompt, so a divergence in the middle of a long history resumes nearby instead of from token zero; `0` disables | `0` |
 | `--fair-share-buckets N` | most recently active N idle private sessions are victim-protected: their checkpoint sets (state images plus KV pages) cannot be evicted by other sessions' pressure; a request that fits no other way releases them oldest first; `0` disables | `8` |
 | `--no-thinking` | disable thinking by default | thinking on |

@@ -114,10 +114,12 @@ std::string serve_usage_text(const char* argv0) {
            "--max-long-anchors-per-continuation and placed by --auto-long-anchors; the value is "
            "accepted and ignored so existing command lines keep starting, and the flag goes "
            "away in a later release\n"
-           "       --auto-long-anchors N proposes a private long anchor at each of the last N "
-           "user message boundaries (turn starts) of every prompt, so a client that rewrites "
-           "recent history restores at the anchor below the edit instead of re-prefilling from "
-           "zero; when the retained set is full the most redundant member is released to keep "
+           "       --auto-long-anchors N proposes a private long anchor at the boundary "
+           "immediately before each of the last N user messages of every prompt (default 5), at "
+           "least --first-anchor-spacing apart, so a client that rewrites or branches a recent "
+           "user message restores at the anchor before the edit - including the assistant reply "
+           "that precedes it - instead of re-prefilling from zero; when the retained set is full "
+           "the most redundant member is released to keep "
            "the anchors spread over the whole conversation (the shallowest anchor is pinned), "
            "so raise --max-long-anchors-per-continuation and --host-state-slots for deeper "
            "edits; defaults to the cap and is clamped to it; 0 disables (anchors then need "
@@ -489,11 +491,18 @@ std::uint32_t resolve_automatic_anchor_spacing(const ServeOptions& options,
     return options.auto_anchor_spacing.value_or(0U);
 }
 
+// The last N user-message boundaries are anchored. Five covers the recent turns a client actually
+// rewrites or branches without spending the per-session anchor budget on the tail of a conversation
+// whose messages are a few dozen tokens apart (2026-09-22: with the default equal to the retention
+// cap, a short-message conversation produced an anchor every 23 tokens and evicted the spread
+// anchors). The window is also subject to `--first-anchor-spacing`, so a dense tail cannot flood it.
+constexpr std::uint32_t kDefaultAutomaticPrivateAnchors = 5;
+
 std::uint32_t resolve_automatic_private_anchors(const ServeOptions& options,
                                                 const ContextCacheOptions& resolved) {
     if (!resolved.enabled || !options.allow_prefix_reuse) { return 0; }
     const std::uint32_t cap = resolved.max_long_anchors_per_continuation.value_or(0U);
-    return std::min(options.auto_long_anchors.value_or(cap), cap);
+    return std::min(options.auto_long_anchors.value_or(kDefaultAutomaticPrivateAnchors), cap);
 }
 
 std::uint32_t resolve_first_anchor_spacing(const ServeOptions& options,

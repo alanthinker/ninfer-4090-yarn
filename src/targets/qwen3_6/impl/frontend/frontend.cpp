@@ -857,37 +857,58 @@ PreparedContextCache prepare_context_cache(
     }
 
     std::uint32_t engine_order = static_cast<std::uint32_t>(hints.markers.size());
-    // Engine-automatic private long anchors: the boundary after each of the last N user
-    // messages (turn starts), newest first. Only user-turn boundaries qualify: a private
-    // conversation is re-entered at user turns (a fork, a branch-back, or a rewritten user
-    // message), never in the middle of a tool loop, and the newest prefix is covered in real
-    // time by the endpoint and rewrite checkpoints. Tool-result and assistant boundaries
-    // inside a turn are machine-internal stops no request resumes from; taking them would
-    // flood the anchor budget and squeeze out the user-turn anchors forks actually hit. The
-    // boundary after the final message and the preamble boundary at index 0 are never
-    // anchors. Unresolved user boundaries (a folded instruction message) still consume one of
-    // the N positions, so the count is "the last N user boundaries", not "N anchors".
+    // Engine-automatic private long anchors: the boundary immediately BEFORE each of the last N user
+    // messages, newest first, at least `automatic_first_anchor_spacing` apart.
+    //
+    // Before, not after: a client re-enters a conversation by rewriting, editing, or branching a
+    // user message, and the prefix it can reuse is everything that precedes that message - including
+    // the assistant reply that comes before it. Anchoring at the end of the user message instead
+    // leaves that reply uncovered, so every edit re-prefilled it (measured 2026-09-22 on a 7-message
+    // conversation: editing the last user message reused 947 of 1,335 tokens anchored after the
+    // user messages, 1,140 when the boundary before the message is anchored).
+    //
+    // The spacing matters as much as the count: consecutive user messages in a working conversation
+    // are often tens of tokens apart, and an anchor every 23 tokens spends the whole per-session
+    // anchor budget (--max-long-anchors-per-continuation) on the tail of the conversation, evicting
+    // the spread anchors that make a deep divergence cheap. Only boundaries at least
+    // `automatic_first_anchor_spacing` below the newest kept anchor become anchors; the newest
+    // boundary is always kept, because it is the only one a client editing its final message can
+    // resume from.
+    //
+    // The preamble boundary (index 0) and the boundary after the final message (the prompt
+    // frontier) are never anchors. Unresolved user boundaries (a folded instruction message) still
+    // consume one of the N positions, so the count is "the last N user boundaries", not "N anchors".
     if (hints.automatic_private_anchors != 0 && message_count > 1) {
+        const std::uint32_t minimum_spacing =
+            hints.automatic_first_anchor_spacing != 0
+                ? (hints.automatic_anchor_spacing != 0
+                       ? std::min(hints.automatic_first_anchor_spacing,
+                                  hints.automatic_anchor_spacing)
+                       : hints.automatic_first_anchor_spacing)
+                : hints.automatic_anchor_spacing;
         std::uint32_t remaining = hints.automatic_private_anchors;
-        for (std::size_t after = message_count - 1U; after != 0 && remaining != 0; --after) {
-            // The boundary immediately before the final message is anchored whatever role the
-            // message it closes has. A client that edits, rewrites, or branches its final user
-            // message can only ever resume from there, and in an alternating conversation that
-            // boundary is the end of the assistant reply - not a user boundary, so the role filter
-            // below used to drop it and every edit re-prefilled that whole reply (measured
-            // 2026-09-22: editing the last user message reused 981 of 1,365 tokens with the filter,
-            // 1,169 without it). It costs one anchor per request and never displaces a user-turn
-            // anchor, because it is the newest one.
-            const bool before_final_message = after + 1U == message_count;
-            if (!before_final_message && message_roles[after - 1] != ChatRole::User) { continue; }
-            if (after >= message_boundaries.size() || !message_boundaries[after] ||
-                *message_boundaries[after] >= full_prompt_frontier) {
+        std::optional<std::uint32_t> newest_kept;
+        for (std::size_t message = message_count; message-- > 1 && remaining != 0;) {
+            if (message_roles[message] != ChatRole::User) { continue; }
+            if (message >= message_boundaries.size() || !message_boundaries[message] ||
+                *message_boundaries[message] >= full_prompt_frontier) {
+                --remaining;
+                continue;
+            }
+            const std::uint32_t frontier = *message_boundaries[message];
+            if (frontier == 0) {
+                --remaining;
+                continue;
+            }
+            if (newest_kept && minimum_spacing != 0 &&
+                *newest_kept - frontier < minimum_spacing) {
                 --remaining;
                 continue;
             }
             --remaining;
+            newest_kept = frontier;
             add_opportunity(PromptCacheMarkerKind::PrivateLongAnchor, SharedCandidateEvidence::None,
-                            *message_boundaries[after], engine_order++);
+                            frontier, engine_order++);
         }
     }
     // Engine-automatic spread anchors: the first boundary at or after every

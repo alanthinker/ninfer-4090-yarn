@@ -1404,17 +1404,16 @@ int test_image_resize_rejection_policy() {
     return failures;
 }
 
-// Engine-automatic private long anchors: ContextCacheHints::automatic_private_anchors = N must
-// yield PrivateLongAnchor opportunities at the boundaries after the last N user messages (turn
-// starts, newest first) plus the boundary immediately before the final message whatever role the
-// message it closes has. The second one is what a client that edits, rewrites, or branches its
-// final user message can resume from: in an alternating conversation it is the end of the
-// assistant reply, so leaving it out re-prefilled that whole reply on every edit (measured
-// 2026-09-22: 981 of 1,365 tokens reused before, 1,169 after). Tool-result and interior assistant
-// boundaries stay excluded - a private conversation is re-entered at user turns, never mid-loop -
-// and the boundary after the final message and the preamble boundary are never anchors. Automatic
-// anchors do not count against the explicit marker limit and do not merge with an explicit anchor
-// at a different frontier.
+// Engine-automatic private long anchors: ContextCacheHints::automatic_private_anchors = N yields a
+// PrivateLongAnchor at the boundary immediately BEFORE each of the last N user messages, newest
+// first, at least `automatic_first_anchor_spacing` apart. Before, not after: a client re-enters the
+// conversation by rewriting or branching a user message, and the prefix it can reuse is everything
+// preceding that message, including the assistant reply that comes before it (2026-09-22: anchoring
+// after the user message reused 947 of 1,335 tokens when the final message was edited, 1,140 with
+// the boundary before it). The spacing keeps a short-message conversation from spending the whole
+// per-session anchor budget on its tail. The preamble boundary and the prompt frontier are never
+// anchors; the newest boundary is always kept. Automatic anchors do not count against the explicit
+// marker limit and do not merge with an explicit anchor at a different frontier.
 int test_automatic_private_anchor_opportunities() {
     int failures               = 0;
     const Frontend frontend    = FrontendFactory::create_component(resources(), false);
@@ -1432,7 +1431,9 @@ int test_automatic_private_anchor_opportunities() {
         input.messages.push_back(text_message(ninfer::ChatRole::User, "first question"));
         input.messages.push_back(text_message(ninfer::ChatRole::Assistant, "first answer"));
         input.messages.push_back(text_message(ninfer::ChatRole::User, "second question"));
-        input.options.enable_thinking = false;
+        input.options.enable_thinking                     = false;
+        input.context_cache.automatic_first_anchor_spacing = 4096;
+        input.context_cache.automatic_anchor_spacing       = 32768;
         return input;
     };
     const auto anchors = [](const auto& data) {
@@ -1453,11 +1454,10 @@ int test_automatic_private_anchor_opportunities() {
                           "automatic private anchors appeared without being requested");
     }
 
-    // N = 2 on [System, User, Assistant, User]: two anchors - after "first question" (a user-turn
-    // boundary) and the boundary immediately before the final user message, which here closes the
-    // assistant reply and coincides with the rewrite checkpoint (the two identities share one
-    // captured state). The boundary after the final user message is the prompt frontier, and the
-    // preamble boundary is never an anchor.
+    // N = 2 on [System, User, Assistant, User]: the boundary before "second question" is the only
+    // user-message boundary that qualifies (the boundary before "first question" is the preamble
+    // boundary, which is never an anchor). It closes the assistant reply and coincides with the
+    // rewrite checkpoint, so the two identities share one captured state.
     std::vector<std::uint32_t> turn_anchors;
     {
         ninfer::PromptInput input                     = conversation();
@@ -1465,9 +1465,6 @@ int test_automatic_private_anchor_opportunities() {
         const auto prepared                           = frontend.prepare(std::move(input));
         const auto& data                              = FrontendFactory::inspect(prepared);
         turn_anchors                                  = anchors(data);
-        // The rewrite checkpoint closes the final user turn, so both anchors sit strictly below it:
-        // the user-turn boundary first, then the boundary before the final message (the end of the
-        // assistant reply here).
         const bool inside = std::all_of(turn_anchors.begin(), turn_anchors.end(),
                                         [&](std::uint32_t frontier) {
                                             return frontier != 0 && frontier < data.token_ids.size() &&
@@ -1475,15 +1472,23 @@ int test_automatic_private_anchor_opportunities() {
                                                     frontier <
                                                         data.identity.rewrite_checkpoint->frontier);
                                         });
-        const bool ordered_before_final =
-            turn_anchors.size() == 2 && turn_anchors[0] < turn_anchors[1];
-        failures += check(inside && ordered_before_final,
-                          "automatic_private_anchors=2 did not yield the user-turn anchor and the "
-                          "boundary before the final message");
+        failures += check(turn_anchors.size() == 1 && inside,
+                          "automatic_private_anchors=2 did not yield the boundary before the "
+                          "final user message");
+
+        // The same conversation with a 4-token spacing keeps both user-message boundaries: the one
+        // before "second question" (the end of the assistant reply) and the one before "first
+        // question". This is what stops a short-message conversation from anchoring every message.
+        ninfer::PromptInput spaced                     = conversation();
+        spaced.context_cache.automatic_private_anchors = 2;
+        spaced.context_cache.automatic_first_anchor_spacing = 4;
+        const auto spaced_prepared = frontend.prepare(std::move(spaced));
+        failures += check(anchors(FrontendFactory::inspect(spaced_prepared)).size() == 2,
+                          "a small first-anchor-spacing did not keep both user-message anchors");
     }
 
-    // N above the user-turn count proposes the same set and stops there: the preamble, interior
-    // assistant, and final boundaries are never anchors.
+    // N above the user-turn count proposes the same set and stops there: the preamble boundary and
+    // the prompt frontier are never anchors.
     {
         ninfer::PromptInput input                     = conversation();
         input.context_cache.automatic_private_anchors = 10;
@@ -1491,7 +1496,7 @@ int test_automatic_private_anchor_opportunities() {
         const auto all                                = anchors(FrontendFactory::inspect(prepared));
         failures += check(all == turn_anchors,
                           "automatic_private_anchors above the user-turn count did not stop at "
-                          "the user-turn boundaries and the boundary before the final message");
+                          "the boundary before the final user message");
     }
 
     // Tool results and assistant messages *inside* a turn produce no automatic anchors even when N
@@ -1515,7 +1520,9 @@ int test_automatic_private_anchor_opportunities() {
                    (!inspect.identity.rewrite_checkpoint ||
                     frontier < inspect.identity.rewrite_checkpoint->frontier);
         });
-        failures += check(all.size() == 2 && inside,
+        // Only the boundary before "now run the tests" qualifies: the interior tool and assistant
+        // messages are not user messages, so their boundaries are not anchors.
+        failures += check(all.size() == 1 && inside,
                           "interior tool or assistant boundaries produced automatic anchors");
     }
 

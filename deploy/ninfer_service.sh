@@ -17,7 +17,7 @@
 #   NINFER_NO_VISION     设 1 则不加 --vision, 省约 0.6 GiB
 #   NINFER_MODEL         模型路径, 默认复用 ninfer-4090/models 下已校验的那份
 #   NINFER_AUTO_LONG_ANCHORS / NINFER_MAX_LONG_ANCHORS
-#                        长锚点窗口与保留上限, 默认 32。跨会话前缀缓存就靠它: 窗口是从末尾往前数
+#                        长锚点窗口与保留上限, 默认 5。跨会话前缀缓存就靠它: 窗口是从末尾往前数
 #                        的 N 个消息边界, 必须 N >= 消息数-1 才能包住"系统提示词末尾"这条所有会话
 #                        都相同的边界。见 README 前缀缓存一节。
 #   NINFER_MAX_SHARED_PREFIXES  共享前缀目录容量, 默认 4 (实测调大不解决长会话问题)
@@ -122,7 +122,7 @@ start)
   # N=8 时 7 条消息能命中 (1.4s) 但 10 条消息仍 0 命中; N=32 时 7/10/21 条消息都能命中 8,669
   # (87-90%, TTFT 1.4-2.6s)。显存/内存占用与 N 无关 (锚点复用已预留的 snapshot arena, 实测
   # RSS 36.57 GiB、显存 30,966 MiB 在 N=4/8/32/64 下完全相同), 所以默认给足 32。
-  AUTO_ANCHORS="${NINFER_AUTO_LONG_ANCHORS:-32}"
+  AUTO_ANCHORS="${NINFER_AUTO_LONG_ANCHORS:-5}"
   MAX_ANCHORS="${NINFER_MAX_LONG_ANCHORS:-16}"
   # 同时保留的续算条目数(每个会话链一份端点/rewrite)。8 时,5~6 条会话每次发布都挤同一个
   # 上限,容易把别的会话的深度端点顶掉;16 给多会话留出余量。真正的上限是 Host KV 池

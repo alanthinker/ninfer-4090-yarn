@@ -525,7 +525,7 @@ N=32, 21 条消息:最浅检查点 = 8669                  ← 含
 | 8 | ✅ | ✅ 1.4 s | ❌ 0 | ❌ 0 |
 | 32（现值） | ✅ | ✅ 1.4 s | ✅ 1.7 s | ✅ 2.6 s |
 
-**已改的默认值**：`--auto-long-anchors 32`、`--max-long-anchors-per-continuation 32`
+**默认值**：`--auto-long-anchors` 现为 **5**（上表是旧默认 32 时的实测）、`--max-long-anchors-per-continuation 32`
 （`deploy/ninfer_service.sh`），可用 `NINFER_AUTO_LONG_ANCHORS` / `NINFER_MAX_LONG_ANCHORS` 调。
 
 **代价实测为 0**：锚点复用已预留的 snapshot arena，进程 RSS 36.57 GiB、显存 30,966 MiB 在
