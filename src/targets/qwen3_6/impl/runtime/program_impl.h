@@ -6915,14 +6915,32 @@ ProgramImplCore::RetireVictim ProgramImplCore::select_retire_victim() const noex
 }
 
 std::uint32_t ProgramImplCore::retirable_host_state_slots() const noexcept {
+    // Memoized per (resource revision, in-flight source). This walks the catalog - every catalogued
+    // owner through `can_release_continuation_slot_strict` - and the feasibility checks call the
+    // relief it feeds once per candidate assessment, hundreds of times in one planning problem. The
+    // 2026-09-22 stall (6.7 s TTFT, 499 evaluated targets) came from exactly this shape of
+    // per-assessment cost growing with the catalog, so the scan must not run there. Planning is
+    // read-only and every mutating step advances the revision; the in-flight source is part of the
+    // key because the scan skips the owner it protects.
+    const std::uint32_t protected_index =
+        (release_protected_state && state_store)
+            ? state_store->debug_index(*release_protected_state) + 1U
+            : 0U;
+    if (retirable_relief_revision_ == resource_revision_.value &&
+        retirable_relief_protected_ == protected_index) {
+        return retirable_relief_slots_;
+    }
+    std::uint32_t slots      = 0;
     const RetireVictim victim = select_retire_victim();
     if (victim.continuation) {
-        return owner_exclusive_resources(continuation_states[*victim.continuation]).host.state_slots;
+        slots = owner_exclusive_resources(continuation_states[*victim.continuation]).host.state_slots;
+    } else if (victim.shared) {
+        slots = owner_exclusive_resources(shared_prefix_states[*victim.shared]).host.state_slots;
     }
-    if (victim.shared) {
-        return owner_exclusive_resources(shared_prefix_states[*victim.shared]).host.state_slots;
-    }
-    return 0;
+    retirable_relief_revision_  = resource_revision_.value;
+    retirable_relief_protected_ = protected_index;
+    retirable_relief_slots_     = slots;
+    return slots;
 }
 
 bool ProgramImplCore::retire_oldest_idle_continuation() {

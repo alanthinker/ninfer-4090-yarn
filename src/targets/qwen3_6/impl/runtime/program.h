@@ -1259,6 +1259,10 @@ private:
     };
     [[nodiscard]] RetireVictim select_retire_victim() const noexcept;
     [[nodiscard]] std::uint32_t retirable_host_state_slots() const noexcept;
+    // Memo for the scan above: revision, protected-state index, and the Host slots it returned.
+    mutable std::uint64_t retirable_relief_revision_  = std::numeric_limits<std::uint64_t>::max();
+    mutable std::uint32_t retirable_relief_protected_ = std::numeric_limits<std::uint32_t>::max();
+    mutable std::uint32_t retirable_relief_slots_     = 0;
     std::unique_ptr<PreparedPromptData> failed_materialization_prompt_;
     // One step of Device/Host StateImage capacity release, least destructive first: demote a
     // retained state to Host, then retire the oldest idle continuation. Returns false when no

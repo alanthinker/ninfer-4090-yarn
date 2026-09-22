@@ -98,6 +98,21 @@ def post(messages, tag):
 # One long constant block shared by every conversation: the reusable prefix production refuses.
 FSL_STABLE = "myai coding agent. " + ("stable instruction and tool schema token " * 900)
 
+def planning_times():
+    """Per-request planner cost, the measure a per-assessment scan would inflate."""
+    plan, search, targets = [], [], []
+    for line in open(log_path, errors="ignore").read().splitlines():
+        if '"planning_elapsed_ns"' not in line:
+            continue
+        try:
+            materialization = json.loads(line)["materialization"]
+        except Exception:
+            continue
+        plan.append(materialization.get("planning_elapsed_ns") or 0)
+        search.append(materialization.get("search_elapsed_ns") or 0)
+        targets.append(materialization.get("targets_evaluated") or 0)
+    return plan, search, targets
+
 def conversation(session, turns, words=600):
     # The live client's shape: one long constant block that every conversation shares (its
     # developer prompt and tools), then per-session turns. The reusable prefix is therefore a
@@ -202,6 +217,12 @@ text   = open(os.environ["NINFER_SERVICE_LOG"], errors="ignore").read()
 shares = sorted(100.0 * cached / prompt for cached, prompt in results)
 print(f"  请求 {len(results)} 条 | 0% 命中 {sum(1 for c, _ in results if c == 0)} 条"
       f" | 命中率中位 {shares[len(shares) // 2]:.1f}%")
+plan, search, targets = planning_times()
+if plan:
+    plan.sort(); search.sort()
+    print("  planner: requests={} planning med/max={:.1f}/{:.1f}ms search med/max={:.1f}/{:.1f}ms "
+          "targets max={}".format(len(plan), plan[len(plan)//2]/1e6, plan[-1]/1e6,
+                                  search[len(search)//2]/1e6, search[-1]/1e6, max(targets)))
 print("  pool: host_state_slots={}/{} device_state_slots={} host_kv={:.1f}GB".format(
     occupancy.get("host_state_slots"), os.environ["AGENT_HOST_SLOTS"],
     occupancy.get("device_state_slots"), (occupancy.get("host_kv_bytes") or 0) / 1e9))
