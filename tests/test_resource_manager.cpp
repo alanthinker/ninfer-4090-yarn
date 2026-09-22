@@ -1,3 +1,4 @@
+#include "core/site_bad_alloc.h"
 #include "runtime/engine/resource_manager.h"
 
 #include <algorithm>
@@ -808,6 +809,11 @@ public:
         started_action_ids.clear();
         for (const auto& action : plan.private_actions) { started_action_ids.push_back(action.id); }
         for (const auto& action : plan.shared_actions) { started_action_ids.push_back(action.id); }
+        if (capacity_miss_on_start) {
+            // The Program releases its staging before rethrowing, so the resource manager may treat
+            // this as a retryable capacity miss rather than a fatal engine error.
+            throw ninfer::core::SiteBadAlloc("fake: materialization state restore after LRU evict");
+        }
         if (cancellation.requested() || abort_start || plan.revision != revision_) {
             return ContextTransactionReserveStatus::Aborted;
         }
@@ -1195,6 +1201,9 @@ public:
     // phase.  Off by default: the default two-pass closure never revisits assigned owners.
     bool closure_upgrades_to_eviction                    = false;
     bool abort_start                                     = false;
+    // Capacity miss raised from start_resource_transaction (the release ladder could not produce
+    // the state or KV capacity the sealed plan needs).
+    bool capacity_miss_on_start                          = false;
     bool abort_progress                                  = false;
     bool malform_last_private_victim                     = false;
     bool malform_last_capture_private_victim             = false;
@@ -2562,6 +2571,48 @@ void test_root_lifecycle_and_prefix_reuse() {
             "failed start did not roll back its logical source claim");
 }
 
+void test_capacity_miss_is_retryable() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest seed = start_active(manager, program, 31, make_base(31), 1);
+    (void)finish_active(manager, program, seed);
+
+    auto inspection = manager.inspect(program, FakePreparedPrompt{31}, make_base(31), 2);
+    require(inspection.choice.has_value(), "reuse choice was not produced");
+
+    // Saturated pools: the Program cannot place the state this plan restores even after its release
+    // ladder. Before 2026-09-22 that exception escaped to the engine worker, which wiped every
+    // session and left the service answering 503 until restart.
+    program.capacity_miss_on_start = true;
+    const auto status = manager.reserve_materialization(program, std::move(*inspection.choice),
+                                                        FakePreparedPrompt{31}, {});
+    require(status == FakeManager::MaterializationReserveResult::Stale,
+            "capacity miss was not reported as retryable work");
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "capacity miss did not roll back its logical reservation");
+
+    // The retry re-plans against the pool the ladder produced and succeeds.
+    program.capacity_miss_on_start = false;
+    auto retry = manager.inspect(program, FakePreparedPrompt{31}, make_base(31), 3);
+    require(retry.choice.has_value(), "retry produced no plan");
+    const auto retried = manager.reserve_materialization(program, std::move(*retry.choice),
+                                                         FakePreparedPrompt{31}, {});
+    require(retried == FakeManager::MaterializationReserveResult::Reserved,
+            "capacity miss left the manager unable to reserve after re-planning");
+    auto outcome = [&]() -> FakeManager::MaterializationOutcome {
+        auto progress = manager.progress_context_transaction(program, {});
+        if (std::holds_alternative<ContextTransactionInProgress>(progress)) {
+            auto completed = manager.progress_context_transaction(program, {});
+            return std::get<FakeManager::MaterializationOutcome>(std::move(completed));
+        }
+        return std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+    }();
+    require(outcome.status == ContextTransactionStatus::Published && outcome.activation,
+            "re-planned materialization did not publish");
+    auto activation = std::move(*outcome.activation);
+    manager.adopt(program, std::move(activation));
+}
+
 void test_stale_revision_is_retryable() {
     FakeManager manager = make_manager();
     FakeProgram program;
@@ -3657,6 +3708,7 @@ int main() {
              test_evicting_seed_accepted_when_retention_proven_infeasible);
     run_test("root lifecycle and prefix reuse", test_root_lifecycle_and_prefix_reuse);
     run_test("retired owner catalog repair", test_retired_owner_is_not_offered_as_reuse_source);
+    run_test("capacity miss is retryable", test_capacity_miss_is_retryable);
     run_test("stale revision is retryable", test_stale_revision_is_retryable);
     run_test("materialization abort preserves source", test_materialization_abort_preserves_source);
     run_test("committed victim survives abort", test_committed_victim_survives_transaction_abort);

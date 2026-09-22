@@ -183,6 +183,10 @@ struct RequestRecord {
     std::string abandoned_prefix_detail;
     EngineRequestState model_state        = EngineRequestState::Waiting;
     bool capture_pending                  = false;
+    // Re-plans already spent on this request because its sealed plan could not be reserved (the
+    // catalog moved, or the pools could not produce the capacity it needs). Bounded, so a request
+    // that no admissible plan can serve fails on its own instead of re-planning forever.
+    std::uint32_t admission_replans       = 0;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;
     std::optional<FinishReason> terminal_reason;
 

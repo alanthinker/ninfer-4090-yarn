@@ -1958,10 +1958,34 @@ private:
             .started          = Clock::now(),
         };
 
+        // Consecutive re-plans one request may spend before it is reported as unplaceable. Every
+        // attempt re-plans against the pool the release ladder just produced, so a healthy pool
+        // needs one; the bound only stops a request the pools genuinely cannot serve.
+        constexpr std::uint32_t kMaximumAdmissionReplans = 8;
         const auto reserved = resources_.reserve_materialization(
             *instance_.program, std::move(choice), std::move(request->prompt),
             CancellationFlagView{&request->cancelled});
         if (reserved == ResourceManagement::MaterializationReserveResult::Stale) {
+            if (++request->admission_replans > kMaximumAdmissionReplans) {
+                // No admissible plan fits the pools this request can see, even after the release
+                // ladder ran on each attempt. Fail this request with a stated reason and keep the
+                // engine serving: the alternative was an exception that cleared every session.
+                std::fprintf(stderr,
+                             "[engine] request %llu gave up after %u re-plans\n",
+                             static_cast<unsigned long long>(request->id),
+                             request->admission_replans);
+                std::fflush(stderr);
+                if (!erase_pending(request)) {
+                    throw std::logic_error("unplaceable materialization lost its waiting request");
+                }
+                on_waiting_removed(request);
+                complete_error(request,
+                               std::make_exception_ptr(std::runtime_error(
+                                   "no admissible plan fits the available context cache capacity")));
+                request_admission_check();
+                publish_runtime_stats();
+                return AdmissionProgress::ControlProgress;
+            }
             request_admission_check();
             return AdmissionProgress::ControlProgress;
         }

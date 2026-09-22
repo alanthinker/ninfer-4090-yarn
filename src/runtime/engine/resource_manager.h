@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/site_bad_alloc.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/context_cost.h"
@@ -536,6 +537,21 @@ public:
             // ladder retired or moved after sealing. The request is still serviceable, so re-plan
             // instead of failing it: the engine retries admission and the next plan sees the
             // current catalog (typically falling back to root).
+            choice.plan_.reset();
+            rollback_logical_materialization(open);
+            transaction_.template emplace<std::monostate>();
+            return MaterializationReserveResult::Stale;
+        } catch (const core::SiteBadAlloc& exhaustion) {
+            // The Program could not produce the state or KV capacity this plan needs even after its
+            // release ladder - every remaining owner is active, in flight, or protected. That is a
+            // capacity miss, not a broken invariant: the Program already released its staging
+            // before rethrowing (reserve_materialization's catch), so the catalog is consistent and
+            // the request can be re-planned against the pool the ladder just produced, which
+            // normally falls back to root. Before 2026-09-22 this exception escaped to the engine
+            // worker and took the whole service down for one request's capacity miss
+            // ('materialization state restore after LRU evict', saturated pool).
+            std::fprintf(stderr, "materialization: re-plan after capacity miss site=%s\n",
+                         exhaustion.what());
             choice.plan_.reset();
             rollback_logical_materialization(open);
             transaction_.template emplace<std::monostate>();
