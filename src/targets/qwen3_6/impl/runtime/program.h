@@ -493,6 +493,11 @@ struct RequestControl {
         std::vector<CaptureGroup> capture_groups;
         std::size_t next_capture            = 0;
         std::uint64_t pending_capture_offer = 0;
+        // Destructive capacity reclamations (retiring an idle session) this prefill has spent. Each
+        // one costs about a second of host-side release work, so the plan shares a small budget and
+        // the newest boundaries spend it first: an anchor-heavy plan used to retire one session per
+        // group and per attempt (up to 7 for a single request; 2026-09-22, 6 s TTFT on a 99.7% hit).
+        std::uint32_t destructive_reclaims = 0;
         // Frontier whose boundary hidden is recorded in the continuation StateImage: the last chunk
         // this prefill committed. An abandoned prefill publishes exactly this prefix, so it can be
         // resumed without running another chunk.
@@ -1244,8 +1249,12 @@ private:
     // One step of Device/Host StateImage capacity release, least destructive first: demote a
     // retained state to Host, then retire the oldest idle continuation. Returns false when no
     // further step can free anything.
+    // `allow_retire` permits the destructive last resort (retiring an idle session); `did_retire`
+    // reports whether that last resort ran, so a caller can bound how many sessions one request
+    // may destroy.
     [[nodiscard]] bool release_state_capacity_step(const char* site = "unknown",
-                                                   bool allow_retire = true);
+                                                   bool allow_retire = true,
+                                                   bool* did_retire = nullptr);
     // Reserve a private StateImage destination, releasing capacity step by step until it succeeds.
     [[nodiscard]] std::optional<StateImageHandle>
     reserve_state_destination_with_release(bool allow_retire = true);

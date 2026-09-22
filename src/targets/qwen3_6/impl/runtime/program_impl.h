@@ -6767,7 +6767,9 @@ std::uint32_t ProgramImplCore::host_slot_relief() const noexcept {
     return state_store->count_state_relief(keep_bound).host_evictable;
 }
 
-bool ProgramImplCore::release_state_capacity_step(const char* site, bool allow_retire) {
+bool ProgramImplCore::release_state_capacity_step(const char* site, bool allow_retire,
+                                                  bool* did_retire) {
+    if (did_retire != nullptr) { *did_retire = false; }
     if (release_one_device_state_slot()) { return true; }
     if (!allow_retire) {
         std::fprintf(stderr, "[ladder] no non-destructive capacity site=%s\n", site);
@@ -6777,10 +6779,22 @@ bool ProgramImplCore::release_state_capacity_step(const char* site, bool allow_r
     // occupancy so a retention collapse is attributable (2026-09-21: a veto regression made every
     // demotion ineligible and this step ran on nearly every request, dropping retention from ~320
     // retained states to ~29).
-    const bool retired = retire_oldest_idle_continuation();
-    std::fprintf(stderr, "[ladder] retire site=%s ok=%d device=%u/%u\n", site, retired ? 1 : 0,
-                 state_store ? state_store->device_occupied() : 0,
-                 state_store ? state_store->device_capacity() : 0);
+    const auto retire_started = std::chrono::steady_clock::now();
+    const bool retired        = retire_oldest_idle_continuation();
+    if (did_retire != nullptr) { *did_retire = retired; }
+    const double retire_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - retire_started)
+            .count();
+    std::fprintf(stderr, "[ladder] retire site=%s ok=%d device=%u/%u elapsed=%.1fms\n", site,
+                 retired ? 1 : 0, state_store ? state_store->device_occupied() : 0,
+                 state_store ? state_store->device_capacity() : 0, retire_ms);
+    // Retiring an owner releases its checkpoints' KV pages and state images; at a saturated pool
+    // that is the engine's most expensive host-side operation and it lands in the requesting
+    // request's latency (2026-09-22: 6 s TTFT on a 99.7% hit whose anchors needed capacity).
+    if (retire_ms >= 100.0) {
+        std::fprintf(stderr, "[slow] retire site=%s elapsed=%.3fs\n", site, retire_ms / 1000.0);
+        std::fflush(stderr);
+    }
     return retired;
 }
 
@@ -8459,11 +8473,35 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
     // again, so the decision is always made against the pool the ladder actually produced: a plan
     // built on crediting retirement instead destroyed state a live reference still held.
     if (!pressure.has_value() && !assessment.physically_feasible && assessment.publishes_private) {
+        // Non-destructive capacity first (demote a replica, reclaim a redundant host replica), then
+        // destruction under a per-request budget and only for the newest boundaries. Retiring an
+        // idle session releases hundreds of KV pages and every state image it held, which costs
+        // about a second; letting every optional anchor spend one turned a single request into
+        // seven retirements and a 6 s TTFT (2026-09-22). §6.2 guarantees the request's own newest
+        // checkpoint, so that is what the budget is reserved for; shallower anchors degrade to a
+        // skip, which is the documented treatment of an optional capture.
+        RequestControl::Prefill* reclaim_prefill =
+            requests[offered_lane].prefill ? &*requests[offered_lane].prefill : nullptr;
+        const std::size_t groups = reclaim_prefill ? reclaim_prefill->capture_groups.size() : 0;
+        const std::size_t newest_window = groups > 2 ? groups - 2 : 0;
+        const bool newest_boundary =
+            reclaim_prefill != nullptr && reclaim_prefill->next_capture < groups &&
+            reclaim_prefill->capture_groups[reclaim_prefill->next_capture].frontier >=
+                reclaim_prefill->capture_groups[newest_window].frontier;
+        const bool may_retire =
+            newest_boundary && reclaim_prefill->destructive_reclaims < 1U;
         for (std::uint32_t attempt = 0; attempt < 4U; ++attempt) {
-            if (!release_state_capacity_step("capture-reclaim", /*allow_retire=*/true)) { break; }
+            bool did_retire = false;
+            if (!release_state_capacity_step("capture-reclaim", may_retire, &did_retire)) { break; }
+            if (did_retire && reclaim_prefill != nullptr) { ++reclaim_prefill->destructive_reclaims; }
             assessment = inspect_capture(offer, exact_shared, planned_replacement,
                                         private_replacement, permit_shared);
             if (assessment.physically_feasible) { break; }
+        }
+        if (!assessment.physically_feasible && !newest_boundary) {
+            log_capture_decision("skip", assessment.frontier, "capacity-reserved-for-newest", {});
+            skip_capture(std::move(offer));
+            return runtime::ContextTransactionReserveStatus::Aborted;
         }
     }
     const CapturePressureCandidateImpl* pressure_details =

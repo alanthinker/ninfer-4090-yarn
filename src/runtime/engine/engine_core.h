@@ -2365,9 +2365,23 @@ private:
             try {
                 set_host_work_class(HostWorkClass::Control);
                 HostPhaseMeasurement boundary = begin_host_phase();
+                // Name an engine unit that stalls. Steady-state units are sub-millisecond host work;
+                // a multi-second unit is what an operator sees as TTFT, and until now the ledger
+                // could only say "some host phase spent 6 s" without saying which unit did it.
+                const auto unit_started = Clock::now();
+                const auto report_unit  = [&](const char* name) {
+                    const double seconds =
+                        std::chrono::duration<double>(Clock::now() - unit_started).count();
+                    if (seconds >= 0.1) {
+                        std::fprintf(stderr, "[slow] engine-unit=%s elapsed=%.3fs\n", name, seconds);
+                        std::fflush(stderr);
+                    }
+                };
                 const bool have_pending       = expire_pending_requests();
                 (void)progress_context_transaction(have_pending);
+                report_unit("progress-context-transaction");
                 (void)settle_terminal_requests(boundary);
+                report_unit("settle-terminal-requests");
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary, boundary);
                 RoundMembership membership =
@@ -2379,6 +2393,7 @@ private:
                         previous_unit_was_decode, instance_.program->has_context_transaction()) &&
                     consume_admission_check()) {
                     (void)try_admit_one();
+                    report_unit("try-admit-one");
                     membership = scheduler_.build_round_membership(slots_, max_concurrency_);
                 }
 
