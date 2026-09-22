@@ -41,6 +41,7 @@ CONCURRENCY="${AGENT_CONCURRENCY:-2}"
 FIRST_SPACING="${AGENT_FIRST_SPACING:-4096}"   # production value: first spread anchor at tools end
 ANCHOR_SPACING="${AGENT_ANCHOR_SPACING:-100}"  # dense anchors, so a filler request fills the pool
 MAX_ANCHORS="${AGENT_MAX_ANCHORS:-16}"
+SHARED_PREFIXES="${AGENT_SHARED_PREFIXES:-4}"   # small shared catalog fills fast (replacement path)
 AUTO_ANCHORS="${AGENT_AUTO_ANCHORS:-32}"    # production value: last-N user-turn boundaries
 FAIR_BUCKETS="${AGENT_FAIR_BUCKETS:-2}"
 REUSE_DIAG="${REUSE_DIAG:-0}"
@@ -60,6 +61,7 @@ PARAMS=(
     --first-anchor-spacing "$FIRST_SPACING"
     --auto-anchor-spacing "$ANCHOR_SPACING"
     --max-long-anchors-per-continuation "$MAX_ANCHORS"
+    --max-shared-prefixes "$SHARED_PREFIXES"
     --auto-long-anchors "$AUTO_ANCHORS"
     --fair-share-buckets "$FAIR_BUCKETS"
     --request-log-jsonl "$REQUEST_LOG"

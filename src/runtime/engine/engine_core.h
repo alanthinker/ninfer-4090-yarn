@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <cstdio>
 #include <exception>
 #include <future>
 #include <limits>
@@ -2250,6 +2251,18 @@ private:
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
     // Program introspection can observe a partially cleared physical state.
     void fail_all_locked(std::exception_ptr error) noexcept {
+        // Name the error in the serve log, not only in the request log: this path wipes every
+        // session and leaves the engine answering 503 until restart, so the one line that explains
+        // why has to be where an operator already looks (2026-09-22: the cause was only visible as
+        // `error.message` in request_log.jsonl).
+        try {
+            if (error) { std::rethrow_exception(error); }
+        } catch (const std::exception& failure) {
+            std::fprintf(stderr, "[engine] fatal: %s\n", failure.what());
+        } catch (...) {
+            std::fprintf(stderr, "[engine] fatal: unknown exception\n");
+        }
+        std::fflush(stderr);
         std::deque<std::shared_ptr<Request>> pending;
         {
             std::lock_guard lock(queue_mutex_);

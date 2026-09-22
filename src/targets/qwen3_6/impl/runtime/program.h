@@ -1308,7 +1308,10 @@ private:
     install_private_capture(SequenceState& sequence, const CaptureGroup& group,
                             StateImageHandle checkpoint,
                             std::optional<runtime::CheckpointRef> replacement);
-    void prepare_active_capture(ActiveCaptureTransaction& transaction);
+    // Returns false when the capture cannot be prepared against the live pool (its state
+    // destination has no device slot left), in which case the caller aborts the transaction and
+    // skips the capture: publishing an optional checkpoint must not fail the request.
+    [[nodiscard]] bool prepare_active_capture(ActiveCaptureTransaction& transaction);
     void enqueue_active_capture_transfers(ActiveCaptureTransaction& transaction);
     void abort_active_capture(ActiveCaptureTransaction& transaction) noexcept;
     [[nodiscard]] ActiveCaptureResult publish_active_capture(ActiveCaptureTransaction& transaction);

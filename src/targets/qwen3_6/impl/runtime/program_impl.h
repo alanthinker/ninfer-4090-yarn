@@ -7988,13 +7988,25 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
     if (exact_shared != nullptr && !shared_capture_matches(offer, *exact_shared)) {
         throw std::logic_error("capture dedup source is not exact");
     }
+    // A shared publication replaces an existing shared owner. That owner can be gone by the time
+    // this runs: the release ladder retires shared owners while reclaiming capacity at a saturated
+    // pool, and a caller's owner view can lag one planning pass behind it. A stale victim is not an
+    // invariant violation - it makes *this scenario* unpublishable - so the replacement is dropped
+    // and the assessment continues as the private-only baseline. Throwing here instead failed the
+    // request and latched the whole engine (fail_all_locked wiped every session and left the
+    // service answering 503 until restart; 2026-09-22, 21-message branch request on a full pool).
+    const bool replacement_stale = replacement != nullptr && !valid_shared_prefix(*replacement);
+    if (replacement_stale) { replacement = nullptr; }
     if (replacement != nullptr) {
-        if (!valid_shared_prefix(*replacement)) {
-            throw std::logic_error("capture replacement capability is stale");
-        }
         const SharedPrefixState& victim = shared_prefix_states[ContractAccess::index(*replacement)];
         if (victim.active_references != 0) {
-            throw std::logic_error("active-referenced shared prefix is not replaceable");
+            // A live reader owns the candidate victim, so this scenario cannot publish either. Same
+            // treatment as a stale victim: report the scenario as unpublishable instead of failing.
+            CaptureAssessment unpublishable;
+            unpublishable.publishes_private   = false;
+            unpublishable.publishes_shared    = false;
+            unpublishable.physically_feasible = false;
+            return unpublishable;
         }
     }
     const std::uint32_t lane               = ContractAccess::lane(offer).value;
@@ -8004,7 +8016,7 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
     const bool publish_private =
         group.rewrite.has_value() ||
         (group.long_anchor && context_cache.max_long_anchors_per_continuation.value_or(0) != 0);
-    const bool publish_shared = group.shared && permit_shared_publication &&
+    const bool publish_shared = !replacement_stale && group.shared && permit_shared_publication &&
                                 exact_shared == nullptr && shared_prefix_capacity != 0;
 
     CaptureAssessment assessment;
@@ -8043,7 +8055,14 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
             }
         }
         if (private_replacement && selected_anchor_replacement == nullptr) {
-            throw std::logic_error("private capture replacement is stale");
+            // The anchor the planner chose to replace is gone: it was retired or dropped by the
+            // release ladder between planning and reservation, which is routine once the pool is
+            // saturated. The anchor set is still full, so this group has nothing it can publish;
+            // report "not publishable" (the caller skips the capture) instead of failing the
+            // request and the whole engine with an invariant error.
+            assessment.publishes_private = false;
+            assessment.publishes_shared  = false;
+            return assessment;
         }
         if (!private_replacement) { return assessment; }
     } else if (private_replacement) {
@@ -8411,8 +8430,22 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
+    // A shared capture replaces an existing shared owner. The release ladder retires shared owners
+    // while reclaiming capacity at a saturated pool, so the owner the planner named can be gone by
+    // the time this reservation runs: the capability is then stale, and treating that as an
+    // invariant violation failed the request *and* the engine (fail_all_locked wiped every session
+    // and left the service answering 503 until restart; 2026-09-22, 21-message branch request on a
+    // full pool). Shared publication is optional (§7.2), so the capture degrades to the request's
+    // own private checkpoint (§6.2), which is the guarantee that actually matters here.
+    const SharedPrefixHandle* planned_replacement = replacement;
+    bool permit_shared                            = permit_shared_publication;
+    if (planned_replacement != nullptr && !valid_shared_prefix(*planned_replacement)) {
+        log_capture_decision("degrade", 0, "stale-shared-replacement", {});
+        planned_replacement = nullptr;
+        permit_shared       = false;
+    }
     CaptureAssessment assessment = inspect_capture(
-        offer, exact_shared, replacement, private_replacement, permit_shared_publication);
+        offer, exact_shared, planned_replacement, private_replacement, permit_shared);
     if (!assessment.publishes_private && !assessment.publishes_shared) {
         log_capture_decision("skip", assessment.frontier, "no-publication", identities());
         skip_capture(std::move(offer));
@@ -8428,8 +8461,8 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
     if (!pressure.has_value() && !assessment.physically_feasible && assessment.publishes_private) {
         for (std::uint32_t attempt = 0; attempt < 4U; ++attempt) {
             if (!release_state_capacity_step("capture-reclaim", /*allow_retire=*/true)) { break; }
-            assessment = inspect_capture(offer, exact_shared, replacement, private_replacement,
-                                        permit_shared_publication);
+            assessment = inspect_capture(offer, exact_shared, planned_replacement,
+                                        private_replacement, permit_shared);
             if (assessment.physically_feasible) { break; }
         }
     }
@@ -8523,7 +8556,8 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
             transaction.shared_pressure_results[index].owner =
                 pressure_details->shared_pressure_owner_ids[index];
             const std::uint32_t victim = transaction.shared_victim_indices[index];
-            if (replacement != nullptr && ContractAccess::index(*replacement) == victim) {
+            if (planned_replacement != nullptr &&
+                ContractAccess::index(*planned_replacement) == victim) {
                 throw std::logic_error("capture logical replacement is duplicated by pressure");
             }
             transaction.shared_pressure.push_back(MaterializationTransaction::PressureWork{
@@ -8544,8 +8578,8 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
 
     try {
         if (transaction.publish_shared) {
-            if (replacement != nullptr) {
-                const std::uint32_t index = ContractAccess::index(*replacement);
+            if (planned_replacement != nullptr) {
+                const std::uint32_t index = ContractAccess::index(*planned_replacement);
                 if (index >= shared_prefix_capacity ||
                     shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued ||
                     shared_prefix_states[index].active_references != 0) {
@@ -8681,7 +8715,7 @@ ProgramImplCore::install_private_capture(SequenceState& sequence, const CaptureG
     return removed;
 }
 
-void ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transaction) {
+bool ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transaction) {
     if (transaction.prepared || transaction.lane >= max_concurrency ||
         transaction.lane_epoch != lane_epochs[transaction.lane]) {
         throw std::logic_error("active capture capacity preparation is stale");
@@ -8732,9 +8766,14 @@ void ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
         if (transaction.recycles_private_state || host_state_images == nullptr) {
             throw std::logic_error("Host capture placement has no valid backing");
         }
-        std::optional<StateImageHandle> destination = reserve_logical_destination_with_release();
+        std::optional<StateImageHandle> destination =
+            reserve_logical_destination_with_release(allow_retire);
         if (!destination) {
-            throw std::logic_error("selected capture has no prepared logical State capacity");
+            // The ladder could not produce a Host state slot and nothing more can be released.
+            // Publishing this checkpoint is optional, so the capture is skipped (the caller aborts
+            // the transaction) instead of failing the request and the engine. Reached on a
+            // saturated pool while several lanes publish anchors at once (2026-09-22).
+            return false;
         }
         transaction.destination_state = *destination;
     } else if (transaction.recycles_private_state) {
@@ -8748,7 +8787,8 @@ void ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
         std::optional<StateImageHandle> destination =
             reserve_state_destination_with_release(allow_retire);
         if (!destination) {
-            throw std::logic_error("selected capture has no prepared Device State capacity");
+            // No device state slot could be freed (see the Host case above): skip the capture.
+            return false;
         }
         transaction.destination_state = *destination;
     }
@@ -8790,6 +8830,7 @@ void ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
         refresh_state_views(sequence);
     }
     transaction.prepared = true;
+    return true;
 }
 
 void ProgramImplCore::enqueue_active_capture_transfers(ActiveCaptureTransaction& transaction) {
@@ -9356,12 +9397,18 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     if (cancellation.requested()) { return abort(); }
     if (!transaction.prepared) {
         if (cancellation.requested()) { return abort(); }
+        bool prepared = false;
         try {
-            prepare_active_capture(transaction);
+            prepared = prepare_active_capture(transaction);
         } catch (...) {
             abort_active_capture(transaction);
             transaction.published = true;
             throw;
+        }
+        if (!prepared) {
+            log_capture_decision("skip", transaction.group.frontier, "state-destination-unavailable",
+                                 {});
+            return abort();
         }
     }
     if (transaction.transfer_enqueue_pending) {
