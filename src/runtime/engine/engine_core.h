@@ -587,7 +587,34 @@ private:
             timing.expose_engine(phase, elapsed,
                                  current_host_work_class_ == HostWorkClass::Decode &&
                                      current_decode_contains(exposure.lane));
+            // 2026-09-22: one request reported engine_commit_output=2.6 s while queue, prefill,
+            // decode, every transfer and every planner phase were accounted for, and the serve log
+            // said nothing about where the time went. Name the phase and the request instead.
+            if (elapsed >= kSlowHostPhaseNs) {
+                std::fprintf(stderr, "[slow] host-phase=%s elapsed=%.3fs request=%llu class=%s\n",
+                             engine_host_phase_name(phase), static_cast<double>(elapsed) / 1e9,
+                             static_cast<unsigned long long>(exposure.request->id),
+                             current_host_work_class_ == HostWorkClass::Decode ? "decode"
+                                                                             : "prefill");
+                std::fflush(stderr);
+            }
         }
+    }
+
+    // A host phase worth naming in the serve log. Steady-state host phases are single-digit
+    // milliseconds; anything in the hundreds is a stall the operator sees as TTFT.
+    static constexpr std::uint64_t kSlowHostPhaseNs = 300'000'000ULL;
+
+    [[nodiscard]] static const char* engine_host_phase_name(EngineHostPhase phase) noexcept {
+        switch (phase) {
+        case EngineHostPhase::Boundary:
+            return "boundary";
+        case EngineHostPhase::CommitOutput:
+            return "commit-output";
+        case EngineHostPhase::Maintenance:
+            return "maintenance";
+        }
+        return "unknown";
     }
 
     void finish_engine_phase(const HostPhaseMeasurement& measurement,
