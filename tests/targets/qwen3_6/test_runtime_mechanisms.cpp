@@ -320,11 +320,20 @@ void test_prefix_identity() {
                                         changed_position.token_ids.size()),
            "different MRoPE positions must not reuse resident state");
 
+    // `rewrite_execution_frontiers` records how a root or replay prefill is decomposed for
+    // execution (CUDA-graph chunk boundaries). It is planning state, not content: commit 598ae25c
+    // removed it from the identity comparison and from the shortlist digest, because mixing it in
+    // made the same text prefix miss its own checkpoint whenever the surrounding message structure
+    // rendered different chunk boundaries. The assertions below protect that contract, and check
+    // that the frontier list itself is still carried for planning.
     q36::PreparedPromptData changed_decomposition              = identity_prompt();
     changed_decomposition.identity.rewrite_execution_frontiers = {1};
-    expect(!q36::detail::prefix_matches(changed_decomposition, ledger, resident,
-                                        changed_decomposition.token_ids.size()),
-           "different GDN execution decomposition must not reuse resident state");
+    expect(changed_decomposition.identity.rewrite_execution_frontiers !=
+               original.identity.rewrite_execution_frontiers,
+           "the two prompts no longer differ in their execution decomposition");
+    expect(q36::detail::prefix_matches(changed_decomposition, ledger, resident,
+                                       changed_decomposition.token_ids.size()),
+           "execution decomposition must not gate resident-state reuse");
     changed_decomposition.identity.rewrite_execution_frontiers = {4};
     expect(q36::detail::prefix_matches(changed_decomposition, ledger, resident, 3),
            "execution decomposition wholly after the frontier changed prefix identity");
@@ -337,8 +346,8 @@ void test_prefix_identity() {
     incoming_future.identity.rewrite_execution_frontiers = {1, 3};
     expect(q36::detail::prefix_matches(incoming_future, ledger, resident_with_future, 1),
            "resident execution decomposition after the frontier changed prefix identity");
-    expect(!q36::detail::prefix_matches(incoming_future, ledger, resident_with_future, 3),
-           "different execution decomposition inside the frontier reused resident state");
+    expect(q36::detail::prefix_matches(incoming_future, ledger, resident_with_future, 3),
+           "in-prefix execution decomposition must not gate resident-state reuse");
 
     q36::detail::PrefixShortlistDigests future_digest;
     future_digest.assign(resident_future);
@@ -346,8 +355,8 @@ void test_prefix_identity() {
     incoming_digest.assign(incoming_future);
     expect(future_digest.at(1) == incoming_digest.at(1),
            "future execution boundaries changed an earlier content shortlist");
-    expect(future_digest.at(3) != incoming_digest.at(3),
-           "different in-prefix execution boundaries shared a shortlist digest");
+    expect(future_digest.at(3) == incoming_digest.at(3),
+           "execution boundaries must not change the content shortlist digest");
 
     resident.append_generated(1, original.rope_delta);
     ledger.push_back(12);

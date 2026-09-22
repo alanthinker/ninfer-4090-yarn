@@ -327,8 +327,17 @@ Program 的 exact verification 可以使用：
 
 Session key、marker、hash 和 prefix index 只缩小 candidate 集合，不证明命中。
 
-`rewrite_execution_frontiers` 也是 exact identity 的一部分。它记录 replay/root prefill 必须分段的 exact
-token frontiers，使重建路径采用与原生成路径一致的 execution decomposition；不能为了采用 endpoint 而忽略。
+`rewrite_execution_frontiers` **不是** exact identity 的一部分。它记录 replay/root prefill 如何分段执行
+（CUDA graph chunk 边界），是 planning 状态而不是内容：`598ae25c` 把它从 identity 比较与 shortlist digest
+中移除，因为一旦混入，同一段文本在不同外围消息结构下会算出不同 digest，导致多轮会话里 checkpoint 对**自己
+的前缀**都判不中（实测新会话 0% 命中）。因此：
+
+- `ResidentPrefixIdentity::matches()` / `prefix_equals()` 只比较 token、token type、position/MRoPE、
+  Vision span 与 media digest；
+- `PrefixShortlistDigests` 是纯内容摘要，不含 frontier marker；
+- frontier 列表仍然按会话保存，并继续驱动 root/replay prefill 的 execution decomposition，但它不决定
+  reuse eligibility；引擎也不承诺不同 decomposition 下 GDN 状态逐 bit 相同。
+
 当 NInfer 自己生成的 accepted output 形成可由历史 renderer 精确重建的边界时，所有权链固定为：
 
 ```text
