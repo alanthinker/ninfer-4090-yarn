@@ -121,7 +121,7 @@
   增长、检查点行带 fair=1、真实 DSH 会话连续 99%+ 端点命中,均通过;启动行
   `fair_share_buckets=8` 因死代码缺陷未出现在运行实例(仅日志行,功能逻辑不受影响),
   磁盘二进制已修复,下次重启后在 banner 行可见。多客户端活体重放脚本:
-  `deploy-yarn/test_fair_share_sim.py`(A 60k 热身空闲 / B 240k churn+压缩改写 /
+  `tools/smoke/test_fair_share_sim.py`(A 60k 热身空闲 / B 240k churn+压缩改写 /
   A 返回,断言端点 fair=1 CANDIDATE、命中 ≥95%、无桶释放)。
 - 已知未修(客户端侧,超出本次引擎提交):DSH 工具结果原地修剪会作废深度检查点,
   18:00 型事故引擎侧无解,需要 DSH 侧改修剪策略。
