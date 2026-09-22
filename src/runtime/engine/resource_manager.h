@@ -752,10 +752,20 @@ public:
                 });
             };
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
-                const CatalogEntry& entry = catalog_[slot];
+                CatalogEntry& entry = catalog_[slot];
                 if (entry.state != CatalogState::Catalogued || !entry.handle ||
                     private_has_active_edge(slot) ||
                     is_fair_share_protected(protected_slots, slot)) {
+                    continue;
+                }
+                // An owner the Program retired while reclaiming capacity for an earlier capture in
+                // this same request is gone even though this catalog still lists it. It must not
+                // enter the capture planning domain: a later lookup for its planning ID would fail
+                // and, before 2026-09-22, that throw reached the engine's fatal path and took the
+                // whole service down. Repair the catalog instead.
+                if (!program.continuation_is_live(*entry.handle)) {
+                    std::fprintf(stderr, "catalog: clear retired private owner slot=%u\n", slot);
+                    clear_catalog_entry(entry);
                     continue;
                 }
                 const PlanningOwnerId owner{
@@ -788,8 +798,13 @@ public:
                 }
             }
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
-                const SharedCatalogEntry& entry = shared_catalog_[slot];
+                SharedCatalogEntry& entry = shared_catalog_[slot];
                 if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+                if (!program.shared_prefix_is_live(*entry.handle)) {
+                    std::fprintf(stderr, "catalog: clear retired shared owner slot=%u\n", slot);
+                    clear_shared_entry(entry);
+                    continue;
+                }
                 // Price before publishing this owner into the capture policy: an owner whose
                 // checkpoint the emergency ladder already released must not enter the domain at
                 // all (a policy row without a checkpoint would be a dangling owner).
@@ -836,17 +851,19 @@ public:
                 std::vector<PlanningOwnerId> private_owner_ids;
                 std::vector<const SharedPrefixHandle*> shared_owners;
                 std::vector<PlanningOwnerId> shared_owner_ids;
+                // Owners outside the planning domain (retired, actively referenced, fair-share
+                // protected, or with no priced checkpoint) are simply not victims. Callers skip
+                // them or the scenario that needs them: a capture is optional, so an owner view
+                // that lags the Program must never fail the request.
                 const auto owner_id_for = [&](LogicalOwnerKind kind,
-                                              std::uint32_t slot) -> PlanningOwnerId {
+                                              std::uint32_t slot) -> std::optional<PlanningOwnerId> {
                     const auto found =
                         std::find_if(capture_owner_records.begin(), capture_owner_records.end(),
                                      [&](const auto& record) {
                                          return record.capability.owner.kind == kind &&
                                                 record.capability.slot == slot;
                                      });
-                    if (found == capture_owner_records.end()) {
-                        throw std::logic_error("capture owner has no planning ID");
-                    }
+                    if (found == capture_owner_records.end()) { return std::nullopt; }
                     return found->id;
                 };
                 if (pressure_evidence) {
@@ -861,9 +878,11 @@ public:
                             is_fair_share_protected(protected_slots, slot)) {
                             continue;
                         }
+                        const std::optional<PlanningOwnerId> owner =
+                            owner_id_for(LogicalOwnerKind::PrivateContinuation, slot);
+                        if (!owner) { continue; }
                         private_owners.push_back(&*entry.handle);
-                        private_owner_ids.push_back(
-                            owner_id_for(LogicalOwnerKind::PrivateContinuation, slot));
+                        private_owner_ids.push_back(*owner);
                     }
                     for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
                         const SharedCatalogEntry& entry = shared_catalog_[slot];
@@ -872,9 +891,25 @@ public:
                             entry.id == scenario.replacement_id) {
                             continue;
                         }
+                        const std::optional<PlanningOwnerId> owner =
+                            owner_id_for(LogicalOwnerKind::SharedPrefix, slot);
+                        if (!owner) { continue; }
                         shared_owners.push_back(&*entry.handle);
-                        shared_owner_ids.push_back(
-                            owner_id_for(LogicalOwnerKind::SharedPrefix, slot));
+                        shared_owner_ids.push_back(*owner);
+                    }
+                }
+                std::optional<PlanningOwnerId> direct_shared_victim;
+                if (scenario.replacement != nullptr) {
+                    direct_shared_victim =
+                        owner_id_for(LogicalOwnerKind::SharedPrefix, scenario.publication_slot);
+                    if (!direct_shared_victim) {
+                        // The scenario replaces a shared owner that is no longer in the planning
+                        // domain: the ladder retired it between building this scenario and this
+                        // pass. Drop the scenario; the private baseline still publishes.
+                        std::fprintf(stderr,
+                                     "capture: skip frontier=%u reason=replacement-not-plannable\n",
+                                     scenario.assessment.frontier);
+                        continue;
                     }
                 }
                 const typename CapturePlanner::Input input{
@@ -885,11 +920,7 @@ public:
                     .shared_owner_ids    = shared_owner_ids,
                     .owner_policies      = owner_policies,
                     .checkpoint_policies = checkpoint_policies,
-                    .direct_shared_victim =
-                        scenario.replacement == nullptr
-                            ? std::nullopt
-                            : std::optional<PlanningOwnerId>(owner_id_for(
-                                  LogicalOwnerKind::SharedPrefix, scenario.publication_slot)),
+                    .direct_shared_victim = direct_shared_victim,
                     .candidate_demand_mask =
                         committed_demand_mask_for(scenario.assessment.shortlist_key),
                     .candidate_rebuild_ns =
