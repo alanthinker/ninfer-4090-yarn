@@ -88,7 +88,16 @@ public:
         validate(input);
         build_portfolio_base(input, machine_cost);
         queue_.clear();
-        target_ledger_.reset(static_cast<std::size_t>(input.target_budget) + 1U);
+        const std::uint64_t domain =
+            static_cast<std::uint64_t>(input.owner_policies.size() + 1U) *
+            static_cast<std::uint64_t>(input.checkpoint_policies.size() + 1U);
+        const std::uint32_t target_budget =
+            domain == 0
+                ? input.target_budget
+                : static_cast<std::uint32_t>(
+                      std::clamp<std::uint64_t>(kTargetWorkBudget / domain, kMinimumTargetBudget,
+                                                input.target_budget));
+        target_ledger_.reset(static_cast<std::size_t>(target_budget) + 1U);
 
         auto session = program.begin_capture_pressure_planning(
             *input.capture, input.private_owners, input.private_owner_ids, input.shared_owners,
@@ -113,7 +122,7 @@ public:
         std::uint32_t targets_evaluated = 0;
         std::size_t cursor              = 0;
 
-        while (cursor < queue_.size() && targets_evaluated < input.target_budget) {
+        while (cursor < queue_.size() && targets_evaluated < target_budget) {
             const QueuedTarget queued = queue_[cursor++];
             if (target_marked(queued.ordinal, kTargetAssessed)) { continue; }
             AssessedPressureTarget assessed            = session.assess(queued.target);
@@ -160,7 +169,7 @@ public:
                 continue;
             }
             auto prepared                 = session.prepare_expansion(queued.target);
-            const std::uint32_t remaining = input.target_budget - canonical_targets;
+            const std::uint32_t remaining = target_budget - canonical_targets;
             if (prepared.new_canonical_count() > remaining) {
                 session.discard_expansion(std::move(prepared));
                 continue;
@@ -202,6 +211,12 @@ public:
     }
 
     static constexpr std::uint32_t kTargetBudget = 4096;
+    // Every target assessment walks all owners and all their checkpoints, so the search costs
+    // target_budget x domain. Budget the work, not the target count: with 64 owners and ~1,100
+    // checkpoints, a 4,096-target budget spent 6.6 s inside one request's capture reservation
+    // (2026-09-22), while the decision itself is binary - publish the shared checkpoint or not.
+    static constexpr std::uint64_t kTargetWorkBudget   = 48'000;
+    static constexpr std::uint32_t kMinimumTargetBudget = 16;
 
 private:
     struct QueuedTarget {
