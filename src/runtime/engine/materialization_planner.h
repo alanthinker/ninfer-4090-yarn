@@ -509,9 +509,15 @@ public:
 
         const auto expand_target = [&](const QueueEntry& parent) {
             if (target_marked(parent.stable_target_ordinal, kTargetExpanded)) { return true; }
-            if (optional_targets >= effective_target_budget) { return false; }
+            // The first expansion is always allowed. It is the minimum unit of search, and a
+            // request whose guided closure failed must still be able to look at one neighbourhood;
+            // otherwise it would fall back to the maximal (release-everything) plan, which destroys
+            // other sessions' cache -- the failure mode the 2026-09-21 retention collapse showed.
+            // One expansion costs ~300 assessments (~0.3 s), bounded and rare.
+            if (expansions != 0 && optional_targets >= effective_target_budget) { return false; }
             auto prepared = session.prepare_expansion(parent.target);
-            if (prepared.new_canonical_count() > effective_target_budget - optional_targets) {
+            if (expansions != 0 &&
+                prepared.new_canonical_count() > effective_target_budget - optional_targets) {
                 session.discard_expansion(std::move(prepared));
                 return false;
             }
