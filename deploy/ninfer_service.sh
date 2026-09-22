@@ -29,11 +29,11 @@
 #                                                             本服务 ~75 req/h, 100 个只有 ~1.5 小时; 0=不限)
 #                          NINFER_DUMP_REQUESTS_MAX_AGE_HOURS 超过多少小时删除, 默认 24 (0=不限)
 #                        只清理服务自己写的 req-*.json, 目录里其他文件不动。
-#   NINFER_REUSE_DIAG    前缀复用诊断, 默认 1 (每次 start 自动开启)。每个请求把前缀索引里
+#   NINFER_REUSE_DIAG    前缀复用诊断, 默认 0 (生产关闭)。每个请求把前缀索引里
 #                        每一个 checkpoint 及拒绝它的具体门槛(index-invalid / 状态 / 内容不匹配
 #                        等)逐条打到 stderr(即服务日志)。只读不改行为, 用于区分 0% 命中到底是
 #                        "请求字节变了"还是"规划器没来得及评估候选"(长上下文的 time_budget 超时)。
-#                        日志量随 checkpoint 数线性增长, 不需要时设 0 或空字符串关闭。
+#                        日志量随 checkpoint 数线性增长(每请求上千行), 排查前缀缓存命中时设 1 开启。
 #   NINFER_LOG_LEVEL     日志级别, 默认 debug。相比 info 多出的只有: 启动时一条内存台账(权重后/
 #                        启动后/余量)、每个 prompt 一条上下文成本(传输/预填/画像)、warmup 两条
 #                        —— 共个位数行/请求, 对性能无可测影响。(trace 与 debug 输出完全相同:
@@ -42,13 +42,23 @@
 #                        每次启动前若 ninfer_serve.log 超过阈值, 归档为 ninfer_serve.log.1
 #                        (更旧的 .1→.2 依次后移), 最多保留 NINFER_LOG_KEEP 份归档(默认 2)。
 #   NINFER_LOG_KEEP      归档份数, 默认 2 (即 log + log.1 + log.2 三个文件)。
+#   NINFER_REQUEST_LOG_JSONL
+#                        机器可读请求日志 (jsonl), 默认 $HERE/request_log.jsonl (每次 start 自动开启)。
+#                        每行一个 JSON 事件: server_start (启动配置/内存/参数快照)、
+#                        request_start / request_done / request_error / request_rejected
+#                        (单请求全精度: queue/prefill/decode 分段, 引擎 CPU 五分解
+#                        engine_boundary/submit/post/commit/maintenance, 复用路径
+#                        prefix_reuse_path, MTP 接受统计, 物化规划诊断)、
+#                        throughput (每 5 秒: 调度器状态 + host_work 五分解 + 内存摘要)。
+#                        文本日志的单行摘要是给人看的, 这里是事后归因 (例如"TTFT 里排队 2s
+#                        花在哪") 的数据源。只追加; 启动前与文本日志同样滚动
+#                        (NINFER_LOG_MAX_BYTES / NINFER_LOG_KEEP 共用)。设为 0 或空字符串关闭。
 #   NINFER_SKIP_MEM_CHECK 设 1 跳过启动前的内存门禁(默认开启)。
 #
-# 本脚本不会自动停 vLLM: 启动前检查 vLLM (python -m vllm.entrypoints 父进程 / VLLM:: 子进程)
-# 是否还在运行, 在则报错退出, 需要先手工执行:
-#   /root/ai/large_models/qwen_3.8_27b/vllm_service.sh stop
-# 注意 vLLM 被停掉/强杀后 /dev/shm/vllm_offload_*.mmap 的 offload 残留不会自己 unlink, 残留的
-# 文件页会一直占着 RAM, 可能让下面的内存门禁拒绝启动。
+# 启动前会自动收掉 vLLM 并清掉它的 /dev/shm 残留, 走共用脚本 /root/ai/large_models/kill_vllm.sh:
+# 停父启动进程 + VLLM:: 子进程(含"父进程已死、只剩 EngineCore"的孤儿 —— 它仍占着显存, 还映射
+# 着 offload 段), 再删 /dev/shm/vllm_offload_*.mmap(被强杀时 vLLM 不会自己 unlink, 残留的
+# 文件页会一直占着 RAM)。设 NINFER_NO_AUTO_STOP_VLLM=1 则只报错退出、不自动停 vLLM。
 # 内存门禁按 host state 槽位 x 147 MiB + host KV 32 GiB + 4 GiB 余量估算需求, 不够就明确
 # 拒绝启动: 否则不会有任何报错, 只会在 "pinning host KV" 之后被内核 OOM 杀掉。
 #
@@ -100,10 +110,8 @@ start)
   # 根治在客户端 (compaction-basic 应当把会话档位带上), 这里是不改客户端的服务端兜底。
   DEFAULT_EFFORT="${NINFER_DEFAULT_EFFORT:-medium}"
   # 跨会话前缀缓存的关键: 自动长锚点窗口 + 保留上限。
-  # 引擎在每个 prompt 的「最后 N 个用户消息边界(用户轮起点)」上放置私有长锚点
-  # (N=--auto-long-anchors; 工具/助手消息边界不入候选——分叉/回访只发生在用户轮),
-  # 而每条 continuation 最多保留 --max-long-anchors-per-continuation 个, 满了就抽掉间距最挤
-  # (最冗余)的那个、钉住最浅的头锚, 使锚点大致等距铺满整个会话 (老消息也留有恢复点)。
+  # 引擎在每个 prompt 的「最后 N 个消息边界」上放置私有长锚点 (N=--auto-long-anchors),
+  # 而每条 continuation 最多保留 --max-long-anchors-per-continuation 个, 满了就替换最浅的那个。
   # 窗口是从结尾往前数的, 所以 N 太小 + 历史消息多时, 唯一对所有会话都相同的那条边界
   # (developer/system 之后, 即整个系统提示词的末尾) 会落在窗口之外 —— 于是每个新会话都 0 命中。
   # 实测 (本机, 同一份 DSH 历史会话 payload): N=4 时 7/21 条消息的会话全部 0 命中 (7.6-8.5s);
@@ -111,16 +119,16 @@ start)
   # (87-90%, TTFT 1.4-2.6s)。显存/内存占用与 N 无关 (锚点复用已预留的 snapshot arena, 实测
   # RSS 36.57 GiB、显存 30,966 MiB 在 N=4/8/32/64 下完全相同), 所以默认给足 32。
   AUTO_ANCHORS="${NINFER_AUTO_LONG_ANCHORS:-32}"
-  MAX_ANCHORS="${NINFER_MAX_LONG_ANCHORS:-64}"
+  MAX_ANCHORS="${NINFER_MAX_LONG_ANCHORS:-16}"
   # 同时保留的续算条目数(每个会话链一份端点/rewrite)。8 时,5~6 条会话每次发布都挤同一个
   # 上限,容易把别的会话的深度端点顶掉;16 给多会话留出余量。真正的上限是 Host KV 池
   # (32 GiB ≈ 188 万 token),条目再多也超不过它。
-  PRIVATE_CONTINUATIONS="${NINFER_MAX_PRIVATE_CONTINUATIONS:-16}"
+  PRIVATE_CONTINUATIONS="${NINFER_MAX_PRIVATE_CONTINUATIONS:-64}"
   # 共享前缀目录容量。引擎自己对每个 prompt 提出三个候选: 「全部 tools 之后」「连续 leading
   # System/Developer 之后」「full prompt」——第二个就是所有会话都相同的系统提示词末尾。
   # 但这些是 EngineStructural 证据, 按设计 (docs/maintainer/resource-scheduling-and-context-cache.md
   # §7.2) 只能用"不降低现有 owner 的空余终态", 默认容量只有 max(并发,4)=4, 容易被占满而发布不出去。
-  SHARED_PREFIXES="${NINFER_MAX_SHARED_PREFIXES:-8}"
+  SHARED_PREFIXES="${NINFER_MAX_SHARED_PREFIXES:-16}"
   # Host StateImage 槽位数。每个 checkpoint(会话端点 1 个 + 每个长锚点 1 个)都要独占一张
   # GDN 递归状态快照,147 MiB,而且它一旦没有 device/host 副本,该 checkpoint 就按设计不可用
   # —— 即使它的 KV 页还在显存里。所以槽位数不足时,症状是"深度端点反复消失、命中退化到浅的
@@ -152,6 +160,13 @@ start)
   #   32768 时,658k 上下文约产生 20 个铺开锚点 + 32 个尾部锚点 = 52 张状态镜像 ≈ 7.6 GiB/会话,
   #   所以 --host-state-slots 要按 会话数 x (2 + 尾部锚点 + 铺开锚点) 配足(160 够 3 个会话)。
   ANCHOR_SPACING="${NINFER_ANCHOR_SPACING:-32768}"
+  # 首个锚点位置 (2026-09-20 修复: 短对话 <32K 没有锚点导致 state 不可恢复)
+  # 2026-09-21: 8192 -> 4096。DSH 客户端的 developer+tools 边界实测 8,131 tokens, 距 8192
+  # 只差 61: 首个铺开锚点被推过那条 user 消息(落在提醒词边界 8,506), 同前缀的"单发兄弟
+  # 消息"(只发最新一条、不带历史)共同前缀在 8,131 分叉, 锚点全在分叉之后, 结构性 0% 命中
+  # (alantest1/2、eee/ttt、99999 均复现; 5 消息形 tools 边界 8,453 ≥ 8192 故一直正常)。
+  # 4096 使首个锚点压在 tools 边界(8,131, user 消息之前), 兄弟消息即可互相命中。
+  FIRST_ANCHOR_SPACING="${NINFER_FIRST_ANCHOR_SPACING:-4096}"
   # 公平份额桶 (2026-09-12 17:09 事故修复)。最近活跃的 N 个空闲会话的整套 checkpoint
   # (状态镜像 + KV 页, 随 owner 一体) 被硬保护: 别的会话的压力(增长/压缩 churn)只能驱逐
   # 共享池里的 owner, 动不到它们的深度端点。没有这个, 空闲会话会被"价值模型"当成最划算的
@@ -172,18 +187,28 @@ start)
     echo "警告: 模型大小 $SZ != $EXPECT. 校验命令:"
     echo "  cd $(dirname "$MODEL") && echo 'eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e  $(basename "$MODEL")' | sha256sum --check"
   fi
-  # vLLM (myai, :30000) 是本会话 AI 的模型后端, 与本服务互斥: 共用 :30000 和同一块 GPU,
-  # 它的 KV offload 段还要占 30+ GiB RAM。本脚本不自动停它: 还在运行就报错退出,
-  # 必须先手工执行 /root/ai/large_models/qwen_3.8_27b/vllm_service.sh stop。
-  if pgrep -f '^[^ ]*python[0-9.]* -m vllm[.]entrypoints' >/dev/null \
-     || pgrep -f '^VLLM::' >/dev/null; then
+  # vLLM 与本服务互斥: 共用 :30000 和同一块 GPU, 它的 KV offload 段还要占 30+ GiB RAM。
+  # 停进程(父启动进程 + VLLM:: 子进程, 含"父进程已死、只剩 EngineCore"的孤儿)与清 /dev/shm
+  # 的 offload 残留, 统一交给共用脚本 kill_vllm.sh: 顺序(先 SIGTERM → 超时 SIGKILL → 确认无
+  # 残留 → 才删文件)和防误杀都在那一处实现并自测过。没有 vLLM 在跑时它什么都不做。
+  # ※ 必须排在下面的端口检查之前 —— vLLM 正常在跑时正是它占着 :30000。
+  # 想自己控制先后顺序: NINFER_NO_AUTO_STOP_VLLM=1 时改为只报错退出。
+  KILL_VLLM="${NINFER_KILL_VLLM:-/root/ai/large_models/kill_vllm.sh}"
+  if [ "${NINFER_NO_AUTO_STOP_VLLM:-0}" = "1" ] \
+     && { pgrep -f '^[^ ]*python[0-9.]* -m vllm[.]entrypoints' >/dev/null || pgrep -f '^VLLM::' >/dev/null; }; then
     echo "错误: vLLM (myai, :30000) 还在运行。先执行:"
     echo "  /root/ai/large_models/qwen_3.8_27b/vllm_service.sh stop"
     exit 1
   fi
+  [ -x "$KILL_VLLM" ] || { echo "错误: 缺少 $KILL_VLLM —— 自动停 vLLM 与清 offload 残留要靠它"; exit 1; }
+  "$KILL_VLLM" || {
+    echo "错误: vLLM 没清干净(见上面输出), 先手工处理:"
+    echo "  /root/ai/large_models/qwen_3.8_27b/vllm_service.sh stop"
+    exit 1
+  }
 
-  # 端口检查(vLLM 还在跑时上面已经退出; 这里确认 :30000 真的空出来了,
-  # 若被非 vLLM 的东西占着, 由这里报错。)
+  # 端口检查(放在自动停止之后: 刚把 vLLM 收掉, 这里顺带确认 :30000 真的空出来了;
+  # 若被非 vLLM 的东西占着, 上面那步不会动它, 由这里报错。)
   if ss -tln | grep -q ":$PORT "; then echo "错误: 端口 $PORT 被占用"; exit 1; fi
 
   # 内存门禁。本服务启动时要把 host state (槽位 x 147 MiB) 和 host KV (--host-kv-mib)
@@ -266,16 +291,36 @@ start)
     unset NINFER_DUMP_REQUESTS
     echo "请求体落盘: 已关闭 (设 NINFER_DUMP_REQUESTS=目录 可开启)"
   fi
-  # 前缀复用诊断(默认开启)。同样是 getenv 读取(非命令行参数), 必须 export。
+  # 前缀复用诊断(默认关闭)。同样是 getenv 读取(非命令行参数), 必须 export。
   # 每个请求逐条打印前缀索引里每个 checkpoint 的拒绝门槛: 排查长上下文 0% 命中时,
   # 用它区分"请求字节变了"(内容不匹配)与"规划器 time_budget 超时放弃"(候选没被评估)。
-  REUSE_DIAG="${NINFER_REUSE_DIAG:-1}"
+  # 日志量每请求上千行, 只留作按需开关: 设 NINFER_REUSE_DIAG=1 开启。
+  REUSE_DIAG="${NINFER_REUSE_DIAG:-0}"
   if [ -n "$REUSE_DIAG" ] && [ "$REUSE_DIAG" != "0" ]; then
     export NINFER_REUSE_DIAG=1
     echo "前缀复用诊断: 开 (每个请求在日志里列出各 checkpoint 的拒绝原因; NINFER_REUSE_DIAG=0 关闭)"
   else
     unset NINFER_REUSE_DIAG
-    echo "前缀复用诊断: 已关闭"
+    echo "前缀复用诊断: 已关闭 (设 NINFER_REUSE_DIAG=1 开启)"
+  fi
+  # 机器可读请求日志 (jsonl): 单请求全精度计时 (queue/CPU 五分解/复用路径/物化规划)
+  # + 每 5 秒调度器与 host_work 采样, 是 TTFT 归因的事后数据源; 文本日志只有单行摘要。
+  # 只追加, 启动前与文本日志同样滚动 (共用 NINFER_LOG_MAX_BYTES / NINFER_LOG_KEEP)。
+  REQUEST_LOG_JSONL="${NINFER_REQUEST_LOG_JSONL:-$HERE/request_log.jsonl}"
+  JSONL_ARGS=()
+  if [ -n "$REQUEST_LOG_JSONL" ] && [ "$REQUEST_LOG_JSONL" != "0" ]; then
+    if [ -f "$REQUEST_LOG_JSONL" ] && [ "$(stat -c%s "$REQUEST_LOG_JSONL")" -gt "$LOG_MAX_BYTES" ]; then
+      rm -f "$REQUEST_LOG_JSONL.$LOG_KEEP"
+      for ((i = LOG_KEEP - 1; i >= 1; i--)); do
+        [ -f "$REQUEST_LOG_JSONL.$i" ] && mv -f "$REQUEST_LOG_JSONL.$i" "$REQUEST_LOG_JSONL.$((i + 1))"
+      done
+      mv -f "$REQUEST_LOG_JSONL" "$REQUEST_LOG_JSONL.1"
+      echo "JSON 日志已滚动: 旧日志归档为 $REQUEST_LOG_JSONL.1 (保留 ${LOG_KEEP} 份归档)"
+    fi
+    JSONL_ARGS=(--request-log-jsonl "$REQUEST_LOG_JSONL")
+    echo "请求 JSON 日志: 开 ($REQUEST_LOG_JSONL)"
+  else
+    echo "请求 JSON 日志: 已关闭 (设 NINFER_REQUEST_LOG_JSONL=路径 可开启)"
   fi
   echo "===== $(date '+%F %T') 启动 (yarn factor=$YARN_FACTOR ctx=$MAX_CTX) =====" >> "$LOG"
   # setsid: 让服务脱离启动者的会话/进程组。否则启动它的 shell 收到 SIGTERM 时, 整组连同
@@ -299,9 +344,11 @@ start)
     --max-long-anchors-per-continuation "$MAX_ANCHORS" \
     --auto-long-anchors "$AUTO_ANCHORS" \
     --auto-anchor-spacing "$ANCHOR_SPACING" \
+    --first-anchor-spacing "$FIRST_ANCHOR_SPACING" \
     --fair-share-buckets "$FAIR_SHARE_BUCKETS" \
     --default-reasoning-effort "$DEFAULT_EFFORT" \
     --log-level "$LOG_LEVEL" \
+    "${JSONL_ARGS[@]}" \
     --preserve-thinking >>"$LOG" 2>&1 &
   echo $! > "$PIDF"
   echo "pid=$(cat "$PIDF")  日志: $LOG"
@@ -331,7 +378,8 @@ start)
   ;;
 stop)
   # 只匹配 "二进制路径 + 本模型路径", 不会误杀 35B 服务 (不同二进制+模型)。
-  # 注意: deploy-yarn/ninfer_service.sh 用的是同一份二进制+同一模型, 命令行特征相同, 两个实例互可见。
+  # 注意: _ninfer_repos/deploy-yarn/ninfer_service.sh 用的是同一份二进制+同一模型,
+  # 命令行特征相同, 两个实例互可见 —— 日常启停只认其中一份, 别两边都用来操作。
   if [ -f "$PIDF" ]; then
     PID=$(cat "$PIDF")
     kill "$PID" 2>/dev/null || true
