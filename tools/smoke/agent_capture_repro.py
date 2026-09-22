@@ -150,8 +150,11 @@ def client_messages(template, user_text, big_tokens=0, salt=None):
     dev = template["messages"][0]["content"]
     if salt is not None:
         # A distinct developer prefix keeps filler anchors from matching the measured shape: the
-        # filler must occupy the pools without becoming a reuse candidate for the pair.
-        dev = dev[:-16] + f"[filler-{salt}]".ljust(16, ".")
+        # filler must occupy the pools without becoming a reuse candidate for the pair. The salt
+        # goes at the START of the block, because prefix reuse matches from token zero: a marker at
+        # the end leaves the first 6.8K tokens identical to every earlier run, so the "cold" request
+        # of a pair hit cache from an anchor an earlier pair had published (2026-09-22).
+        dev = f"[salt-{salt}]".ljust(16, ".") + dev[16:]
     constants = [{"role": "developer", "content": dev}]
     for message in template["messages"][1:]:
         constants.append({"role": message["role"], "content": message["content"]})

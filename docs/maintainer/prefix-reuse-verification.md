@@ -123,10 +123,21 @@ Measured on 2026-09-22 at `host_state_slots 320/320` (`--host-state-slots 320`,
 
 | Sequence | Result |
 |---|---|
-| cold request (new developer prefix, nothing to reuse) | `path=root`, 0 %, TTFT 7.4 s |
-| sibling message of that request, 2 s later | `path=private_long_anchor`, 9,468/9,482 = 99.8 %, TTFT 0.16 s |
-| the eight recorded client requests | 96.1–100 %, TTFT 0.03–0.75 s (previously 2.0–9.6 s) |
-| soak windows (fork sequence ×4, anchor probe, cold+siblings, 4-way bursts ×2) | 500/503/fatal `0` every window |
+| cold request (developer prefix salted at its head, nothing to reuse) | `path=root`, 0 %, TTFT 7.9 s |
+| sibling message of that request, 2 s later | `path=private_long_anchor`, 9,463/9,476 = 99.9 %, TTFT 0.16 s |
+| the eight recorded client requests, right after a pool refill | first request re-prefills (4.4 s, 0 %); one sibling landed in a window gap (2,273/4,570 = 50 %, 1.9 s); the other six 99.5–100 % at 0.04–0.20 s |
+| soak windows (fork sequence ×4, anchor probe, cold+siblings, 4-way bursts ×2) | 500/503/fatal `0` every window, cache 85.6–100 %, TTFT ≤ 0.31 s |
+
+**A saturated pool publishes the newest boundary, not the whole window.** The request's own tail
+anchor - the one its next message resumes from - is published even at `320/320`; the deeper members
+of the last-N window are skipped with `capture: skip reason=pressure-no-private-baseline`, because
+publishing them would have to evict another session's checkpoint and the per-request destructive
+reclaim is spent on the newest frontier. The consequence is measurable: at `320/320` a fork into
+the middle of a 4.8K conversation reused 801 of 3,883 tokens (21 %) and a fork into the middle of a
+23K conversation reused 7,157 of 14,208 (50 %), while the same two shapes on a small pool with room
+to publish reused 62 % and 63 %. Deeper coverage at saturation is therefore a capacity decision
+(more `--host-state-slots`, or spending more than one destructive reclaim per cold request), not a
+frontend one.
 
 ### Reading Cache Hits From a Client
 
