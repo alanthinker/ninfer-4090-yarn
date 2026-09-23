@@ -30,8 +30,10 @@ MANIFEST = Path(os.environ.get("NINFER_FILL_MANIFEST") or BENCH_MESSAGES / "long
 CHARS_PER_TOKEN = 32338 / 7680
 
 N_MESSAGES = 20
-MSG_TOKENS = 1500    # 每条消息 ~1.5K token; 20 条 ≈ 30K + system ≈ 32K
-SYSTEM_TOKENS = 1000
+# 每条消息 token 数(可环境变量缩放,rig 用 NINFER_FILL_MSG_TOKENS=200:20 条 ≈5K token,
+# prompt 仍 ≥16×256 → 自动锚点照样封顶 16,状态/批语义(17/会话)不变,只把 prefill 从 ~26s 缩到 ~4s)
+MSG_TOKENS = int(os.environ.get("NINFER_FILL_MSG_TOKENS", "1500"))   # 默认 每条 ~1.5K; 20 条 ≈ 30K + system ≈ 32K
+SYSTEM_TOKENS = int(os.environ.get("NINFER_FILL_SYSTEM_TOKENS", "1000"))
 MAX_SESSIONS = 30    # 安全上限(320 槽 / 17 ≈ 19, 留余量防部分会话锚点不足)
 
 
@@ -87,6 +89,33 @@ def occupancy() -> dict:
     return {}
 
 
+def max_host_since(since_ms: int) -> int:
+    """窗口内 occupancy 序列的 host max。
+
+    「曾经满过」用历史峰值判定,而不是读脚本返回瞬间的最新一条:占用率每 5s 才写一条,
+    且打满之后会被后续请求立刻驱逐,用瞬时值会把真实的 FULL 漏判。
+    """
+    best = -1
+    try:
+        for line in REQUEST_LOG.read_text(errors="replace").splitlines():
+            if '"occupancy"' not in line:
+                continue
+            try:
+                record = json.loads(line)
+                ts = record.get("timestamp_unix_ms") or 0
+                if ts < since_ms:
+                    continue
+                host = (record.get("context_cache", {}).get("occupancy") or {}) \
+                    .get("host_state_slots")
+                if host is not None and host > best:
+                    best = host
+            except Exception:
+                continue
+    except FileNotFoundError:
+        pass
+    return best
+
+
 def main() -> None:
     port = sys.argv[1] if len(sys.argv) > 1 else "30000"
     max_sessions = int(sys.argv[2]) if len(sys.argv) > 2 else MAX_SESSIONS
@@ -98,6 +127,7 @@ def main() -> None:
     full_at = max(total - 2, 1)
     base = f"http://127.0.0.1:{port}"
     corpus = load_corpus()
+    started_ms = int(time.time() * 1000)
     o = occupancy()
     print(f"start occupancy: host_state={o.get('host')}/{total} device_state={o.get('device')} "
           f"pinned={o.get('pinned')} kv_pages={o.get('kv_pages')} host_kv={o.get('host_kv_mb')}MB", flush=True)
@@ -116,12 +146,14 @@ def main() -> None:
             break
         o = occupancy()
         host = o.get("host")
-        status = "FULL" if (host is not None and host >= full_at) else ""
+        # 曾经满过即停: 窗口内序列 max 达标就算 FULL(会话中途打满、事后被驱逐也算)。
+        peak = max_host_since(started_ms)
+        status = "FULL" if (peak >= full_at or (host is not None and host >= full_at)) else ""
         print(f"[{s:2d}] prompt={r['prompt']:>6} {r['elapsed']:>5.1f}s | "
-              f"host={host}/{total} dev={o.get('device')} pinned={o.get('pinned')} "
+              f"host={host}/{total} peak={peak} dev={o.get('device')} pinned={o.get('pinned')} "
               f"host_kv={o.get('host_kv_mb')}MB {status} | wall={time.time()-t0:.0f}s", flush=True)
         if status:
-            print(f"== host state pool FULL (host_state_slots={host}/{total}) after {s} sessions ==")
+            print(f"== host state pool FULL (peak={peak} host={host}/{total}) after {s} sessions ==")
             break
     print(f"DONE | final {occupancy()} | {time.time()-t0:.0f}s")
 
