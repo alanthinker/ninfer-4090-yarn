@@ -2101,6 +2101,97 @@ private:
         std::fflush(stderr);
     }
 
+    // NINFER_EVICT_PICK=0 disables these lines; they are on by default because a whole-session
+    // sacrifice is rare (tens per hour) and is otherwise only visible as a bare `[evict] slot=N`,
+    // which cannot say WHICH session died or why it lost.
+    //
+    // A victim is chosen by the planner's preference order, but the Program may only sacrifice an
+    // owner it can physically target and release, so the executed eviction is not always the global
+    // minimum of that order. These lines print the key tuple the order uses for the sacrificed owner
+    // (copied verbatim from the planner's preference sort, so ranks are the planner's own order), the
+    // cheapest owners that stayed, and the count of strictly cheaper owners, which separates
+    // "nothing cheaper was sacrifiable" (`cheaper=0`, the order executed as designed) from "a cheaper
+    // owner was left resident" (`retained_cheaper>0`, either untargetable or priced above the victim
+    // by the fold). The owner set is this request's eligible pressure owners only: an active or
+    // pinned owner is absent from it rather than ranked low, so a rank is never a pool-wide rank.
+    [[nodiscard]] static bool evict_pick_logging_enabled() noexcept {
+        const char* value = std::getenv("NINFER_EVICT_PICK");
+        return value == nullptr || *value != '\0' && *value != '0';
+    }
+
+    [[nodiscard]] static auto owner_preference_key(const MaterializationOwnerPolicy& policy) noexcept {
+        return std::tuple{policy.selected_hit_count, policy.explicit_shared_credit ? 1U : 0U,
+                          policy.private_retention_weight, policy.last_hit_epoch,
+                          policy.owner.value};
+    }
+
+    [[nodiscard]] static const char* retention_class_label(RetentionClass retention) noexcept {
+        switch (retention) {
+        case RetentionClass::Disposable:
+            return "disposable";
+        case RetentionClass::RecentPrivate:
+            return "recent-private";
+        case RetentionClass::LiveSession:
+            return "live-session";
+        case RetentionClass::SharedStable:
+            return "shared-stable";
+        }
+        return "unknown";
+    }
+
+    void log_evict_pick(PlanningOwnerId victim, std::uint32_t slot, bool shared,
+                        std::span<const MaterializationOwnerPolicy> policies,
+                        std::span<const PressureOwnerOutcome> outcomes) const {
+        if (!evict_pick_logging_enabled()) { return; }
+        const MaterializationOwnerPolicy* picked = nullptr;
+        for (const MaterializationOwnerPolicy& policy : policies) {
+            if (policy.owner == victim) {
+                picked = &policy;
+                break;
+            }
+        }
+        if (picked == nullptr) { return; }
+
+        const auto victim_key = owner_preference_key(*picked);
+        std::size_t cheaper   = 0;
+        std::vector<const MaterializationOwnerPolicy*> retained_cheaper;
+        for (const MaterializationOwnerPolicy& policy : policies) {
+            if (policy.owner == victim || !(owner_preference_key(policy) < victim_key)) { continue; }
+            ++cheaper;
+            const bool also_evicted = std::any_of(
+                outcomes.begin(), outcomes.end(), [&](const PressureOwnerOutcome& outcome) {
+                    return outcome.owner == policy.owner &&
+                           outcome.disposition == VictimDisposition::Evicted;
+                });
+            if (!also_evicted) { retained_cheaper.push_back(&policy); }
+        }
+        std::sort(retained_cheaper.begin(), retained_cheaper.end(),
+                  [](const auto* left, const auto* right) {
+                      return owner_preference_key(*left) < owner_preference_key(*right);
+                  });
+        std::fprintf(stderr,
+                     "[evict-pick] owner=%u slot=%u kind=%s class=%s hits=%llu credit=%u "
+                     "weight=%u last_hit=%llu rank=%zu/%zu cheaper=%zu retained_cheaper=%zu\n",
+                     victim.value, slot, shared ? "shared" : "private",
+                     retention_class_label(picked->retention_class),
+                     static_cast<unsigned long long>(picked->selected_hit_count),
+                     picked->explicit_shared_credit ? 1U : 0U, picked->private_retention_weight,
+                     static_cast<unsigned long long>(picked->last_hit_epoch), cheaper + 1U,
+                     policies.size(), cheaper, retained_cheaper.size());
+        const std::size_t shown = std::min<std::size_t>(retained_cheaper.size(), 3U);
+        for (std::size_t index = 0; index < shown; ++index) {
+            const MaterializationOwnerPolicy& policy = *retained_cheaper[index];
+            std::fprintf(stderr,
+                         "[evict-pick]   kept-cheaper owner=%u class=%s hits=%llu credit=%u "
+                         "weight=%u last_hit=%llu\n",
+                         policy.owner.value, retention_class_label(policy.retention_class),
+                         static_cast<unsigned long long>(policy.selected_hit_count),
+                         policy.explicit_shared_credit ? 1U : 0U, policy.private_retention_weight,
+                         static_cast<unsigned long long>(policy.last_hit_epoch));
+        }
+        std::fflush(stderr);
+    }
+
     [[nodiscard]] std::uint64_t newest_hit_epoch(const CatalogEntry& entry) const noexcept {
         std::uint64_t epoch = 0;
         for (const CheckpointObservation& observation : entry.observations) {
@@ -2723,6 +2814,10 @@ private:
                     .disposition         = outcome.disposition,
                     .dropped_checkpoints = std::move(dropped),
                 });
+            }
+            if (outcome.disposition == VictimDisposition::Evicted) {
+                log_evict_pick(outcome.owner, record->capability.slot, shared, owner_policies,
+                               planned->owner_outcomes);
             }
         }
         return choice;

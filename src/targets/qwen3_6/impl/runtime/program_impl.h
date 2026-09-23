@@ -7077,12 +7077,15 @@ void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index) noex
         std::terminate();
     }
     SequenceState& sequence = continuation_states[index];
+    // `session` is the same digest `/slots` publishes and a client sees, so a bare slot index here
+    // can be joined against the request that owned the session and against `[evict-pick]`'s owner.
+    const std::string session_digest = ledger_prefix_digest(sequence.ledger);
     std::fprintf(stderr,
-                 "[evict] slot=%u frontier=%u text_kv_valid=%u ledger=%zu anchors=%zu "
+                 "[evict] slot=%u session=%s frontier=%u text_kv_valid=%u ledger=%zu anchors=%zu "
                  "endpoint=%d state_valid=%d | host_state=%u/%u device_state=%u/%u "
                  "host_kv=%zuMiB catalog=%u/%u\n",
-                 index, sequence.execution_frontier, sequence.text_kv_valid,
-                 sequence.ledger.size(), sequence.long_anchors.size(),
+                 index, session_digest.c_str(), sequence.execution_frontier,
+                 sequence.text_kv_valid, sequence.ledger.size(), sequence.long_anchors.size(),
                  sequence.endpoint_valid ? 1 : 0,
                  (state_store && state_store->valid(sequence.state.read)) ? 1 : 0,
                  state_store ? state_store->host_occupied() : 0,
