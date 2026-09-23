@@ -128,13 +128,18 @@ public:
         portfolio_checkpoint_scratch_.reserve(64);
     }
 
+    // `negative_sound` (nullable) reports, on a nullopt result, whether the failure PROVED the
+    // request infeasible (the full victim domain has no plan) rather than the search giving up
+    // early. Only a sound verdict may be memoized by a caller: it is stable while the pool
+    // state it was planned against holds.
     template <class PressureInputsFn, class LogicalGoalFn, class FinalScheduleFn>
     [[nodiscard]] std::optional<Result>
     plan(Program& program, const PreparedPrompt& prompt,
          const ContextMachineCostModel& machine_cost, std::span<const CandidateInput> candidates,
          std::uint32_t root_candidate_index, PressureInputsFn&& pressure_inputs,
          LogicalGoalFn&& logical_goal, FinalScheduleFn&& final_schedule,
-         std::uint32_t prompt_tokens, Clock::time_point planning_started) {
+         std::uint32_t prompt_tokens, Clock::time_point planning_started,
+         bool* negative_sound = nullptr) {
         if (candidates.empty() || root_candidate_index >= candidates.size()) {
             throw std::invalid_argument("materialization planning problem has no root candidate");
         }
@@ -237,7 +242,10 @@ public:
                 std::optional<ResourcePlan> sealed = program.seal_identity(
                     *selected.candidate, prompt,
                     FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
-                if (!sealed) { return std::nullopt; }
+                if (!sealed) {
+                    if (negative_sound) { *negative_sound = false; }
+                    return std::nullopt;
+                }
                 MaterializationDiagnostics diagnostics = complete_diagnostics(
                     identity_best->cost, static_cast<std::uint32_t>(candidates.size()),
                     projection_work, planning_started, MaterializationStopReason::NoPressure,
@@ -313,7 +321,13 @@ public:
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
-            if (!goal) { return std::nullopt; }
+            if (!goal) {
+                // The root-maximal target is infeasible or cannot publish: neither any owner,
+                // checkpoint, nor capture can free the capacity, so the complete victim domain
+                // has no plan. Sound to memoize while the pool state is unchanged.
+                if (negative_sound) { *negative_sound = true; }
+                return std::nullopt;
+            }
             const FoldedCost cost =
                 fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
                                 pressure.checkpoint_policy, machine_cost);

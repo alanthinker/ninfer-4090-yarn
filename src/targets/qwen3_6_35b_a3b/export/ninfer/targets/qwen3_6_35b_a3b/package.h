@@ -98,6 +98,7 @@ struct Package {
     using CaptureOffer               = qwen3_6::CaptureOffer<detail::Variant>;
     using CacheSessionKey            = qwen3_6::PreparedSessionKey;
     using ContinuationSummary        = qwen3_6::ContinuationSummary;
+    using PhysicalUsageSnapshot      = qwen3_6::PhysicalUsageSnapshot;
     using SharedPrefixSummary        = qwen3_6::SharedPrefixSummary;
     using PressurePlanningSession    = qwen3_6::PressurePlanningSession<detail::Variant>;
     using PressureTargetHandle       = qwen3_6::PressureTargetHandle;

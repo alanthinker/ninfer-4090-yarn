@@ -311,6 +311,12 @@ public:
     struct Inspection {
         Readiness readiness = Readiness::TemporarilyBlocked;
         std::optional<Choice> choice;
+        // Set only when TemporarilyBlocked came from a materialization search that PROVED no
+        // plan fits the current pool state (full victim domain). Such a verdict is stable while
+        // the pool state holds, so the Engine may keep it and skip re-running the planner at
+        // the next boundary. Early blocked returns (open transaction, no free lane) leave it
+        // false: they are cheap to re-evaluate and are not search verdicts at all.
+        bool negative_sound = false;
     };
 
     ResourceManager(std::uint32_t lane_count, std::uint32_t private_catalog_capacity,
@@ -489,10 +495,13 @@ public:
             }
         }
 
+        bool negative_sound = false;
         std::optional<Choice> selected =
             plan_materialization(program, prompt, base, *destination, candidates, publication_order,
-                                 planning_started, provisional_demand);
-        if (!selected) { return {.readiness = Readiness::TemporarilyBlocked}; }
+                                 planning_started, provisional_demand, &negative_sound);
+        if (!selected) {
+            return {.readiness = Readiness::TemporarilyBlocked, .negative_sound = negative_sound};
+        }
         return {
             .readiness = selected->needs_transfer() ? Readiness::NeedsTransfer : Readiness::Ready,
             .choice    = std::move(selected),
@@ -2347,7 +2356,8 @@ private:
                          const RequestBasePlan& base, LaneId destination,
                          std::vector<Candidate>& candidates, std::uint64_t publication_order,
                          typename Planner::Clock::time_point planning_started,
-                         PrefixDemandRecord& provisional_demand) {
+                         PrefixDemandRecord& provisional_demand,
+                         bool* negative_sound = nullptr) {
         std::vector<typename Planner::CandidateInput> candidate_inputs;
         std::vector<const ContinuationHandle*> private_owners;
         std::vector<PlanningOwnerId> private_owner_ids;
@@ -2383,6 +2393,9 @@ private:
         const std::vector<std::uint32_t> protected_slots = fair_share_protected_slots();
         std::optional<typename Planner::Result> planned;
         std::uint32_t released_buckets = 0;
+        // The verdict of the LAST attempt is the one that stands: each earlier attempt ran with
+        // a smaller victim domain, so only the final (full-domain) one can prove infeasibility.
+        bool final_negative_sound = false;
         for (std::size_t attempt = 0;; ++attempt) {
             const std::size_t protected_limit =
                 attempt < protected_slots.size() ? protected_slots.size() - attempt : 0;
@@ -2637,9 +2650,13 @@ private:
                                                           provisional_demand, split_cost);
         };
 
+            // Reset: plan() only writes the out-param on the nullopt paths that classify the
+            // verdict, so a stale value from an earlier attempt must not survive into this one.
+            final_negative_sound = false;
             planned = planner_.plan(program, prompt, cost_model_, candidate_inputs, 0,
                                     build_pressure_inputs, logical_goal, final_schedule,
-                                    base.summary().prompt_tokens, planning_started);
+                                    base.summary().prompt_tokens, planning_started,
+                                    &final_negative_sound);
             if (planned || protected_limit == 0) { break; }
             // No feasible target while this attempt's buckets are closed: the shared pool and
             // every unprotected owner are exhausted, so the oldest bucket is released and the
@@ -2652,6 +2669,7 @@ private:
                                    })
                     : candidate_inputs.end();
         if (!planned || !planned->plan || selected_candidate == candidate_inputs.end()) {
+            if (negative_sound) { *negative_sound = final_negative_sound; }
             return std::nullopt;
         }
 

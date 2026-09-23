@@ -61,9 +61,10 @@ public:
     using ActiveAdmissionSet = typename Scheduling::ActiveAdmissionSet;
     using ExecutionAction    = typename Scheduling::ExecutionAction;
     using AdmissionGrant     = typename Scheduling::AdmissionGrant;
-    using ResourceManagement = ResourceManager<Package>;
-    using ResourceInspection = typename ResourceManagement::Inspection;
-    using Clock              = std::chrono::steady_clock;
+    using ResourceManagement  = ResourceManager<Package>;
+    using ResourceInspection  = typename ResourceManagement::Inspection;
+    using PhysicalUsageSnapshot = typename Package::PhysicalUsageSnapshot;
+    using Clock               = std::chrono::steady_clock;
 
     EngineCore(Instance& instance, DeviceContext& device, const EngineOptions& options,
                ContextMachineCostModel context_cost)
@@ -1101,6 +1102,7 @@ private:
 
     void release_planning_state(const std::shared_ptr<Request>& request) noexcept {
         request->base_plan.reset();
+        request->admission_negative_memo.active = false;
     }
 
     void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
@@ -2171,7 +2173,32 @@ private:
                 control_progress = true;
                 continue;
             }
-            auto head_inspection = inspect_admission(head);
+            // The blocked head is re-inspected at every boundary. An inspection that PROVED the
+            // request infeasible against the current pool state is stable while that state holds,
+            // so it is memoized on the request and the planner is not paid again until a pool
+            // counter or the resource revision moves; an inspection that only gave up (budget
+            // stops, open transaction, no free lane) is never memoized.
+            const PhysicalUsageSnapshot usage_before = instance_.program->physical_usage();
+            const bool head_memo_hit =
+                head->admission_negative_memo.active && !head->reuse_suppressed &&
+                head->admission_negative_memo.usage == usage_before;
+            // Inspection holds a move-only Choice, so it is produced by one call that either
+            // reuses the memoized verdict or runs the inspection and records the memo.
+            // Non-const: the Ready path moves the Choice out of it.
+            ResourceInspection head_inspection = [&]() -> ResourceInspection {
+                if (head_memo_hit) {
+                    return ResourceInspection{.readiness = Readiness::TemporarilyBlocked};
+                }
+                ResourceInspection inspection = inspect_admission(head);
+                head->admission_negative_memo.active =
+                    inspection.readiness == Readiness::TemporarilyBlocked &&
+                    inspection.negative_sound && !head->reuse_suppressed &&
+                    usage_before == instance_.program->physical_usage();
+                if (head->admission_negative_memo.active) {
+                    head->admission_negative_memo.usage = usage_before;
+                }
+                return inspection;
+            }();
             if (head_inspection.readiness == Readiness::PermanentlyInfeasible) {
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
@@ -2245,7 +2272,27 @@ private:
                     control_progress = true;
                     continue;
                 }
-                auto candidate_inspection = inspect_admission(candidate);
+                // Same negative-verdict memo as the FIFO head: a backfill candidate that proved
+                // infeasible against the current pool state is not re-searched until it moves.
+                const PhysicalUsageSnapshot candidate_usage_before =
+                    instance_.program->physical_usage();
+                const bool candidate_memo_hit =
+                    candidate->admission_negative_memo.active && !candidate->reuse_suppressed &&
+                    candidate->admission_negative_memo.usage == candidate_usage_before;
+                ResourceInspection candidate_inspection = [&]() -> ResourceInspection {
+                    if (candidate_memo_hit) {
+                        return ResourceInspection{.readiness = Readiness::TemporarilyBlocked};
+                    }
+                    ResourceInspection inspection = inspect_admission(candidate);
+                    candidate->admission_negative_memo.active =
+                        inspection.readiness == Readiness::TemporarilyBlocked &&
+                        inspection.negative_sound && !candidate->reuse_suppressed &&
+                        candidate_usage_before == instance_.program->physical_usage();
+                    if (candidate->admission_negative_memo.active) {
+                        candidate->admission_negative_memo.usage = candidate_usage_before;
+                    }
+                    return inspection;
+                }();
                 if (candidate_inspection.readiness == Readiness::PermanentlyInfeasible) {
                     (void)remove_pending_error(
                         candidate, std::make_exception_ptr(RequestError(

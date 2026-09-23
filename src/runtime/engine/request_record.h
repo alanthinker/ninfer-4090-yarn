@@ -111,6 +111,17 @@ struct RequestRecord {
     using SequenceHandle = typename Package::SequenceHandle;
     using StreamEvent    = std::variant<GenerationTimingObservation, OutputDelta>;
 
+    // A blocked admission inspection that PROVED this request infeasible against the pool state
+    // captured in `usage` (resource revision plus every physical pool counter). While that state
+    // holds, re-inspecting would redo the same materialization search and reach the same
+    // verdict, so the Engine keeps the verdict instead of paying the planner again at every
+    // boundary. Any pool movement changes the snapshot and invalidates the memo; a search that
+    // only GAVE UP (budget stops) never sets it.
+    struct AdmissionNegativeMemo {
+        bool active = false;
+        typename Package::PhysicalUsageSnapshot usage{};
+    };
+
     RequestRecord(std::uint64_t request_identity, std::uint64_t publication_sequence,
                   PreparedPrompt input, OutputSession output_session, PromptSummary summary,
                   double frontend_seconds, ResolvedRequestOptions request_options,
@@ -194,6 +205,7 @@ struct RequestRecord {
     std::optional<FinishReason> terminal_reason;
 
     std::optional<BasePlan> base_plan;
+    AdmissionNegativeMemo admission_negative_memo;
     std::uint64_t remaining_service_work = 0;
     std::uint64_t backfill_epoch         = 0;
     BackfillClass backfill_class         = BackfillClass::None;
