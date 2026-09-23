@@ -726,11 +726,18 @@ PrivateLoss_o(S_b,S_t)=w_o\max_{p\in o}
 不同 owners 的 `PrivateLoss` 相加。这样不会把同一 continuation 的嵌套 checkpoints 全部当作未来请求，
 也不会让一个仍然可用的末端 checkpoint 掩盖较早 TurnClosure 或 long anchor 的损失。权重为：
 
-| Private retention | prior weight |
-|---|---:|
-| Disposable | 1 |
-| RecentPrivate | 4 |
-| LiveSession | 16 |
+| Private retention | prior weight | 谁先被牺牲 | 何时产生 |
+|---|---:|---|---|
+| SharedStable | 0 | 同命中数、且无 credit 时最前 | 共享前缀 owner：`w=0` 不是"最廉价"，而是**不计私有损失**（`context_portfolio_value.h` 只在 `w != 0` 时累加该 owner 的损失），其价值走 `PublicValue` + explicit credit |
+| Disposable | 1 | 次之 | 客户端显式声明可丢弃（Responses `store_response=false`） |
+| RecentPrivate | 4 | 再次 | 默认：普通私有 continuation（请求未带 session_key） |
+| LiveSession | 16 | 最后 | 带 session_key 的活会话（Responses `store_response=true`） |
+
+`prior weight` 只是损失倍率，不是优先级本身：牺牲顺序是
+`{selected_hit_count, explicit_shared_credit, private_retention_weight, last_hit_epoch, owner}`
+的字典序（命中次数第 1、credit 第 2、权重第 3），权重只在命中次数与 credit 都相同时才起作用。
+本部署的日常流量走 `openai_chat_completions`，它不设置 session_key（只有 `/v1/responses` 设置），
+因此实际权重恒为 `RecentPrivate=4`，区分度来自命中次数与最近命中 epoch。
 
 Shared owner 没有固定 retention multiplier。`ExplicitBoundary` 或 `RequestedAutomatic` 在 publication 时带来
 一个 owner-scoped credit；它在第一次后续 exact match 时消费，或在 32 次成功 materialization 后到期。
