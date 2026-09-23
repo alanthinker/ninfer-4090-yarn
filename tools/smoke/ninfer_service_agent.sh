@@ -57,7 +57,9 @@ FAIR_BUCKETS="${AGENT_FAIR_BUCKETS:-4}"     # protected-vs-evictable boundary vi
 MAX_PENDING="${AGENT_MAX_PENDING:-16}"      # production value: bounded FIFO ingress
 PENDING_TIMEOUT_MS="${AGENT_PENDING_TIMEOUT_MS:-600000}"  # production value; lower per-test for
                                                           # the queue-timeout boundary
-REUSE_DIAG="${REUSE_DIAG:-0}"
+# Diagnostics ON by default: a TEST rig must emit the evidence its suites assert on
+# (fair_share_sim greps `reuse-diag: ... fair=N ... CANDIDATE`, gated by NINFER_REUSE_DIAG).
+REUSE_DIAG="${REUSE_DIAG:-1}"
 REQUEST_LOG="${AGENT_REQUEST_LOG:-$NINFER_HARNESS_DIR/request_log_agent.jsonl}"
 
 PARAMS=(
@@ -113,11 +115,11 @@ start() {
     cd "$NINFER_HARNESS_DIR"
     setsid nohup "$BIN" "${PARAMS[@]}" > "$LOG" 2>&1 &
     echo $! > "$PIDFILE"
-    for _ in $(seq 1 120); do
+    for attempt in $(seq 1 120); do
         # Ready = healthy AND OUR pid still alive: a healthy foreign answer alone must not pass.
         if curl -s -m 2 "http://127.0.0.1:$PORT/health" | grep -q ok \
             && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-            echo "Ready after $((_ * 2))s (PID $(cat "$PIDFILE"))."
+            echo "Ready after $((attempt * 2))s (PID $(cat "$PIDFILE"))."
             return
         fi
         sleep 2
