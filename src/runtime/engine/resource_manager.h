@@ -350,6 +350,43 @@ public:
 
     // `allow_reuse` false plans the request from root: the caller sets it after a materialization it
     // sealed could not get capacity, so the request is served by recomputing instead of failing.
+    // Full-catalog reconciliation: clear every cell whose Program-side owner is already gone.
+    //
+    // The eviction ladder retires owners inside the Program at any moment - this request or an
+    // earlier one - while the catalog still lists those cells as Catalogued. `logical_goal` finds
+    // a publication slot only by scanning for `CatalogState::Vacant`, so stale cells hide free
+    // slots: goal comes back empty, the candidate never gets an identity (no-eviction) plan, and
+    // every attempt seeds from the maximal target that evicts to publish. On 2026-09-23 a
+    // 1.9k-token disposable session therefore retired a 20k-token conversation to publish while
+    // host_state sat at 8/48 and host_kv at 0 MiB - the victim's value never entered the choice
+    // because no plan without an eviction existed to compete.
+    //
+    // The clears already present in this class cover only the cells a request's reuse matching
+    // happens to visit (and the capture planner's own domain build), which is exactly the set a
+    // brand-new conversation does not visit. This pass runs once per admission before planning.
+    void reconcile_catalog(Program& program) {
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            CatalogEntry& entry = catalog_[slot];
+            if (entry.state != CatalogState::Catalogued || !entry.handle ||
+                private_has_active_edge(slot)) {
+                continue;
+            }
+            if (program.continuation_is_live(*entry.handle)) { continue; }
+            std::fprintf(stderr, "catalog: clear retired private owner slot=%u\n", slot);
+            clear_catalog_entry(entry);
+        }
+        for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+            SharedCatalogEntry& entry = shared_catalog_[slot];
+            if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
+                entry.transaction_pins != 0 || shared_active_edge_count(slot) != 0) {
+                continue;
+            }
+            if (program.shared_prefix_is_live(*entry.handle)) { continue; }
+            std::fprintf(stderr, "catalog: clear retired shared owner slot=%u\n", slot);
+            clear_shared_entry(entry);
+        }
+    }
+
     [[nodiscard]] Inspection inspect(Program& program, const PreparedPrompt& prompt,
                                      const RequestBasePlan& base, std::uint64_t publication_order,
                                      bool allow_reuse = true) {
@@ -377,6 +414,10 @@ public:
 
         const typename Planner::Clock::time_point planning_started = Planner::Clock::now();
         rebuild_prefix_index();
+        // Before reuse matching and before plan_materialization: see reconcile_catalog. A stale
+        // cell blocks the publication-slot scan that decides whether a plan without an eviction
+        // can exist at all.
+        reconcile_catalog(program);
         log_reuse_diagnostics(base);
         PrefixDemandRecord provisional_demand;
         provisional_demand.domain =
