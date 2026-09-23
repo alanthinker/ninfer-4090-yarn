@@ -762,6 +762,7 @@ VictimCost(o)=\Big(w_o\max_p (Rebuild(p)-Recovery_b(p)) + PublicValue_o + Credit
   ③ 刚被读过的会话 `age≈0`，乘子最大。保留 `owner.value` 作为最终 tie-break 保证确定性。
 
 同一个序也交给 Program 的**兜底退休**（`[exhaust]`，阶梯最后一档）：那一档跑在 Program 内部，手上没有 cost model、
+同一套保护也覆盖**刚用过的会话**：`fair_share_protected_slots()` 在桶窗口之后追加**60 秒活跃视界**内的 owner（`kRecencyHorizonSeconds`），它们不进规划器的 victim 域，在兜底序里落入第二梯队、只在彼此之间按最久未活跃排序。理由是活跃名次无法表达"刚读过的别删"——生产每秒触碰 8 个以上 owner，1 秒前读过的会话会掉出 top-N；2026-09-24 实测：一条 7k 会话读完 1 秒后为腾 1 个 device 对象被退休（fork_hit 控制组 79.3%），而数小时没再读的 31k 会话按分排在它之后。视界只决定**谁先轮到**，不改变"必须能找到人"的兜底性。
 observation 表和 demand window，所以由公共层定价并把序交过去（`ResourceManager::retire_preference_order()` →
 `Program::set_retire_preference()`，在 `inspect` / `reserve_materialization` / `reserve_active_capture` 前刷新）。
 公共层这一份定价唯一省略的是 recovery offset（要逐检查点回调 Program，而兜底恰恰发生在池子耗尽时，
