@@ -2166,18 +2166,25 @@ private:
 
         struct PricedOwner {
             const MaterializationOwnerPolicy* policy = nullptr;
-            std::uint64_t score                      = 0;
+            MaterializationVictimCost cost;
         };
-        const auto score_of = [&](PlanningOwnerId owner) {
-            return materialization_victim_score(policies, checkpoints, owner);
-        };
-        const std::uint64_t victim_score = score_of(victim);
-        std::size_t cheaper               = 0;
+        const MaterializationVictimCost victim_cost =
+            materialization_victim_cost(policies, checkpoints, victim);
+        const std::uint64_t victim_score = victim_cost.score;
+        std::size_t cheaper              = 0;
+        std::size_t unpriced             = 0;
         std::vector<PricedOwner> retained_cheaper;
         for (const MaterializationOwnerPolicy& policy : policies) {
             if (policy.owner == victim) { continue; }
-            const std::uint64_t score = score_of(policy.owner);
-            if (score >= victim_score) { continue; }
+            const MaterializationVictimCost cost =
+                materialization_victim_cost(policies, checkpoints, policy.owner);
+            if (cost.priced_checkpoints == 0) {
+                // Nothing left to reclaim: the Program already retired this owner, so it can never
+                // be a victim and its zero score says nothing about the ordering.
+                ++unpriced;
+                continue;
+            }
+            if (cost.score >= victim_score) { continue; }
             ++cheaper;
             const bool also_evicted = std::any_of(
                 outcomes.begin(), outcomes.end(), [&](const PressureOwnerOutcome& outcome) {
@@ -2185,40 +2192,43 @@ private:
                            outcome.disposition == VictimDisposition::Evicted;
                 });
             if (!also_evicted) {
-                retained_cheaper.push_back(PricedOwner{.policy = &policy, .score = score});
+                retained_cheaper.push_back(PricedOwner{.policy = &policy, .cost = cost});
             }
         }
         std::sort(retained_cheaper.begin(), retained_cheaper.end(),
                   [](const PricedOwner& left, const PricedOwner& right) {
-                      return left.score != right.score
-                                 ? left.score < right.score
+                      return left.cost.score != right.cost.score
+                                 ? left.cost.score < right.cost.score
                                  : left.policy->owner.value < right.policy->owner.value;
                   });
+        const std::size_t priced_total = policies.size() - unpriced;
         std::fprintf(stderr,
                      "[evict-pick] owner=%u slot=%u kind=%s class=%s hits=%llu credit=%u "
-                     "weight=%u last_hit=%llu evidence=%.3f score=%.3fs rank=%zu/%zu cheaper=%zu "
-                     "retained_cheaper=%zu\n",
+                     "weight=%u last_hit=%llu evidence=%.3f risk=%.3fs score=%.3fs rank=%zu/%zu "
+                     "cheaper=%zu retained_cheaper=%zu unpriced=%zu\n",
                      victim.value, slot, shared ? "shared" : "private",
                      retention_class_label(picked->retention_class),
                      static_cast<unsigned long long>(picked->selected_hit_count),
                      picked->explicit_shared_credit ? 1U : 0U, picked->private_retention_weight,
                      static_cast<unsigned long long>(picked->last_hit_epoch),
                      static_cast<double>(picked->reuse_evidence_q16) / 65536.0,
-                     static_cast<double>(victim_score) / 1.0e9, cheaper + 1U, policies.size(),
-                     cheaper, retained_cheaper.size());
+                     static_cast<double>(victim_cost.value_ns) / 1.0e9,
+                     static_cast<double>(victim_score) / 1.0e9, cheaper + 1U, priced_total,
+                     cheaper, retained_cheaper.size(), unpriced);
         const std::size_t shown = std::min<std::size_t>(retained_cheaper.size(), 3U);
         for (std::size_t index = 0; index < shown; ++index) {
             const PricedOwner& entry = retained_cheaper[index];
             std::fprintf(stderr,
                          "[evict-pick]   kept-cheaper owner=%u class=%s hits=%llu credit=%u "
-                         "weight=%u evidence=%.3f score=%.3fs\n",
+                         "weight=%u evidence=%.3f risk=%.3fs score=%.3fs\n",
                          entry.policy->owner.value,
                          retention_class_label(entry.policy->retention_class),
                          static_cast<unsigned long long>(entry.policy->selected_hit_count),
                          entry.policy->explicit_shared_credit ? 1U : 0U,
                          entry.policy->private_retention_weight,
                          static_cast<double>(entry.policy->reuse_evidence_q16) / 65536.0,
-                         static_cast<double>(entry.score) / 1.0e9);
+                         static_cast<double>(entry.cost.value_ns) / 1.0e9,
+                         static_cast<double>(entry.cost.score) / 1.0e9);
         }
         std::fflush(stderr);
     }

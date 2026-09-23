@@ -71,6 +71,17 @@ struct MaterializationOwnerPolicy {
     return kFloor + (((kOne - kFloor) * ratio_q16) >> 16U);
 }
 
+// One owner's victim cost, kept in parts because the diagnostic prints them: `value_ns` is the
+// value at risk before the reuse-evidence multiplier, and `priced_checkpoints` is how many of the
+// owner's checkpoints could be priced at all. An owner whose Program handle is already gone prices
+// nothing, so its value is zero - it is not "cheap", it simply has nothing left to give, and its
+// rank must not be read as a decision the planner could have made differently.
+struct MaterializationVictimCost {
+    std::uint64_t value_ns           = 0;
+    std::uint64_t score              = 0;
+    std::size_t priced_checkpoints   = 0;
+};
+
 // Victim ordering is one combined score in the planner's own currency, not a lexicographic field
 // chain. A field-first chain lets a single dimension decide alone - when the reuse count differs,
 // the retention weight and the recency are never read at all - which is how a deep endpoint that
@@ -79,7 +90,7 @@ struct MaterializationOwnerPolicy {
 // multiplies the value at risk (the largest rebuild saving the owner would lose, scaled by its
 // retention weight, plus the demand-observed public value) by the reuse evidence, so depth,
 // retention class, demand, recency, and reuse history contribute to one comparable number.
-[[nodiscard]] inline std::uint64_t materialization_victim_score(
+[[nodiscard]] inline MaterializationVictimCost materialization_victim_cost(
     std::span<const MaterializationOwnerPolicy> owners,
     std::span<const MaterializationCheckpointPolicy> checkpoints, PlanningOwnerId owner) noexcept {
     const MaterializationOwnerPolicy* policy = nullptr;
@@ -89,12 +100,14 @@ struct MaterializationOwnerPolicy {
             break;
         }
     }
-    if (policy == nullptr) { return 0; }
+    if (policy == nullptr) { return {}; }
 
     std::uint64_t private_saving = 0;
+    std::size_t priced           = 0;
     std::array<std::uint64_t, 32> demand_best{};
     for (const MaterializationCheckpointPolicy& checkpoint : checkpoints) {
         if (checkpoint.owner != owner) { continue; }
+        ++priced;
         const std::uint64_t saving = checkpoint.rebuild_ns > checkpoint.baseline_recovery_ns
                                          ? checkpoint.rebuild_ns - checkpoint.baseline_recovery_ns
                                          : 0;
@@ -120,7 +133,17 @@ struct MaterializationOwnerPolicy {
     std::uint64_t value_ns = saturating_mul(private_saving, policy->private_retention_weight);
     for (const std::uint64_t demand_value : demand_best) { saturating_add(value_ns, demand_value); }
     if (policy->explicit_shared_credit) { saturating_add(value_ns, private_saving); }
-    return saturating_mul(value_ns, policy->reuse_evidence_q16) >> 16U;
+    return MaterializationVictimCost{
+        .value_ns         = value_ns,
+        .score            = saturating_mul(value_ns, policy->reuse_evidence_q16) >> 16U,
+        .priced_checkpoints = priced,
+    };
+}
+
+[[nodiscard]] inline std::uint64_t materialization_victim_score(
+    std::span<const MaterializationOwnerPolicy> owners,
+    std::span<const MaterializationCheckpointPolicy> checkpoints, PlanningOwnerId owner) noexcept {
+    return materialization_victim_cost(owners, checkpoints, owner).score;
 }
 
 template <class Package>

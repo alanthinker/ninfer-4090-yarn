@@ -110,6 +110,14 @@ start() {
     # instance on :30000). Without this the health probe below would hit THAT service and
     # report Ready while our own engine died on bind. SO_REUSEADDR lets a just-stopped
     # instance's TIME_WAIT through; a live LISTENER still fails the bind.
+    #
+    # Ask the port directly first: on this kernel a specific-address bind with SO_REUSEADDR still
+    # succeeds while a wildcard listener holds the port, and the probe below then reported Ready
+    # off the OTHER service's answer (2026-09-23: it reported Ready over a stale instance whose
+    # log files had been deleted, and a whole battery measured nothing at all).
+    if curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+        echo "错误: 端口 $PORT 已被一个活动服务占用 - 单卡单服务, 请先 stop 正在运行的服务"; exit 1
+    fi
     python3 -c "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', $PORT)); s.close()" 2>/dev/null \
         || { echo "错误: 端口 $PORT 已被服务监听 - 单卡单服务, 请先 stop 正在运行的服务"; exit 1; }
     cd "$NINFER_HARNESS_DIR"

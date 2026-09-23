@@ -19,6 +19,11 @@ cd "$HERE/../.." || exit 1
 
 export NINFER_BIN="$BIN"
 export NINFER_HARNESS_DIR="/tmp/fs-small-$LABEL"
+# Stop BEFORE deleting the harness directory: `stop` finds the instance through the pid file that
+# lives there, so wiping the directory first leaves the previous service running and holding the
+# port, and every later read of this run's logs silently finds nothing (2026-09-23: a whole battery
+# ran against the stale instance whose log files had been unlinked underneath it).
+"$HERE/ninfer_service_agent.sh" stop >/dev/null 2>&1 || true
 rm -rf "$NINFER_HARNESS_DIR"
 mkdir -p "$NINFER_HARNESS_DIR"
 export NINFER_REQDUMP_DIR="$NINFER_HARNESS_DIR/reqdump"
@@ -44,24 +49,32 @@ export AGENT_SHARED_PREFIXES="${AGENT_SHARED_PREFIXES:-4}"
 export FSL_LABEL="$LABEL" FSL_TIMEOUT="${FSL_TIMEOUT:-90}"
 
 cleanup() {
+    local status=$?
     if [ "${FSL_KEEP:-0}" = "1" ]; then
         echo "== $LABEL: instance left running on port $AGENT_PORT (FSL_KEEP=1) =="
-        return 0
+        return "$status"
     fi
     "$HERE/ninfer_service_agent.sh" stop >/dev/null 2>&1 || true
+    return "$status"
 }
 trap cleanup EXIT
 
 "$HERE/ninfer_service_agent.sh" stop >/dev/null 2>&1 || true
 "$HERE/agent_wait_gpu.sh" >/dev/null 2>&1 || true
-"$HERE/ninfer_service_agent.sh" start >/dev/null
+"$HERE/ninfer_service_agent.sh" start >/dev/null || {
+    echo "$LABEL: failed to start the instance (is another service still on :$AGENT_PORT?)"; exit 1; }
+PIDFILE="$NINFER_HARNESS_DIR/ninfer_serve_agent.pid"
 for _ in $(seq 1 30); do
     curl -sf -m 2 "http://127.0.0.1:$AGENT_PORT/health" >/dev/null && break
     sleep 1
 done
 curl -sf -m 3 "http://127.0.0.1:$AGENT_PORT/health" >/dev/null || {
     echo "$LABEL: instance did not become healthy"; exit 1; }
-echo "== $LABEL: instance up (host slots $AGENT_HOST_SLOTS, device slots $AGENT_DEV_SLOTS, fair-share $AGENT_FAIR_BUCKETS) =="
+# A healthy answer is not enough: a stale service from an earlier run answers just as happily while
+# every log this run reads stays empty. Require the pid this run started to be the live one.
+if [ ! -f "$PIDFILE" ] || ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo "$LABEL: :$AGENT_PORT is served by an instance this run did not start"; exit 1; fi
+echo "== $LABEL: instance up (host slots $AGENT_HOST_SLOTS, device slots $AGENT_DEV_SLOTS, fair-share $AGENT_FAIR_BUCKETS, pid $(cat "$PIDFILE")) =="
 
 python3 - <<'PY'
 import json
