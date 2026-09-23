@@ -360,6 +360,9 @@ public:
         if (publication_order == 0) {
             throw std::invalid_argument("request publication order is zero");
         }
+        // Planning may ask the Program what its last-resort release could deliver
+        // (`retirable_host_state_slots`), so the order has to be current before planning too.
+        push_retire_preference(program);
         if (!program.isolated_request_feasible(base)) {
             return {.readiness = Readiness::PermanentlyInfeasible};
         }
@@ -527,6 +530,9 @@ public:
             throw std::logic_error("ResourceManager already owns a resource transaction");
         }
         const ProgramResourceRevision resource_revision = program.resource_revision();
+        // The reserve below may run the Program's capacity-release ladder, which can retire an
+        // owner; hand over the current value order first.
+        push_retire_preference(program);
         if (!choice.plan_ || resource_revision.value == 0) {
             throw std::logic_error("resource choice is malformed");
         }
@@ -646,6 +652,9 @@ public:
             program.skip_capture(std::move(offer));
             return ActiveCaptureReserveResult::Skipped;
         }
+        // Same reason as reserve_materialization: capture reservation allocates state slots and can
+        // fall through to the ladder.
+        push_retire_preference(program);
         rebuild_prefix_index();
 
         CaptureAssessment private_baseline =
@@ -1837,6 +1846,83 @@ private:
     // again" and multiplies the value at risk in the victim score; the floor keeps a session that
     // has not been re-read yet cheap but never free, because "never reused" used to sort as the
     // cheapest owner no matter how much prefill the session held.
+
+    // Score order for the Program's last-resort release step. The ladder runs inside the Program,
+    // which owns neither the cost model nor the observation history nor the demand window, so it
+    // cannot price a victim; this layer can, from the catalog alone - every summary carries its
+    // checkpoints' rebuild work, and the hits, the retention class and the demand window are local.
+    // Same arithmetic as the planner's victim score (`victim_value_ns` x `victim_score_ns`); the
+    // one term resolved differently is the recovery offset, which needs a Program round-trip per
+    // checkpoint and is small next to the rebuild cost it offsets.
+    [[nodiscard]] std::vector<RetirePreferenceEntry> retire_preference_order() const {
+        struct Scored {
+            RetirePreferenceEntry entry;
+            std::uint64_t score = 0;
+        };
+        std::vector<Scored> scored;
+        scored.reserve(catalog_count_ + shared_catalog_count_);
+        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+
+        // `for_each_checkpoint` visits one checkpoint at a time, so nothing has to be collected.
+        const auto append = [&](bool shared_prefix, std::uint32_t slot, std::uint32_t weight,
+                                std::uint64_t hits, std::chrono::steady_clock::time_point last,
+                                bool credit, auto&& for_each_checkpoint) {
+            std::uint64_t private_saving = 0;
+            std::array<std::uint64_t, 32> demand_best{};
+            for_each_checkpoint([&](const auto& checkpoint) {
+                const std::uint64_t saving = cost_model_.prefill_ns(checkpoint.rebuild_work);
+                private_saving             = std::max(private_saving, saving);
+                const std::uint32_t mask   = committed_demand_mask_for(checkpoint.shortlist_key);
+                for (std::uint32_t bit = 0; bit < demand_best.size(); ++bit) {
+                    if ((mask & (1U << bit)) == 0) { continue; }
+                    demand_best[bit] = std::max(demand_best[bit], saving);
+                }
+            });
+            const std::uint64_t score = victim_score_ns(
+                victim_value_ns(weight, private_saving, demand_best, credit),
+                reuse_evidence_q16(hits, last, now));
+            scored.push_back(Scored{
+                .entry = RetirePreferenceEntry{
+                    .shared_prefix = shared_prefix, .slot = slot, .score_ns = score},
+                .score = score,
+            });
+        };
+
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            const CatalogEntry& entry = catalog_[slot];
+            if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
+            append(false, slot, private_retention_weight(entry.retention),
+                   entry.lifetime_selected_hits, entry.last_selected_at, false,
+                   [&](auto&& visit) {
+                       if (entry.summary.endpoint) { visit(*entry.summary.endpoint); }
+                       if (entry.summary.rewrite) { visit(*entry.summary.rewrite); }
+                       for (const auto& anchor : entry.summary.long_anchors) {
+                           visit(anchor);
+                       }
+                   });
+        }
+        for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+            const SharedCatalogEntry& entry = shared_catalog_[slot];
+            if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+            append(true, slot, 0, entry.observation.selected_hit_count, entry.last_selected_at,
+                   entry.explicit_credit,
+                   [&](auto&& visit) { visit(entry.summary.checkpoint); });
+        }
+
+        std::sort(scored.begin(), scored.end(), [](const Scored& left, const Scored& right) {
+            return left.score != right.score ? left.score < right.score
+                                             : left.entry.slot < right.entry.slot;
+        });
+        std::vector<RetirePreferenceEntry> order;
+        order.reserve(scored.size());
+        for (const Scored& item : scored) { order.push_back(item.entry); }
+        return order;
+    }
+
+    void push_retire_preference(Program& program) const {
+        const std::vector<RetirePreferenceEntry> order = retire_preference_order();
+        program.set_retire_preference(order);
+    }
 
     void require_lane(LaneId lane, LogicalLaneState expected) const {
         if (lane.value >= lane_count_ || lanes_[lane.value] != expected ||

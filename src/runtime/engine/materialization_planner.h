@@ -82,6 +82,38 @@ struct MaterializationVictimCost {
     std::size_t priced_checkpoints   = 0;
 };
 
+// The two factors of the victim score, split out so the Program's last-resort release step can be
+// ordered by the very same arithmetic when the common layer prices the owners for it (it owns the
+// cost model and the observation history; the ladder does not).
+[[nodiscard]] inline std::uint64_t victim_value_ns(std::uint32_t retention_weight,
+                                                   std::uint64_t private_saving,
+                                                   std::span<const std::uint64_t> demand_values,
+                                                   bool explicit_shared_credit) noexcept {
+    const auto saturating_add = [](std::uint64_t& value, std::uint64_t add) {
+        value = value > std::numeric_limits<std::uint64_t>::max() - add
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : value + add;
+    };
+    const auto saturating_mul = [](std::uint64_t value, std::uint64_t factor) {
+        if (value == 0 || factor == 0) { return std::uint64_t{0}; }
+        return value > std::numeric_limits<std::uint64_t>::max() / factor
+                   ? std::numeric_limits<std::uint64_t>::max()
+                   : value * factor;
+    };
+    std::uint64_t value_ns = saturating_mul(private_saving, retention_weight);
+    for (const std::uint64_t demand_value : demand_values) { saturating_add(value_ns, demand_value); }
+    if (explicit_shared_credit) { saturating_add(value_ns, private_saving); }
+    return value_ns;
+}
+
+[[nodiscard]] inline std::uint64_t victim_score_ns(std::uint64_t value_ns,
+                                                   std::uint64_t reuse_evidence_q16) noexcept {
+    if (value_ns == 0 || reuse_evidence_q16 == 0) { return 0; }
+    return value_ns > std::numeric_limits<std::uint64_t>::max() / reuse_evidence_q16
+               ? std::numeric_limits<std::uint64_t>::max()
+               : (value_ns * reuse_evidence_q16) >> 16U;
+}
+
 // Victim ordering is one combined score in the planner's own currency, not a lexicographic field
 // chain. A field-first chain lets a single dimension decide alone - when the reuse count differs,
 // the retention weight and the recency are never read at all - which is how a deep endpoint that
@@ -118,24 +150,12 @@ struct MaterializationVictimCost {
         }
     }
 
-    const auto saturating_add = [](std::uint64_t& value, std::uint64_t add) {
-        value = value > std::numeric_limits<std::uint64_t>::max() - add
-                    ? std::numeric_limits<std::uint64_t>::max()
-                    : value + add;
-    };
-    const auto saturating_mul = [](std::uint64_t value, std::uint64_t factor) {
-        if (value == 0 || factor == 0) { return std::uint64_t{0}; }
-        return value > std::numeric_limits<std::uint64_t>::max() / factor
-                   ? std::numeric_limits<std::uint64_t>::max()
-                   : value * factor;
-    };
-
-    std::uint64_t value_ns = saturating_mul(private_saving, policy->private_retention_weight);
-    for (const std::uint64_t demand_value : demand_best) { saturating_add(value_ns, demand_value); }
-    if (policy->explicit_shared_credit) { saturating_add(value_ns, private_saving); }
+    std::uint64_t value_ns =
+        victim_value_ns(policy->private_retention_weight, private_saving, demand_best,
+                       policy->explicit_shared_credit);
     return MaterializationVictimCost{
         .value_ns         = value_ns,
-        .score            = saturating_mul(value_ns, policy->reuse_evidence_q16) >> 16U,
+        .score            = victim_score_ns(value_ns, policy->reuse_evidence_q16),
         .priced_checkpoints = priced,
     };
 }

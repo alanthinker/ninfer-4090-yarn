@@ -761,6 +761,14 @@ VictimCost(o)=\Big(w_o\max_p (Rebuild(p)-Recovery_b(p)) + PublicValue_o + Credit
 - 因此：① 深会话即使 hits=0 也按 30 s 量级的价值在险参与排序；② 50 轮对话的 hits≈50，乘子接近饱和；
   ③ 刚被读过的会话 `age≈0`，乘子最大。保留 `owner.value` 作为最终 tie-break 保证确定性。
 
+同一个序也交给 Program 的**兜底退休**（`[exhaust]`，阶梯最后一档）：那一档跑在 Program 内部，手上没有 cost model、
+observation 表和 demand window，所以由公共层定价并把序交过去（`ResourceManager::retire_preference_order()` →
+`Program::set_retire_preference()`，在 `inspect` / `reserve_materialization` / `reserve_active_capture` 前刷新）。
+公共层这一份定价唯一省略的是 recovery offset（要逐检查点回调 Program，而兜底恰恰发生在池子耗尽时，
+不能再加往返）；其余因子与规划器逐项相同。兜底仍以"最久未触碰"保底——那一步必须总能给出一个人，
+这是它存在的理由（2026-09-23 22:19：池满且无冗余副本时，它按 LRU 退役了一条 237k 真实会话，
+而 9 条刚创建的 31k 测试会话存活；价值序修掉的就是这个选择）。
+
 Shared owner 没有固定 retention multiplier。`ExplicitBoundary` 或 `RequestedAutomatic` 在 publication 时带来
 一个 owner-scoped credit；它在第一次后续 exact match 时消费，或在 32 次成功 materialization 后到期。
 同一 frontier 的多个 evidence 不叠加 credit。

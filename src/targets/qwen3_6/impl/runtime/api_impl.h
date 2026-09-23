@@ -486,6 +486,12 @@ void Program<Variant>::skip_capture(CaptureOffer<Variant>&& offer) {
 }
 
 template <>
+void Program<Variant>::set_retire_preference(
+    std::span<const runtime::RetirePreferenceEntry> order) {
+    impl_->set_retire_preference(order);
+}
+
+template <>
 runtime::ContextTransactionReserveStatus Program<Variant>::reserve_active_capture(
     CaptureOffer<Variant>&& offer, const SharedPrefixHandle<Variant>* exact_shared,
     const SharedPrefixHandle<Variant>* replacement,

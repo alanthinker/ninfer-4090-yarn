@@ -6875,9 +6875,51 @@ std::unique_ptr<PreparedPromptData> ProgramImplCore::take_failed_materialization
     return std::move(failed_materialization_prompt_);
 }
 
+void ProgramImplCore::set_retire_preference(
+    std::span<const runtime::RetirePreferenceEntry> order) {
+    // Bounded by the catalog this Program can hold, and rebuilt by the common layer whenever it may
+    // matter, so a stale order can only ever name an owner that is gone - which the walk skips.
+    retire_preference_.assign(order.begin(), order.end());
+}
+
 ProgramImplCore::RetireVictim ProgramImplCore::select_retire_victim() const noexcept {
     RetireVictim victim;
     if (!state_store) { return victim; }
+    retire_pick_from_order_ = false;
+    retire_pick_rank_       = 0;
+    retire_pick_score_      = 0;
+    // The common layer's value order first. Retirement is destructive and used to be decided by
+    // age alone, which is how a 237k-token conversation was dropped at 22:19 while nine freshly
+    // created 31k test sessions stayed (2026-09-23): its state was simply the longest untouched.
+    // Walking the score order costs one pass over an already sorted list; an entry this layer may
+    // not release is skipped, and if the order yields nothing the oldest-touched scan below still
+    // has to answer, because this step must always find a victim.
+    for (std::size_t rank = 0; rank < retire_preference_.size(); ++rank) {
+        const runtime::RetirePreferenceEntry& entry = retire_preference_[rank];
+        if (entry.shared_prefix) {
+            if (entry.slot >= shared_prefix_capacity) { continue; }
+            const SharedPrefixSlotRole role = shared_prefix_slots[entry.slot].role;
+            if (role == SharedPrefixSlotRole::Free) { continue; }
+            if (!can_release_shared_prefix_state(entry.slot, role)) { continue; }
+            victim.shared = entry.slot;
+            victim.continuation.reset();
+            retire_pick_from_order_ = true;
+            retire_pick_rank_       = rank + 1U;
+            retire_pick_score_      = entry.score_ns;
+            return victim;
+        }
+        if (entry.slot >= continuation_capacity) { continue; }
+        if (continuation_slots[entry.slot].role != ContinuationSlotRole::Catalogued) { continue; }
+        if (!can_release_continuation_slot_strict(entry.slot)) { continue; }
+        // Retiring this owner would release the very state the in-flight reservation restores.
+        if (owner_holds_release_protected_state(entry.slot)) { continue; }
+        victim.continuation = entry.slot;
+        victim.shared.reset();
+        retire_pick_from_order_ = true;
+        retire_pick_rank_       = rank + 1U;
+        retire_pick_score_      = entry.score_ns;
+        return victim;
+    }
     // The state's own touch time is the session's last-use time, so it ages idle entries without a
     // parallel recency record. Continuations and shared prefixes both own their state.
     std::optional<std::uint32_t>& best_continuation = victim.continuation;
@@ -6947,14 +6989,23 @@ bool ProgramImplCore::retire_oldest_idle_continuation() {
     if (!state_store) { return false; }
     const RetireVictim victim = select_retire_victim();
     if (victim.continuation) {
-        std::fprintf(stderr, "[exhaust] drop oldest idle continuation slot=%u\n",
-                     *victim.continuation);
+        std::fprintf(stderr,
+                     "[exhaust] drop idle continuation slot=%u source=%s rank=%zu/%zu "
+                     "score=%.3fs\n",
+                     *victim.continuation, retire_pick_from_order_ ? "score" : "oldest",
+                     retire_pick_rank_, retire_preference_.size(),
+                     static_cast<double>(retire_pick_score_) / 1.0e9);
         std::fflush(stderr);
         release_continuation_slot_strict(*victim.continuation);
         return true;
     }
     if (victim.shared) {
-        std::fprintf(stderr, "[exhaust] drop oldest idle shared prefix slot=%u\n", *victim.shared);
+        std::fprintf(stderr,
+                     "[exhaust] drop idle shared prefix slot=%u source=%s rank=%zu/%zu "
+                     "score=%.3fs\n",
+                     *victim.shared, retire_pick_from_order_ ? "score" : "oldest",
+                     retire_pick_rank_, retire_preference_.size(),
+                     static_cast<double>(retire_pick_score_) / 1.0e9);
         std::fflush(stderr);
         (void)release_shared_prefix_state_strict(*victim.shared, shared_prefix_slots[*victim.shared].role);
         return true;

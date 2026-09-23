@@ -581,6 +581,21 @@ struct PressureOwnerOutcome {
                                                    const PressureOwnerOutcome&) noexcept = default;
 };
 
+// One entry of the score order the common layer hands to the Program's last-resort release step.
+// The ladder runs inside the Program, which owns neither the cost model, nor the observation
+// history, nor the demand window, so it cannot price a victim itself; the layer that can prices the
+// owners and passes the order. `slot` is the catalog cell, shared with the Program's own slot index
+// space for the kind it names. The Program may still refuse an entry it cannot release, and falls
+// back to its own oldest-touched scan, because this step must always find someone.
+struct RetirePreferenceEntry {
+    bool shared_prefix = false;
+    std::uint32_t slot = std::numeric_limits<std::uint32_t>::max();
+    std::uint64_t score_ns = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(const RetirePreferenceEntry&,
+                                                   const RetirePreferenceEntry&) noexcept = default;
+};
+
 // Cheap, target-neutral ordering evidence for an unassessed pressure target.  This is deliberately
 // not a feasibility certificate: only PressureTargetAssessment may admit or seal a target.  The
 // Program owns the physical projection and the common planner combines the owner outcomes with its

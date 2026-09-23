@@ -878,6 +878,12 @@ public:
 
     // Engine owns scheduling and logical residency policy. Program owns physical lanes, opaque
     // capabilities, model state and one immutable pending transaction at a time.
+    // The common ResourceManager owns the victim value model (cost model, observation history,
+    // demand window) and hands its score order to the Program, whose last-resort release step runs
+    // where that model is unavailable. The Program walks the order, may still refuse an entry it
+    // cannot release, and falls back to its own oldest-touched scan - that step must always find
+    // someone, because it exists to make an exhausted pool deliver.
+    void set_retire_preference(std::span<const runtime::RetirePreferenceEntry> order);
     [[nodiscard]] RequestBasePlan<Variant>
     plan_request(const PreparedPrompt& prompt, const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt,

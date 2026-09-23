@@ -47,6 +47,7 @@ using ninfer::runtime::Readiness;
 using ninfer::runtime::RequestPlanSummary;
 using ninfer::runtime::RetentionClass;
 using ninfer::runtime::reuse_evidence_q16;
+using ninfer::runtime::RetirePreferenceEntry;
 using ninfer::runtime::VictimDisposition;
 
 int failures = 0;
@@ -672,6 +673,12 @@ public:
         return std::none_of(retired_shared_ids.begin(), retired_shared_ids.end(),
                             [&](std::uint32_t id) { return id == handle.id; });
     }
+
+    // The manager hands its victim score order over before any call that may reach the ladder.
+    void set_retire_preference(std::span<const ninfer::runtime::RetirePreferenceEntry> order) {
+        retire_preference.assign(order.begin(), order.end());
+    }
+    std::vector<ninfer::runtime::RetirePreferenceEntry> retire_preference;
 
     [[nodiscard]] std::optional<FakeAdmissionCandidate>
     inspect_admission(const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base, LaneId,
@@ -3615,6 +3622,51 @@ void test_fair_share_releases_oldest_bucket_only_when_shared_pool_exhausted() {
             "MRU bucket lost its endpoint to a neighbor's pressure");
 }
 
+// The manager owns the victim value model; the Program's last-resort release step runs where that
+// model is unavailable, so the order has to cross the boundary before any call that can reach the
+// ladder. Without this push the fallback silently reverts to oldest-touched, which is how a
+// 237k-token conversation died while freshly created test sessions stayed (2026-09-23).
+void test_manager_hands_the_retire_preference_to_the_program() {
+    FakeManager manager = make_manager(1, 4);
+    FakeProgram program;
+    const ActiveRequest first = start_active(
+        manager, program, 501,
+        make_base(501, FakeCacheSessionKey{501}, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, first);
+    const ActiveRequest second = start_active(
+        manager, program, 502,
+        make_base(502, FakeCacheSessionKey{502}, RetentionClass::LiveSession), 2);
+    (void)finish_active(manager, program, second);
+
+    program.retire_preference.clear();
+    (void)manager.inspect(program, FakePreparedPrompt{503}, make_base(503), 3);
+    require(!program.retire_preference.empty(),
+            "planning did not hand a retire preference to the Program");
+    require(std::is_sorted(program.retire_preference.begin(), program.retire_preference.end(),
+                           [](const RetirePreferenceEntry& left,
+                              const RetirePreferenceEntry& right) {
+                               return left.score_ns < right.score_ns;
+                           }),
+            "the retire preference is not ordered by score");
+    std::vector<std::uint32_t> private_slots;
+    for (const RetirePreferenceEntry& entry : program.retire_preference) {
+        if (!entry.shared_prefix) { private_slots.push_back(entry.slot); }
+    }
+    require(private_slots.size() >= 2,
+            "the retire preference does not cover the catalogued sessions");
+    std::sort(private_slots.begin(), private_slots.end());
+    require(std::adjacent_find(private_slots.begin(), private_slots.end()) == private_slots.end(),
+            "the retire preference names a slot twice");
+
+    program.retire_preference.clear();
+    const ActiveRequest third = start_active(
+        manager, program, 504,
+        make_base(504, FakeCacheSessionKey{504}, RetentionClass::LiveSession), 4);
+    (void)manager.reserve_active_capture(program, third.lane, FakeCaptureOffer{.id = 9}, true, {});
+    require(!program.retire_preference.empty(),
+            "capture reservation did not hand a retire preference to the Program");
+}
+
 // Victim ordering must be one combined score, not a lexicographic field chain. The chain's first
 // field was the reuse count, so an owner that had not been re-read yet sorted as the cheapest
 // victim however deep it was: on 2026-09-23 that evicted a 62k-token conversation which had been
@@ -3828,6 +3880,8 @@ int main() {
              test_fair_share_releases_oldest_bucket_only_when_shared_pool_exhausted);
     run_test("fair-share capture protection",
              test_fair_share_capture_pressure_cannot_touch_protected_sessions);
+    run_test("manager hands over the retire preference",
+             test_manager_hands_the_retire_preference_to_the_program);
     run_test("victim score combines value and reuse evidence",
              test_victim_score_ranks_by_value_not_by_one_field);
     if (failures != 0) { return 1; }

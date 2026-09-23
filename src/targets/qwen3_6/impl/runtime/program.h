@@ -767,6 +767,10 @@ public:
     // the engine can re-plan the request from root. Null when there is none.
     [[nodiscard]] std::unique_ptr<PreparedPromptData> take_failed_materialization_prompt() noexcept;
 
+    // Score order for the last-resort release, supplied by the common layer (see the public
+    // Program declaration). Empty means "no opinion": the scan then falls back to oldest-touched.
+    void set_retire_preference(std::span<const runtime::RetirePreferenceEntry> order);
+
 private:
     void advance_resource_revision() noexcept {
         if (++resource_revision_.value == 0) { ++resource_revision_.value; }
@@ -1259,6 +1263,12 @@ private:
     };
     [[nodiscard]] RetireVictim select_retire_victim() const noexcept;
     [[nodiscard]] std::uint32_t retirable_host_state_slots() const noexcept;
+    std::vector<runtime::RetirePreferenceEntry> retire_preference_;
+    // Where the last select_retire_victim() came from: preference rank (0 = oldest-touched
+    // fallback), the entry's score, and whether it was chosen from the order at all.
+    mutable std::size_t retire_pick_rank_     = 0;
+    mutable std::uint64_t retire_pick_score_  = 0;
+    mutable bool retire_pick_from_order_      = false;
     // Memo for the scan above: revision, protected-state index, and the Host slots it returned.
     mutable std::uint64_t retirable_relief_revision_  = std::numeric_limits<std::uint64_t>::max();
     mutable std::uint32_t retirable_relief_protected_ = std::numeric_limits<std::uint32_t>::max();
