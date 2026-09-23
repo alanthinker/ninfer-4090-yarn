@@ -39,13 +39,22 @@ PIDFILE="$NINFER_HARNESS_DIR/ninfer_serve_agent.pid"
 #   device state objects = concurrency 4 + device-state-slots 4 = 8 (production count)
 #   host state slots 48  = 4 sessions x ~8 retained checkpoints + headroom (production 320);
 #                           session #5+ hits the eviction/retire ladder, session <=4 must not
-#   kv-capacity 65536     = 2 x max-context: one full-context request is always feasible,
-#                           4 x full-context crosses the shared-capacity boundary
+#   kv-capacity auto      = production's mode. Measured production banner (2026-09-23):
+#                           kv_capacity_tokens=658176 kv_page_groups=10284. The old default
+#                           65536 tokens (1024 pages) was 10x tighter than production and
+#                           saturation on that axis - not host state - drove whole-session
+#                           evictions the battery could not attribute: a no-pressure plan was
+#                           judged infeasible at device.main_kv used=1024 peak=1 cap=1024, which
+#                           production never reaches (peak observed 6423 of 10284).
+#   host-kv-mib 4096      = production is 32768 MiB over 320 host slots (~102 MiB/slot); 48
+#                           slots x that ratio = ~4.9 GB. The old 512 MiB made every ~1.1 GB
+#                           host-KV allocation report blocked_host and never fit (166 infeasible
+#                           targets in one battery run), which production cannot reproduce.
 HOST_SLOTS="${AGENT_HOST_SLOTS:-48}"       # working set fits; the 5th session fills the cache
 DEV_SLOTS="${AGENT_DEV_SLOTS:-4}"
-HOST_KV_MIB="${AGENT_HOST_KV_MIB:-512}"
+HOST_KV_MIB="${AGENT_HOST_KV_MIB:-4096}"   # ~102 MiB/host slot, production's ratio
 MAX_CTX="${AGENT_MAX_CTX:-32768}"           # battery prompts ~8.5K; 40K oversized still overflows
-KV_CAPACITY="${AGENT_KV_CAPACITY:-65536}"
+KV_CAPACITY="${AGENT_KV_CAPACITY:-auto}"   # same mode as production (see banner above)
 PRIVATE="${AGENT_PRIVATE:-16}"
 CONCURRENCY="${AGENT_CONCURRENCY:-4}"       # production concurrency: 4-lane admission boundary
 FIRST_SPACING="${AGENT_FIRST_SPACING:-4096}"   # production value: first spread anchor at tools end
