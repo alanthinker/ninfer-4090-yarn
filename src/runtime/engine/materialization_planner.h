@@ -727,11 +727,19 @@ public:
                                                  policy.owner),
             });
         }
+        // Value first; among owners the score cannot separate, the least recently reused one goes
+        // first (never-hit owners carry epoch 0). Replacing the old lexicographic order dropped
+        // recency from this decision entirely, which made a freshly published conversation as
+        // attractive a victim as an hour-old one of the same value.
         std::sort(preferred.begin(), preferred.end(),
                   [](const PreferredOwner& left, const PreferredOwner& right) {
-                      return left.victim_cost != right.victim_cost
-                                 ? left.victim_cost < right.victim_cost
-                                 : left.policy->owner.value < right.policy->owner.value;
+                      if (left.victim_cost != right.victim_cost) {
+                          return left.victim_cost < right.victim_cost;
+                      }
+                      if (left.policy->last_hit_epoch != right.policy->last_hit_epoch) {
+                          return left.policy->last_hit_epoch < right.policy->last_hit_epoch;
+                      }
+                      return left.policy->owner.value < right.policy->owner.value;
                   });
         std::vector<PlanningOwnerId> preferred_owner_ids;
         preferred_owner_ids.reserve(preferred.size());

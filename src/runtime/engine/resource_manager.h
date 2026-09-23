@@ -1550,6 +1550,11 @@ private:
         // turnover, and carried along when a turn publishes into another cell.
         std::uint64_t lifetime_selected_hits = 0;
         std::chrono::steady_clock::time_point last_selected_at{};
+        // Last activity of any kind (publication or reuse hit), used only to break ties between
+        // owners of equal value: among equally valuable states the least recently active one goes
+        // first, so a just-inserted cache is never the first to die while older equal-value state
+        // is resident. It deliberately does not feed the reuse evidence, which is about reuse.
+        std::chrono::steady_clock::time_point last_active_at{};
     };
 
     struct SharedCatalogEntry {
@@ -1858,15 +1863,26 @@ private:
         struct Scored {
             RetirePreferenceEntry entry;
             std::uint64_t score = 0;
+            std::chrono::steady_clock::time_point last_active{};
+            bool protected_by_fair_share = false;
         };
         std::vector<Scored> scored;
         scored.reserve(catalog_count_ + shared_catalog_count_);
         const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        // The SAME protection window the planner uses: fair-share buckets are excluded from the
+        // planner's victim domain, and the old oldest-touched fallback could never pick an owner
+        // inside that window either (the least recently touched is never among the most recently
+        // active). Scoring without this partition put a freshly published conversation - the
+        // cheapest thing in the pool by construction - in the fallback's crosshairs, which is what
+        // broke the reuse suites: `state_index`, `prefix_switch`, `prefix_mixed`, `fork_hit` all
+        // create conversations and then expect them to survive the pressure they themselves cause.
+        const std::vector<std::uint32_t> protected_slots = fair_share_protected_slots();
 
         // `for_each_checkpoint` visits one checkpoint at a time, so nothing has to be collected.
         const auto append = [&](bool shared_prefix, std::uint32_t slot, std::uint32_t weight,
                                 std::uint64_t hits, std::chrono::steady_clock::time_point last,
-                                bool credit, auto&& for_each_checkpoint) {
+                                std::chrono::steady_clock::time_point active, bool credit,
+                                bool protected_by_fair_share, auto&& for_each_checkpoint) {
             std::uint64_t private_saving = 0;
             std::array<std::uint64_t, 32> demand_best{};
             for_each_checkpoint([&](const auto& checkpoint) {
@@ -1884,7 +1900,9 @@ private:
             scored.push_back(Scored{
                 .entry = RetirePreferenceEntry{
                     .shared_prefix = shared_prefix, .slot = slot, .score_ns = score},
-                .score = score,
+                .score               = score,
+                .last_active         = active,
+                .protected_by_fair_share = protected_by_fair_share,
             });
         };
 
@@ -1892,7 +1910,11 @@ private:
             const CatalogEntry& entry = catalog_[slot];
             if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
             append(false, slot, private_retention_weight(entry.retention),
-                   entry.lifetime_selected_hits, entry.last_selected_at, false,
+                   entry.lifetime_selected_hits, entry.last_selected_at,
+                   entry.last_active_at != std::chrono::steady_clock::time_point{}
+                       ? entry.last_active_at
+                       : entry.last_selected_at,
+                   false, is_fair_share_protected(protected_slots, slot),
                    [&](auto&& visit) {
                        if (entry.summary.endpoint) { visit(*entry.summary.endpoint); }
                        if (entry.summary.rewrite) { visit(*entry.summary.rewrite); }
@@ -1905,13 +1927,27 @@ private:
             const SharedCatalogEntry& entry = shared_catalog_[slot];
             if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
             append(true, slot, 0, entry.observation.selected_hit_count, entry.last_selected_at,
-                   entry.explicit_credit,
+                   entry.last_selected_at, entry.explicit_credit, false,
                    [&](auto&& visit) { visit(entry.summary.checkpoint); });
         }
 
+        // Two-tier order, mirroring how the planner escalates into fair-share buckets:
+        //   1. unprotected owners, cheapest value first (ties: least recently active);
+        //   2. protected owners, least recently active first - the planner's escalation releases
+        //      the oldest bucket first, and value should not be able to reach inside the window.
         std::sort(scored.begin(), scored.end(), [](const Scored& left, const Scored& right) {
-            return left.score != right.score ? left.score < right.score
-                                             : left.entry.slot < right.entry.slot;
+            if (left.protected_by_fair_share != right.protected_by_fair_share) {
+                return !left.protected_by_fair_share;
+            }
+            if (left.protected_by_fair_share) {
+                if (left.last_active != right.last_active) {
+                    return left.last_active < right.last_active;
+                }
+                return left.entry.slot < right.entry.slot;
+            }
+            if (left.score != right.score) { return left.score < right.score; }
+            if (left.last_active != right.last_active) { return left.last_active < right.last_active; }
+            return left.entry.slot < right.entry.slot;
         });
         std::vector<RetirePreferenceEntry> order;
         order.reserve(scored.size());
@@ -2056,6 +2092,7 @@ private:
         entry.activity_epoch = 0;
         entry.lifetime_selected_hits = 0;
         entry.last_selected_at       = {};
+        entry.last_active_at         = {};
         advance_revision(entry.revision);
     }
 
@@ -2373,6 +2410,7 @@ private:
         ++activity_sequence_;
         if (activity_sequence_ == 0) { ++activity_sequence_; }
         catalog_[slot].activity_epoch = activity_sequence_;
+        catalog_[slot].last_active_at = std::chrono::steady_clock::now();
     }
 
     template <class SplitCostFn>

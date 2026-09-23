@@ -313,6 +313,13 @@ step prefix_mixed     300 python3 tools/smoke/test_prefix_reuse_mixed.py --port 
     "${MIXED_ARGS[@]}"
 step fork_hit         300 python3 tools/smoke/test_long_anchor_fork_hit.py \
     --base-url "http://127.0.0.1:$PORT/v1" "${FORK_ARGS[@]}"
+
+# Regression guard for the victim score: build ONE valuable conversation (deep, reused every
+# turn), flood the saturated pool until the ladder retires owners, and require that the valuable
+# one is never named by an eviction and still reuses >80% afterwards. This is the property the
+# scoring fix exists for (a 237k conversation died while fresh test sessions stayed, 2026-09-23).
+step important_session 600 python3 tools/smoke/test_important_session_survival.py --port "$PORT" \
+    --turns 8 --turn-tokens 2500 --flood 40
 # fair_share_sim retired from the battery (09-23): the branch it wants to
 # observe (fair-share bucket release) is covered at the decision level by
 #   ./build/tests/ninfer_resource_manager_test
