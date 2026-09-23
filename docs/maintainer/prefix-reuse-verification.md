@@ -70,7 +70,7 @@ was truly lost (evicted from both device and host).
 |--------|---------------|
 | `--device-state-slots 4` | 8 total device slots; more active rounds = more eviction pressure |
 | `--host-state-slots 320` | Must be large enough for all conversations' host replicas |
-| `--fair-share-buckets 8` | Protects 8 most recent idle sessions; with 9 convs, conv 1 may NOT be protected |
+| `--fair-share-buckets 8` | Protects 8 most recent idle sessions; with 9 convs, conv 1 may NOT be protected. Switch-back/state-index scripts must therefore pass `--conversations <= buckets` (and `--verify <= conversations`): on a FULL pool an out-of-set oldest conversation is evicted legitimately and the all-hit assertion goes red for the wrong reason (both `prefix_switch` `9>8` and `state_index` `verify5>conversations4` produced false REDs on 2026-09-23) |
 | `--auto-long-anchors N` (default 5) | Each conversation keeps up to N tail anchors, at least `--first-anchor-spacing` apart (more host slots consumed) |
 | `--max-private-continuations 16` | Catalog capacity; must be >= number of conversations |
 
