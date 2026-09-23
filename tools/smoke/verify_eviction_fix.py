@@ -21,7 +21,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 from harness_paths import HARNESS_DIR, cached_prompt_tokens  # noqa: E402
 from fill_anchors import build_session, occupancy, load_corpus  # noqa: E402
 
-SERVE_LOG = Path(os.environ.get("NINFER_SERVE_LOG") or HARNESS_DIR / "ninfer_serve.log")
+# NINFER_SERVICE_LOG is the documented harness variable (the agent rig exports it and writes
+# ninfer_serve_agent.log); NINFER_SERVE_LOG is kept as the historical alias.
+SERVE_LOG = Path(os.environ.get("NINFER_SERVICE_LOG")
+                 or os.environ.get("NINFER_SERVE_LOG")
+                 or HARNESS_DIR / "ninfer_serve.log")
 
 
 def ask(base: str, msgs: list, timeout: int = 600) -> dict:

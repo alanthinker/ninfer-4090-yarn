@@ -76,9 +76,12 @@ def main():
     print(f"Base URL: {base_url}")
     print(f"Conversations: {args.conversations}")
     print(f"Words/prompt: ~{args.words}")
-    print(f"Device state slots: 4 (8 with both replicas)")
-    print(f"Host state slots: 320")
-    print(f"KV page pool: 10,284 pages (256 tokens/page)")
+    # Live occupancy instead of literals: the previous header printed the production rig's
+    # fixed numbers (host 320 / kv 10284 pages), which silently lie on any other instance.
+    from fill_anchors import occupancy  # noqa: PLC0415
+    o = occupancy()
+    print(f"Device state slots used: {o.get('dev')} | Host state slots used: {o.get('host')}")
+    print(f"KV pages used: {o.get('kv_pages')} | Host KV used: {o.get('host_kv_mb')}MB")
     print()
 
     # Phase 1: Create conversations to fill device slots

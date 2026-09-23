@@ -12,8 +12,8 @@
     2. 新会话到来时, 日志出现锚点 victim 的 CopyToHost/Drop(旧锚点被驱逐)。
 
 用法:
-  python3 fill_anchors.py                 # 打满 30000 端口的主服务
-  python3 fill_anchors.py 30001 20        # 压力服务, 上限 20 条会话
+  python3 fill_anchors.py                    # 打满 30000 端口的主服务 (total 默认 320)
+  python3 fill_anchors.py 30000 6 48         # 小参数 rig: 上限 6 会话, 池总量 48 (随实际标定)
 """
 import json
 import os
@@ -90,10 +90,16 @@ def occupancy() -> dict:
 def main() -> None:
     port = sys.argv[1] if len(sys.argv) > 1 else "30000"
     max_sessions = int(sys.argv[2]) if len(sys.argv) > 2 else MAX_SESSIONS
+    # Pool total follows the instance under test (production 320; small rigs pass e.g. 48),
+    # otherwise a small rig never reaches the production-shaped FULL threshold and keeps
+    # filling long after the pool saturated.
+    total = int(sys.argv[3]) if len(sys.argv) > 3 else int(
+        os.environ.get("NINFER_FILL_TOTAL", "320"))
+    full_at = max(total - 2, 1)
     base = f"http://127.0.0.1:{port}"
     corpus = load_corpus()
     o = occupancy()
-    print(f"start occupancy: host_state={o.get('host')}/{320} device_state={o.get('device')} "
+    print(f"start occupancy: host_state={o.get('host')}/{total} device_state={o.get('device')} "
           f"pinned={o.get('pinned')} kv_pages={o.get('kv_pages')} host_kv={o.get('host_kv_mb')}MB", flush=True)
     t0 = time.time()
     # FILL_SESSION_BASE shifts the generated conversations, so a later round creates NEW sessions
@@ -110,12 +116,12 @@ def main() -> None:
             break
         o = occupancy()
         host = o.get("host")
-        status = "FULL" if (host is not None and host >= 318) else ""
+        status = "FULL" if (host is not None and host >= full_at) else ""
         print(f"[{s:2d}] prompt={r['prompt']:>6} {r['elapsed']:>5.1f}s | "
-              f"host={host}/320 dev={o.get('device')} pinned={o.get('pinned')} "
+              f"host={host}/{total} dev={o.get('device')} pinned={o.get('pinned')} "
               f"host_kv={o.get('host_kv_mb')}MB {status} | wall={time.time()-t0:.0f}s", flush=True)
         if status:
-            print(f"== host state pool FULL (host_state_slots={host}/320) after {s} sessions ==")
+            print(f"== host state pool FULL (host_state_slots={host}/{total}) after {s} sessions ==")
             break
     print(f"DONE | final {occupancy()} | {time.time()-t0:.0f}s")
 

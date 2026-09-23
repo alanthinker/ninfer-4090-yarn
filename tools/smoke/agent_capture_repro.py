@@ -26,8 +26,8 @@ import sys
 import time
 import urllib.request
 
-BASE = "http://127.0.0.1:30002"
-PORT = os.environ.get("AGENT_PORT", "30002")
+PORT = os.environ.get("AGENT_PORT", "30000")   # one GPU, one service: :30000 only
+BASE = "http://127.0.0.1:30000"
 BASE = f"http://127.0.0.1:{PORT}"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness_paths import REQDUMP_DIR, cached_prompt_tokens  # noqa: E402  (tools/smoke/harness_paths.py)

@@ -24,7 +24,11 @@ may already be warm.
 
 Usage:
     python3 tools/smoke/test_context_cache_pressure.py --base-url http://127.0.0.1:30000/v1
-    python3 tools/smoke/test_context_cache_pressure.py --base-url http://127.0.0.1:30001/v1 \
+    # small-pool rig (all harnesses run on :30000): start the agent harness with the retired
+    # pressure script's sizing, then
+    AGENT_PRIVATE=4 AGENT_FIRST_SPACING=100 AGENT_MAX_ANCHORS=32 \
+        tools/smoke/ninfer_service_agent.sh start
+    python3 tools/smoke/test_context_cache_pressure.py --base-url http://127.0.0.1:30000/v1 \
         --conversations 20 --rounds 6 --words 300 --pressure 20 --verify 3
 
 To relate the run to what the engine did, point --log at the service log and the script reports

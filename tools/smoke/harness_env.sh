@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Shared environment for the small-parameter Engine launchers in this directory
-# (ninfer_service_agent.sh, ninfer_service_pressure.sh) and for sweep_concurrency.sh.
+# Shared environment for the small-parameter Engine launcher in this directory
+# (ninfer_service_agent.sh) and for sweep_concurrency.sh.
 #
 # Sourced, never executed. It resolves the three things every launcher needs and keeps the source
 # tree clean while doing it:

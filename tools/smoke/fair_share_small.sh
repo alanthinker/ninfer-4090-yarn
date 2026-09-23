@@ -24,7 +24,7 @@ mkdir -p "$NINFER_HARNESS_DIR"
 export NINFER_REQDUMP_DIR="$NINFER_HARNESS_DIR/reqdump"
 export NINFER_REQUEST_LOG="$NINFER_HARNESS_DIR/request_log.jsonl"
 export NINFER_SERVICE_LOG="$NINFER_HARNESS_DIR/ninfer_serve_agent.log"
-export AGENT_PORT="${AGENT_PORT:-30005}"
+export AGENT_PORT="${AGENT_PORT:-30000}"   # one GPU, one service: :30000 only
 # Sizing rule: the small rig must still hold the WORKING SET - four concurrent sessions, the
 # production concurrency - comfortably. Only the cache beyond that is small, so the rig fills in
 # seconds while the behaviour it exercises stays production-like (a starved working set measures a

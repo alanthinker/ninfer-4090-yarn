@@ -19,19 +19,24 @@ source "$HERE/harness_env.sh"
 harness_require
 BIN="$NINFER_BIN"
 MODEL="$NINFER_WEIGHTS"
-PORT=30001          # 避开生产端口, 不打扰正在跑的服务
+PORT=30000          # 与其他 harness 同端口; 本脚本自起实例, 必须先停正在跑的服务
+# 单 GPU 单服务: 真有服务 LISTEN 才拒绝; TIME_WAIT 不算占用 (否则刚 stop 完会误报)。
+python3 -c "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1',$PORT)); s.close()" 2>/dev/null \
+    || { echo "错误: 端口 $PORT 正被服务监听 - 请先 stop 正在运行的服务再跑本脚本"; exit 1; }
 LOG="$NINFER_HARNESS_DIR/sweep.log"
 
 probe() {   # probe <concurrency> <max_context>
   local n="$1" mc="$2"
   : > "$LOG"
-  "$BIN" "$MODEL" --host 127.0.0.1 --port "$PORT" --model-id probe \
+  # setsid: the probe engine gets its own process group, so our kill sequence can never
+  # reach this script (observed: the script died silently right after kill -9 without it).
+  setsid "$BIN" "$MODEL" --host 127.0.0.1 --port "$PORT" --model-id probe \
     --max-context "$mc" --kv-capacity auto \
     --max-concurrency "$n" --max-pending-requests 4 \
     --prefill-chunk 1024 --kv-dtype rk4v4-e8 \
     --spec mtp --draft-tokens 3 --lm-head-draft \
     --vision --host-kv-mib 4096 --host-state-slots 4 \
-    >"$LOG" 2>&1 &
+    >"$LOG" 2>&1 < /dev/null &
   local pid=$!
   local line="" ok=0
   for _ in $(seq 1 40); do
@@ -50,13 +55,16 @@ probe() {   # probe <concurrency> <max_context>
       "$n" "$mc" "$cap" "${slack:-?}" "${dslots:-?}"
   else
     local err
-    err=$(grep -iE 'error|fatal|exceed|insufficient|at least' "$LOG" | tail -1 | cut -c1-160)
+    err=$(grep -iE 'error|fatal|exceed|insufficient|at least' "$LOG" | tail -1 | cut -c1-160 || true)
     printf 'FAIL N=%-2s max_ctx=%-8s %s\n' "$n" "$mc" "${err:-<no capacity line>}"
   fi
-  kill "$pid" 2>/dev/null
+  kill -TERM "$pid" 2>/dev/null || true
   for _ in $(seq 1 15); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
-  kill -9 "$pid" 2>/dev/null
-  wait "$pid" 2>/dev/null
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  # VRAM is released asynchronously (~tens of GiB): the next probe must not start until the
+  # previous instance has actually given its memory back, or its reservation fails.
+  "$HERE/agent_wait_gpu.sh" 31000 180 >/dev/null 2>&1 || true
   sleep 2
 }
 
