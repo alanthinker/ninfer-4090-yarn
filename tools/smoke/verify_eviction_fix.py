@@ -53,15 +53,23 @@ def main() -> None:
     n_infeasible_before = len(re.findall(r"reuse infeasible", log_before))
     n_evict_before = log_before.count("anchor host evict")
 
-    # 对三条不同新旧程度的填充会话发 follow-up(旧历史 + 一条新消息)
+    # Publish the session first, then follow up on it. The test used to assume the fill had already
+    # created sessions 4/9/14, which only holds when the fill runs to its cap: a tight rig
+    # early-stops after one session, and a follow-up on a session that was never sent is a cold
+    # prefill BY CONSTRUCTION - all 77 indexed checkpoints answered "REJECT digest-mismatch" and the
+    # test printed FAIL for a precondition it had never established (2026-09-23). Establishing its
+    # own premise makes the verdict mean what its name says on any saturation level.
     results = []
     for s in (4, 9, 14):
+        published = ask(base, build_session(s, corpus))
         msgs = build_session(s, corpus)
         msgs.append({"role": "user", "content": f"Reply with exactly: VERIFY-{s:02d} ACK."})
         r = ask(base, msgs)
         results.append((s, r))
-        print(f"session {s:02d}: prompt={r['prompt']:>6} cached={r['cached']:>6} "
-              f"cache={r['cache_pct']:>5}%  {r['elapsed']:>6.1f}s", flush=True)
+        print(f"session {s:02d}: publish prompt={published['prompt']:>6} "
+              f"cache={published['cache_pct']:>5}% {published['elapsed']:>6.1f}s | follow-up "
+              f"prompt={r['prompt']:>6} cached={r['cached']:>6} cache={r['cache_pct']:>5}% "
+              f"{r['elapsed']:>6.1f}s", flush=True)
 
     log_after = SERVE_LOG.read_text(errors="replace")
     window = log_after[len(log_before):]
@@ -76,6 +84,9 @@ def main() -> None:
         print("  |", l[:160])
     print("== PASS: 池满下复用仍命中, 无 physical-peak 拒绝 ==" if ok
           else "== FAIL: 存在 cache 未命中或 physical-peak 拒绝 ==")
+    # The verdict must reach the caller: printing FAIL and returning 0 is what let a whole battery
+    # report rc=0 for a test that had failed.
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

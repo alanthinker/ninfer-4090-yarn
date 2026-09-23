@@ -80,6 +80,7 @@ export NINFER_REQDUMP_DIR="${NINFER_REQDUMP_DIR:-$(dirname "$NINFER_SERVICE_LOG"
 S="$NINFER_SERVICE_LOG"
 FULL_AT=$((TOTAL - 2))
 ERR_PAT='HTTP 500|HTTP 503|\[engine\] fatal|Segmentation|terminate called'
+FAILED_STEPS=0
 
 # Window peak: max host_state_slots over occupancy records newer than this battery's start.
 # Implemented in python so a missing/short log or a non-numeric value fails CLOSED (exit 1),
@@ -125,6 +126,13 @@ step() {
         "$name" "$rc" "$((end - start))" "$errs" "$health"
     if [ "${errs:-0}" != "0" ]; then
         tail -n +"$((before + 1))" "$S" | grep -E "$ERR_PAT" | head -3 | sed 's/^/    /'
+    fi
+    # A suite's own verdict must reach this battery's exit status: a step that printed FAIL and
+    # returned 0 (verify_eviction_fix did exactly that until 2026-09-23) showed rc=0 here and the
+    # battery still ended green. Count a non-zero return, a new error line, or a dead service.
+    if [ "$rc" != "0" ] || [ "${errs:-0}" != "0" ] || [ "$health" = "DOWN" ]; then
+        FAILED_STEPS=$((FAILED_STEPS + 1))
+        echo "    ^ recorded as FAILED (rc=$rc new_err=${errs:-?} health=$health)"
     fi
     return 0
 }
@@ -290,4 +298,8 @@ echo "transfer churn (this battery): D2H copies=$(scope 'state-store: D2H copy h
 # morning's stops while every step slice of this battery was0). Count only this battery's tail.
 echo -n "matching error lines in $S (this battery's window): "
 tail -n +"$((BAT_START_LINE + 1))" "$S" | grep -cE "$ERR_PAT" || true
+if [ "$FAILED_STEPS" != "0" ]; then
+    echo "BATTERY FAILED: $FAILED_STEPS step(s) reported a failure"
+    exit 1
+fi
 echo "== battery done =="
