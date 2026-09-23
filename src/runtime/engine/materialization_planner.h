@@ -36,6 +36,9 @@ struct MaterializationOwnerPolicy {
     std::uint64_t last_hit_epoch           = 0;
     std::uint32_t private_retention_weight = 0;
     bool explicit_shared_credit            = false;
+    // Recency-horizon membership: active within the last minute. It is a sort key, never a veto -
+    // see ResourceManager::within_recency_horizon for why protection must not empty the domain.
+    bool within_recency_horizon            = false;
     // Reuse evidence for this owner in Q16: how often this conversation has been reused as a base,
     // decayed by how long ago that last happened, with a floor so a session that has not been
     // re-read yet is cheap rather than worthless. Owner-scoped on purpose: a growing conversation
@@ -727,12 +730,17 @@ public:
                                                  policy.owner),
             });
         }
-        // Value first; among owners the score cannot separate, the least recently reused one goes
-        // first (never-hit owners carry epoch 0). Replacing the old lexicographic order dropped
-        // recency from this decision entirely, which made a freshly published conversation as
-        // attractive a victim as an hour-old one of the same value.
+        // Idle owners first: an owner active within the recency horizon waits behind every owner
+        // that has been idle longer, and only then does value decide. Protection as an ordering
+        // keeps the last victim reachable - the ladder must always be able to free something -
+        // while still making a just-read conversation the last thing a newer one may retire
+        // (2026-09-24 fork_hit). Within a class, value first; ties break on least recently reused
+        // (never-hit owners carry epoch 0), then owner id for determinism.
         std::sort(preferred.begin(), preferred.end(),
                   [](const PreferredOwner& left, const PreferredOwner& right) {
+                      if (left.policy->within_recency_horizon != right.policy->within_recency_horizon) {
+                          return !left.policy->within_recency_horizon;
+                      }
                       if (left.victim_cost != right.victim_cost) {
                           return left.victim_cost < right.victim_cost;
                       }

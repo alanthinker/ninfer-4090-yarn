@@ -1955,7 +1955,8 @@ private:
                    entry.last_active_at != std::chrono::steady_clock::time_point{}
                        ? entry.last_active_at
                        : entry.last_selected_at,
-                   false, is_fair_share_protected(protected_slots, slot),
+                   false, is_fair_share_protected(protected_slots, slot) ||
+                              within_recency_horizon(slot),
                    [&](auto&& visit) {
                        if (entry.summary.endpoint) { visit(*entry.summary.endpoint); }
                        if (entry.summary.rewrite) { visit(*entry.summary.rewrite); }
@@ -2412,14 +2413,10 @@ private:
     // owner) are excluded from pressure victim domains and from shared-capture pressure, so an
     // active neighbor's churn can no longer evict an idle session's deep endpoint. A request
     // that fits no other way forces the buckets open, oldest first (see plan_materialization).
-    // The bucket window (most recently active N) comes first and the recency-horizon members are
-    // appended behind it, so callers that slice `begin + protected_limit` keep the documented
-    // bucket-opening escalation unchanged while membership tests see both classes. See
-    // kRecencyHorizonSeconds for why activity rank alone is not enough.
     [[nodiscard]] std::vector<std::uint32_t> fair_share_protected_slots() const noexcept {
         std::vector<std::uint32_t> protected_slots;
         if (!cache_enabled_ || fair_share_buckets_ == 0) { return protected_slots; }
-        protected_slots.reserve(catalog_count_);
+        protected_slots.reserve(std::min<std::size_t>(fair_share_buckets_, catalog_count_));
         for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
             const CatalogEntry& entry = catalog_[slot];
             if (entry.state != CatalogState::Catalogued || !entry.handle ||
@@ -2437,39 +2434,36 @@ private:
                                  : left < right;
                   });
         if (protected_slots.size() > fair_share_buckets_) {
-            const std::vector<std::uint32_t> beyond(
-                protected_slots.begin() + fair_share_buckets_, protected_slots.end());
             protected_slots.resize(fair_share_buckets_);
-            const std::chrono::steady_clock::time_point horizon =
-                std::chrono::steady_clock::now() -
-                std::chrono::seconds(kRecencyHorizonSeconds);
-            for (const std::uint32_t slot : beyond) {
-                const std::chrono::steady_clock::time_point active =
-                    catalog_[slot].last_active_at;
-                if (active != std::chrono::steady_clock::time_point{} && active >= horizon) {
-                    protected_slots.push_back(slot);
-                }
-            }
         }
         return protected_slots;
     }
 
-    // Horizon members sit behind the bucket window in fair_share_protected_slots()'s result; they
-    // are victim-protected on their own terms (wall-clock recency), not through bucket escalation.
-    [[nodiscard]] bool recency_horizon_member(const std::vector<std::uint32_t>& protected_slots,
-                                              std::uint32_t slot) const noexcept {
-        const auto found = std::find(protected_slots.begin(), protected_slots.end(), slot);
-        return found != protected_slots.end() &&
-               static_cast<std::size_t>(found - protected_slots.begin()) >= fair_share_buckets_;
+    // The recency horizon is an ORDERING, never an exclusion. Touched within this many seconds,
+    // an owner waits behind owners that have been idle longer - in the planner's preference order
+    // and as the retire order's second tier - so a just-read session is not retired to publish a
+    // newer one (2026-09-24: a 7k-token conversation was retired to free a single device object one
+    // second after it was read, while hour-old never-reread sessions survived; fork_hit's control
+    // fell to 79.3%). Activity rank alone cannot express that: production touches eight or more
+    // owners per second, so a session read one second ago falls out of the top-N bucket.
+    //
+    // As an exclusion it deadlocked admission: under rig churn every owner was inside the horizon
+    // (reuse-diag `fair=16` of 16), the victim domain went empty, and with device.state 8/8 and
+    // nobody left to retire the request could not be planned - the admission watchdog fired
+    // `isolated-feasible request is blocked in an idle Engine` (2026-09-24, battery r16). Only the
+    // bucket window may exclude, because bucket opening is its escape hatch; ordering always keeps
+    // the last victim findable, which is the whole contract of the release ladder.
+    [[nodiscard]] bool within_recency_horizon(std::uint32_t slot) const noexcept {
+        if (slot >= catalog_count_) { return false; }
+        const CatalogEntry& entry = catalog_[slot];
+        if (entry.state != CatalogState::Catalogued || !entry.handle ||
+            entry.last_active_at == std::chrono::steady_clock::time_point{}) {
+            return false;
+        }
+        return entry.last_active_at >=
+               std::chrono::steady_clock::now() - std::chrono::seconds(kRecencyHorizonSeconds);
     }
 
-    // How long an owner stays in the recency horizon: touched within this many seconds, it
-    // competes only with other recently touched owners - least recently active first - and never
-    // against owners that have been idle longer, whatever its score. Activity rank alone cannot
-    // express that: production touches eight or more owners per second, so a session read one
-    // second ago falls out of the top-N bucket (2026-09-24: a 7k-token conversation was retired to
-    // free one device object one second after it was read, while hour-old never-reread sessions
-    // survived; the battery's fork_hit control dropped from its endpoint to an older anchor).
     static constexpr std::int64_t kRecencyHorizonSeconds = 60;
 
     [[nodiscard]] bool is_fair_share_protected(const std::vector<std::uint32_t>& protected_slots,
@@ -2770,10 +2764,6 @@ private:
                 if (is_fair_share_protected(limited_protected, slot)) {
                     continue; // fair-share bucket: victim-protected this attempt
                 }
-                if (recency_horizon_member(protected_slots, slot)) {
-                    continue; // recency horizon: retired only among other recent owners, least
-                              // recently active first - never to publish a newer one
-                }
                 const PlanningOwnerId owner{.value =
                                                 static_cast<std::uint32_t>(owner_records.size())};
                 private_owners.push_back(&*entry.handle);
@@ -2823,6 +2813,7 @@ private:
                     .selected_hit_count       = entry.lifetime_selected_hits,
                     .last_hit_epoch           = newest_hit_epoch(entry),
                     .private_retention_weight = private_retention_weight(entry.retention),
+                    .within_recency_horizon   = within_recency_horizon(slot),
                     .reuse_evidence_q16       = reuse_evidence_q16(
                         entry.lifetime_selected_hits, entry.last_selected_at, observation_now),
                 });
