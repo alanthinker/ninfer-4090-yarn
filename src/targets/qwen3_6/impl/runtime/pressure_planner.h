@@ -3,6 +3,8 @@
 #include "targets/qwen3_6/impl/runtime/program.h"
 
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <tuple>
 
@@ -612,6 +614,18 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::root_maximal_target(
             candidate_options[selected_candidate].victims[index].eviction_choice;
     }
     const std::uint32_t target_index = intern_target(selected_candidate, choice_scratch, true);
+    if (const char* diag = std::getenv("NINFER_REUSE_DIAG");
+        diag != nullptr && *diag != '\0' && *diag != '0') {
+        // 2026-09-23: the materialization search reported selected_maximal_fallback=true for a
+        // request whose pool had free room on every axis. This line settles which of two shapes
+        // the "maximal" target actually had: `victims=0 all_zero=1` means the maximal target IS
+        // the identity node (an empty victim domain makes all-zero choices equal both), while
+        // `victims=N all_zero=0` means a real evict-everything plan over N owners.
+        const bool all_zero = std::all_of(choice_scratch.begin(), choice_scratch.end(),
+                                          [](std::uint16_t choice) { return choice == 0; });
+        std::fprintf(stderr, "[search] root_maximal node=%u victims=%zu all_zero=%d\n",
+                     target_index, choice_scratch.size(), all_zero ? 1 : 0);
+    }
     qwen3_6::PressureTargetHandle handle;
     handle.session_    = this;
     handle.generation_ = generation;
@@ -1148,6 +1162,44 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
     } else {
         node.assessed_residual.reset();
     }
+    if (status != runtime::MaterializationPhysicalStatus::Feasible &&
+        [](const char* diag) {
+            return diag != nullptr && *diag != '\0' && *diag != '0';
+        }(std::getenv("NINFER_REUSE_DIAG"))) {
+        // Why this target cannot be taken. A target that applies no victim decisions (all-zero
+        // choices) is a plan that destroys nothing: when it fails here, the request is forced
+        // onto destructive pressure targets even though the log's occupancy line looks free, and
+        // the axes below say which capacity really did not fit (or that blocked_host did).
+        const auto used  = program->physical_occupancy();
+        const auto cap   = program->admission_capacity();
+        const auto& peak = projected->demand.physical_peak_additional;
+        if (node.assessed_residual.has_value()) {
+            const auto& residual = *node.assessed_residual;
+            std::fprintf(
+                stderr,
+                "[search] target infeasible: identity=%d root_maximal=%d choices=%zu "
+                "status=%d | device.state used=%u peak=%u cap=%u resid=%u"
+                " | device.lanes used=%u peak=%u cap=%u"
+                " | device.main_kv used=%u peak=%u cap=%u"
+                " | host.state used=%u peak=%u cap=%u resid=%u"
+                " | host.kv used=%zu peak=%zu cap=%zu resid=%zu blocked_host=%zu\n",
+                identity_target ? 1 : 0, node.root_maximal ? 1 : 0, choices.size(),
+                static_cast<int>(status), used.device.state_slots, peak.device.state_slots,
+                cap.device.state_slots, residual.device.state_slots, used.device.active_lanes,
+                peak.device.active_lanes, cap.device.active_lanes, used.device.main_kv_pages,
+                peak.device.main_kv_pages, cap.device.main_kv_pages, used.host.state_slots,
+                peak.host.state_slots, cap.host.state_slots, residual.device.state_slots,
+                used.host.kv_bytes, peak.host.kv_bytes, cap.host.kv_bytes, residual.host.kv_bytes,
+                projected->blocked_host_allocation_bytes);
+        } else {
+            std::fprintf(stderr,
+                         "[search] target infeasible: identity=%d root_maximal=%d choices=%zu "
+                         "status=%d (no residual: structural) blocked_host=%zu\n",
+                         identity_target ? 1 : 0, node.root_maximal ? 1 : 0, choices.size(),
+                         static_cast<int>(status), projected->blocked_host_allocation_bytes);
+        }
+    }
+
     const runtime::MaterializationMachineWork machine_work =
         identity_target ? candidate.identity_assessment.machine_work
                         : NINFER_QWEN36_RUNTIME_NS::materialization_machine_work(
