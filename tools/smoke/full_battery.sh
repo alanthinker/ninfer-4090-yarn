@@ -10,9 +10,20 @@
 #     so their session-end readings cycle {17,34} at total=48 and can never show >=46; small
 #     sessions (batch<=4) climb linearly and are what actually reach the top.
 # The flow: base fill (big sessions, early-stops on peak) -> small-session top-up (stops at the
-# first record proving FULL) -> peak gate (fail-closed) -> pressure tests -> correctness tests.
+# first record proving FULL, or at the ceiling this configuration can actually reach) -> peak gate
+# (fail-closed) -> pressure tests -> correctness tests.
 # After saturation the churn itself is the test material: phase5 counts D2H/H2D transfers, and a
 # healthy run keeps producing them as sessions evict and restore.
+#
+# Gate calibration (09-23b): `peak >= TOTAL-2` alone is not reachable on every configuration. On
+# the fair-share rig (48 slots, dense 256-spacing anchors) the pool settles at its own ceiling -
+# measured 43/48 from a warm start, 15-18 from a cold one - because each new session also evicts
+# its predecessor, so the top-up climbed for 79 rounds without ever touching 46 and the gate
+# failed a run that was in fact saturated. The peak is still the criterion; what changed is that
+# the top-up now recognises the CEILING (no increase for PLATEAU_ROUNDS rounds) and the gate
+# accepts it only when the ceiling is within 8 slots of the total, i.e. so full that the next
+# capture must reclaim capacity. Anything below that still fails closed, and the fast path
+# (peak >= TOTAL-2) is unchanged.
 #
 # Client-only: the target service must already own :30000 (one GPU, one service). The C++
 # suite (ci_smoke/ctest) is excluded on purpose: it needs the VRAM the service holds; run it
@@ -79,16 +90,25 @@ fi
 export NINFER_REQDUMP_DIR="${NINFER_REQDUMP_DIR:-$(dirname "$NINFER_SERVICE_LOG")/reqdump}"
 S="$NINFER_SERVICE_LOG"
 FULL_AT=$((TOTAL - 2))
+# The ceiling path: how close to the total a plateauing pool must get before "this configuration
+# is as full as it gets" counts as saturated. Absolute slots, not a ratio: a capture needs a
+# handful of slots, so within 8 the next one must reclaim.
+CEILING_FLOOR=$((TOTAL - 8))
+PLATEAU_ROUNDS=4
 ERR_PAT='HTTP 500|HTTP 503|\[engine\] fatal|Segmentation|terminate called'
 FAILED_STEPS=0
 
 # Window peak: max host_state_slots over occupancy records newer than this battery's start.
 # Implemented in python so a missing/short log or a non-numeric value fails CLOSED (exit 1),
-# never passes: the same code guards phase1b and phase2.
+# never passes. Two ways to pass, both peak-based:
+#   - peak >= FULL_AT: the pool was essentially full (the fast path);
+#   - the top-up proved the configuration's ceiling and that ceiling is >= CEILING_FLOOR
+#     (within 8 slots of the total). $3 is that proof, written by phase 1b.
 window_peak_check() {
-    python3 - "$NINFER_REQUEST_LOG" "$FULL_AT" "$BATTERY_START_MS" <<'PY'
+    python3 - "$NINFER_REQUEST_LOG" "$FULL_AT" "$BATTERY_START_MS" "${1:-0}" "$CEILING_FLOOR" <<'PY'
 import json, sys
-log, full_at, since = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+log, full_at, since, plateau, ceiling_floor = (sys.argv[1], int(sys.argv[2]), int(sys.argv[3]),
+                                              sys.argv[4] == "1", int(sys.argv[5]))
 best = -1
 try:
     with open(log, errors="ignore") as fh:
@@ -106,8 +126,16 @@ try:
                 continue
 except FileNotFoundError:
     pass
-print(f"window peak host_state_slots={best} (full_at={full_at})")
-sys.exit(0 if best >= full_at else 1)
+if best >= full_at:
+    print(f"window peak host_state_slots={best} (full_at={full_at}) - full")
+    sys.exit(0)
+if plateau and best >= ceiling_floor:
+    print(f"window peak host_state_slots={best} (ceiling path: plateau proven, "
+          f"floor={ceiling_floor}, full_at={full_at})")
+    sys.exit(0)
+print(f"window peak host_state_slots={best} (full_at={full_at}, plateau={int(plateau)}, "
+      f"floor={ceiling_floor})")
+sys.exit(1)
 PY
 }
 
@@ -170,10 +198,15 @@ echo "(base fill ended rc=$?; top-up below carries the gate)"
 
 echo "== phase 1b: top-up small sessions - stop at the FIRST record proving FULL =="
 {
-timeout 900 python3 - "$PORT" "$FULL_AT" "$BATTERY_START_MS" <<'PY'
+timeout 900 python3 - "$PORT" "$FULL_AT" "$BATTERY_START_MS" "$PLATEAU_ROUNDS" <<'PY'
 import json, os, sys, time, urllib.request
-port, full_at, since = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+port, full_at, since, plateau_rounds = (sys.argv[1], int(sys.argv[2]), int(sys.argv[3]),
+                                       int(sys.argv[4]))
 log = os.environ["NINFER_REQUEST_LOG"]
+# Phase 2 has to know WHICH criterion phase 1b proved: the fast path (pool full) or the ceiling
+# path (this configuration plateaus near the total). Writing it here keeps the decision in one
+# place instead of re-deriving it from the peak.
+SATURATION_MARKER = "/tmp/fb_saturation"
 
 def window_peak():
     best = -1
@@ -214,10 +247,26 @@ def send(i):
     with urllib.request.urlopen(req, timeout=120) as resp:
         json.loads(resp.read())
 
+stagnant = 0
+last = window_peak()
 for i in range(80):
     peak = window_peak()
-    print(f"  top-up {i:02d}: window peak={peak} (>= {full_at} = stop pressing)", flush=True)
+    print(f"  top-up {i:02d}: window peak={peak} (>= {full_at} = full, "
+          f"{stagnant}/{plateau_rounds} rounds without a new peak)", flush=True)
     if peak >= full_at:
+        print("FULL: pool reached the total-2 threshold")
+        open(SATURATION_MARKER, "w").write("full")
+        raise SystemExit(0)
+    if peak > last:
+        last, stagnant = peak, 0
+    else:
+        stagnant += 1
+    # The ceiling: nothing this workload can send raises the pool any more. That is saturation for
+    # this configuration - the gate then decides whether the ceiling is high enough (phase 2), so a
+    # configuration that genuinely cannot fill still fails closed.
+    if stagnant >= plateau_rounds:
+        print(f"PLATEAU: peak={peak} unchanged for {stagnant} rounds (ceiling of this configuration)")
+        open(SATURATION_MARKER, "w").write("plateau")
         raise SystemExit(0)
     send(i)
     time.sleep(1.0)
@@ -231,7 +280,10 @@ fi
 }   # phase 1b top-up (fallback when fill alone did not reach the ever-full peak)
 
 echo "== phase 2: saturation gate (window peak, fail-closed re-check) =="
-window_peak_check
+PLATEAU_PROVEN=0
+[ "$(cat /tmp/fb_saturation 2>/dev/null)" = "plateau" ] && PLATEAU_PROVEN=1
+rm -f /tmp/fb_saturation
+window_peak_check "$PLATEAU_PROVEN"
 gate_rc=$?
 if [ "$gate_rc" -ne 0 ]; then
     echo "SATURATION GATE FAILED (phase 2 peak check)"

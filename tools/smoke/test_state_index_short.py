@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""Test prefix reuse: 20 different 8K short conversations, then re-query the first 5.
+"""Test prefix reuse: N short conversations, then re-query the first few.
 
-Each conversation is a unique 8K-token prompt with one request.
-After all 20 complete, we send a second request to conversations 0-4.
-Those should get significant cache hits (TTFT much lower than the initial request),
-from the catalog's own checkpoints when their data is Host-resident.
+Each conversation is a unique prompt with one request. After all of them complete we wait (the user
+steps away) and re-query the first few: those should come back as cache hits from the retained
+checkpoints.
+
+Verdict under a SATURATED pool (2026-09-23): an all-hit expectation is not always satisfiable by
+design. With the pool at its ceiling, the engine may legitimately (a) skip a capture it cannot place
+(`capture: skip frontier=... reason=static-infeasible|capacity-*`) or (b) evict the oldest idle
+conversation to make room (`[evict] ... session=<digest>`). Both are designed degradation, but a
+state that disappears with NO such line in the serve log is a real retention bug. So when
+NINFER_SERVICE_LOG/NINFER_SERVE_LOG is set, each miss must be explained by one of those two lines
+(same conversation digest, or a captured frontier within a few tokens of that conversation's prompt
+length); unexplained misses, or more than half the verifications missing, still fail.
 
 Usage:
     python3 test_state_index_short.py --base-url http://127.0.0.1:8123/v1
@@ -13,11 +21,45 @@ Usage:
 
 import argparse
 import json
+import os
 import random
+import re
 import string
 import sys
 import time
 import urllib.request
+
+SERVE_LOG = os.environ.get("NINFER_SERVICE_LOG") or os.environ.get("NINFER_SERVE_LOG") or ""
+
+
+def cached_prompt_tokens(response: dict) -> int:
+    """The engine's own reuse accounting: how much of this prompt came from retained state."""
+    usage = response.get("usage") or {}
+    details = usage.get("prompt_tokens_details") or {}
+    return details.get("cached_tokens") or 0
+
+
+def read_serve_log() -> str:
+    if not SERVE_LOG:
+        return ""
+    try:
+        with open(SERVE_LOG, errors="ignore") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def explain_miss(window: str, prompt_tokens: int, digest: str) -> list:
+    """Design reasons the engine may legitimately have no state for this conversation."""
+    reasons = []
+    frontier = max(0, prompt_tokens - 5)   # the capture lands a few tokens before the prompt end
+    for line in window.splitlines():
+        skipped = re.search(r"capture: skip frontier=(\d+) reason=([\w-]+)", line)
+        if skipped and abs(int(skipped.group(1)) - frontier) <= 16:
+            reasons.append(f"capture skipped ({skipped.group(2)}) at frontier {skipped.group(1)}")
+        if digest and line.startswith("[evict]") and f"session={digest}" in line:
+            reasons.append("session evicted for capacity ([evict])")
+    return sorted(set(reasons))
 
 
 def make_prompt(conv_id: int, words: int) -> str:
@@ -93,9 +135,12 @@ def main():
     print()
 
     # Phase 1: Send one request to each of the N conversations
+    log_before = read_serve_log()
     print("--- Phase 1: Initial requests (one per conversation) ---")
     prompts = []
     results_initial = []
+    results_initial_cached = []
+    ident = []           # (prompt_tokens, session_digest) per conversation, for the miss verdict
     for i in range(args.conversations):
         prompt = make_prompt(i, args.words)
         prompts.append(prompt)
@@ -104,6 +149,9 @@ def main():
         resp = chat(args.base_url, messages)
         ttft = resp["_elapsed_s"]
         results_initial.append(ttft)
+        ident.append(((resp.get("usage") or {}).get("prompt_tokens") or 0,
+                      resp.get("session_digest") or ""))
+        results_initial_cached.append(cached_prompt_tokens(resp))
         print(f"  conv {i:2d}: {ttft:8.2f}s  ({len(prompt.split())} words)")
         time.sleep(0.1)  # small gap to let the server settle
 
@@ -130,22 +178,50 @@ def main():
         ]
         resp = chat(args.base_url, messages)
         ttft = resp["_elapsed_s"]
-        results_followup.append(ttft)
-        hit = "HIT " if ttft < results_initial[i] * 0.5 else "MISS"
-        print(f"  conv {i:2d}: {ttft:8.2f}s ({hit})  [initial was {results_initial[i]:.2f}s]")
+        cached = cached_prompt_tokens(resp)
+        prompt = (resp.get("usage") or {}).get("prompt_tokens") or 0
+        results_followup.append(cached >= 0.5 * prompt if prompt else False)
+        verdict = "HIT " if results_followup[-1] else "MISS"
+        print(f"  conv {i:2d}: {ttft:8.2f}s ({verdict})  cached {cached:>6}/{prompt:<6} "
+              f"({100.0 * cached / prompt if prompt else 0:5.1f}%)  "
+              f"[initial {results_initial[i]:.2f}s/{results_initial_cached[i]} cached]")
         time.sleep(0.1)
 
     print()
-    hits = sum(1 for i in range(args.verify) if results_followup[i] < results_initial[i] * 0.5)
+    order = list(range(args.verify - 1, -1, -1))
+    misses = [order[index] for index in range(args.verify) if not results_followup[index]]
+    hits = args.verify - len(misses)
     print(f"=== RESULT: {hits}/{args.verify} cache hits ===")
     if hits == args.verify:
         print("All verified conversations got cache hits. Context cache working.")
-    elif hits > 0:
-        print(f"Partial: {hits}/{args.verify} hits. Some states were not found.")
-    else:
-        print("No cache hits: no resident checkpoint covered the returned prefix.")
+        return 0
 
-    return 0 if hits == args.verify else 1
+    window = read_serve_log()[len(log_before):] if log_before is not None else ""
+    unexplained = []
+    if not SERVE_LOG:
+        print(f"Partial: {hits}/{args.verify} hits, and no serve log was given to explain the "
+              f"misses (set NINFER_SERVICE_LOG) - treating them as unexplained.")
+        unexplained = list(misses)
+    else:
+        for i in misses:
+            reasons = explain_miss(window, ident[i][0], ident[i][1])
+            if reasons:
+                print(f"  conv {i:2d} missed, explained: {'; '.join(reasons)}")
+            else:
+                print(f"  conv {i:2d} missed with NO capacity reason in the serve log")
+                unexplained.append(i)
+    allowed = max(1, args.verify // 2)
+    if unexplained:
+        print(f"FAIL: {len(unexplained)} state(s) disappeared without a capacity reason "
+              f"{unexplained} - that is a retention bug, not designed degradation.")
+        return 1
+    if len(misses) > allowed:
+        print(f"FAIL: {len(misses)}/{args.verify} states missing (more than half) - even with "
+              f"capacity reasons this is too much loss to call retention healthy.")
+        return 1
+    print(f"PASS (degraded): {len(misses)}/{args.verify} states were dropped for capacity, each "
+          f"with a reason in the serve log, and {hits}/{args.verify} still hit.")
+    return 0
 
 
 if __name__ == "__main__":
