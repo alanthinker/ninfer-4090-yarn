@@ -726,18 +726,40 @@ PrivateLoss_o(S_b,S_t)=w_o\max_{p\in o}
 不同 owners 的 `PrivateLoss` 相加。这样不会把同一 continuation 的嵌套 checkpoints 全部当作未来请求，
 也不会让一个仍然可用的末端 checkpoint 掩盖较早 TurnClosure 或 long anchor 的损失。权重为：
 
-| Private retention | prior weight | 谁先被牺牲 | 何时产生 |
-|---|---:|---|---|
-| SharedStable | 0 | 同命中数、且无 credit 时最前 | 共享前缀 owner：`w=0` 不是"最廉价"，而是**不计私有损失**（`context_portfolio_value.h` 只在 `w != 0` 时累加该 owner 的损失），其价值走 `PublicValue` + explicit credit |
-| Disposable | 1 | 次之 | 客户端显式声明可丢弃（Responses `store_response=false`） |
-| RecentPrivate | 4 | 再次 | 默认：普通私有 continuation（请求未带 session_key） |
-| LiveSession | 16 | 最后 | 带 session_key 的活会话（Responses `store_response=true`） |
+| Private retention | prior weight | 何时产生 |
+|---|---:|---|
+| SharedStable | 0 | 共享前缀 owner：`w=0` 不是"最廉价"，而是**不计私有损失**（`context_portfolio_value.h` 只在 `w != 0` 时累加该 owner 的损失），其价值走 `PublicValue` + explicit credit |
+| Disposable | 1 | 客户端显式声明可丢弃（Responses `store_response=false`） |
+| RecentPrivate | 4 | 默认：普通私有 continuation（请求未带 session_key） |
+| LiveSession | 16 | 带 session_key 的活会话（Responses `store_response=true`） |
 
-`prior weight` 只是损失倍率，不是优先级本身：牺牲顺序是
-`{selected_hit_count, explicit_shared_credit, private_retention_weight, last_hit_epoch, owner}`
-的字典序（命中次数第 1、credit 第 2、权重第 3），权重只在命中次数与 credit 都相同时才起作用。
 本部署的日常流量走 `openai_chat_completions`，它不设置 session_key（只有 `/v1/responses` 设置），
-因此实际权重恒为 `RecentPrivate=4`，区分度来自命中次数与最近命中 epoch。
+因此实际权重恒为 `RecentPrivate=4`；`prior weight` 是**价值在险的倍率**，不是排序优先级。
+
+### 8.3.1 受害者排序：联合打分，不是字典序
+
+**曾经**是字典序 `{selected_hit_count, explicit_shared_credit, private_retention_weight,
+last_hit_epoch, owner}`（`materialization_planner.h`）。而 `guided_closure_target`
+（`pressure_planner.h`）会沿这个顺序贪心取**第一个能腾出容量的 owner**，所以第一位（复用次数）一旦不同，
+权重、credit、recency 全部不会被读到——等价于只看一个字段。后果：一条 62k token、7 个 long anchor 的
+真实会话，因为"建好之后还没被别人重读过"（`selected_hit_count=0`）排在所有被测试脚本反复命中的浅会话
+前面，2026-09-23 17:01 被整条驱逐，而池子里 ~200 张测试镜像继续留存 74 分钟。
+
+现在按**一个联合分**排序（`materialization_victim_score`，`materialization_planner.h`）：
+
+\[
+VictimCost(o)=\Big(w_o\max_p (Rebuild(p)-Recovery_b(p)) + PublicValue_o + Credit_o\Big)\times Evidence_o
+\]
+
+- 价值在险与 `PrivateLoss` 同源，单位是 ns：`rebuild_ns - baseline_recovery_ns` 是该 checkpoint 一旦丢失
+  就要重算的 prefill 工作量；`PublicValue_o` 是已观测需求为该 owner 的 checkpoint 计出的 saving。
+- `Evidence_o`（Q16）= `1/8 + (7/8)·d/(d+8)`，其中 `d = 生命周期复用次数 × 2^(−age/τ)`、`τ = 30 min`，
+  并设上限（4096 次）以约束定点运算。下限 1/8 保证"还没被重读"只是便宜而不是免费；越久没人碰，乘子越小。
+- 复用次数是**owner 级寿命计数**（`CatalogEntry::lifetime_selected_hits`），不是 checkpoint 级：
+  一条自回归增长的会话每轮都会替换自己的 endpoint，`migrate_observations` 会连同旧 ref 一起丢掉它的
+  计数，所以"这条对话被复用了 50 次"只能记在 owner 上。命中计数随发布跨 cell 继承（`commit_materialization`）。
+- 因此：① 深会话即使 hits=0 也按 30 s 量级的价值在险参与排序；② 50 轮对话的 hits≈50，乘子接近饱和；
+  ③ 刚被读过的会话 `age≈0`，乘子最大。保留 `owner.value` 作为最终 tie-break 保证确定性。
 
 Shared owner 没有固定 retention multiplier。`ExplicitBoundary` 或 `RequestedAutomatic` 在 publication 时带来
 一个 owner-scoped credit；它在第一次后续 exact match 时消费，或在 32 次成功 materialization 后到期。

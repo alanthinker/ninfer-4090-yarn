@@ -35,7 +35,9 @@ using ninfer::runtime::ContextTransferObservation;
 using ninfer::runtime::ContextTransferRequirement;
 using ninfer::runtime::FinishDisposition;
 using ninfer::runtime::LaneId;
+using ninfer::runtime::MaterializationCheckpointPolicy;
 using ninfer::runtime::MaterializationMachineWork;
+using ninfer::runtime::MaterializationOwnerPolicy;
 using ninfer::runtime::PrefillWork;
 using ninfer::runtime::PlanningCandidateId;
 using ninfer::runtime::PlanningOwnerId;
@@ -44,6 +46,7 @@ using ninfer::runtime::ProgramResourceRevision;
 using ninfer::runtime::Readiness;
 using ninfer::runtime::RequestPlanSummary;
 using ninfer::runtime::RetentionClass;
+using ninfer::runtime::reuse_evidence_q16;
 using ninfer::runtime::VictimDisposition;
 
 int failures = 0;
@@ -3612,6 +3615,67 @@ void test_fair_share_releases_oldest_bucket_only_when_shared_pool_exhausted() {
             "MRU bucket lost its endpoint to a neighbor's pressure");
 }
 
+// Victim ordering must be one combined score, not a lexicographic field chain. The chain's first
+// field was the reuse count, so an owner that had not been re-read yet sorted as the cheapest
+// victim however deep it was: on 2026-09-23 that evicted a 62k-token conversation which had been
+// idle since its last turn while shallow probe sessions a test loop had just hammered stayed
+// resident. The score multiplies the value at risk by reuse evidence, so depth, retention class,
+// and recency all contribute to the same number.
+void test_victim_score_ranks_by_value_not_by_one_field() {
+    const auto now = std::chrono::steady_clock::now();
+    constexpr std::uint64_t kSecond = 1000000000ULL;
+    const std::array owners{
+        // Deep conversation that nobody has re-read yet: 60 s of rebuild work at RecentPrivate.
+        MaterializationOwnerPolicy{
+            .owner                    = PlanningOwnerId{.value = 0},
+            .retention_class          = RetentionClass::RecentPrivate,
+            .private_retention_weight = 4,
+            .reuse_evidence_q16       = reuse_evidence_q16(0, {}, now),
+        },
+        // Shallow probe session a test loop has just hammered twenty times: 4 s of rebuild work.
+        MaterializationOwnerPolicy{
+            .owner                    = PlanningOwnerId{.value = 1},
+            .retention_class          = RetentionClass::RecentPrivate,
+            .selected_hit_count       = 20,
+            .private_retention_weight = 4,
+            .reuse_evidence_q16       = reuse_evidence_q16(20, now, now),
+        },
+        // Same value at risk as the deep session, but a LiveSession retention class.
+        MaterializationOwnerPolicy{
+            .owner                    = PlanningOwnerId{.value = 2},
+            .retention_class          = RetentionClass::LiveSession,
+            .private_retention_weight = 16,
+            .reuse_evidence_q16       = reuse_evidence_q16(0, {}, now),
+        },
+    };
+    const std::array checkpoints{
+        MaterializationCheckpointPolicy{
+            .owner = PlanningOwnerId{.value = 0}, .rebuild_ns = 60U * kSecond},
+        MaterializationCheckpointPolicy{
+            .owner = PlanningOwnerId{.value = 1}, .rebuild_ns = 4U * kSecond},
+        MaterializationCheckpointPolicy{
+            .owner = PlanningOwnerId{.value = 2}, .rebuild_ns = 60U * kSecond},
+    };
+    const auto score = [&](std::uint32_t owner) {
+        return materialization_victim_score(owners, checkpoints, PlanningOwnerId{.value = owner});
+    };
+
+    require(score(0) > score(1),
+            "a deep session that has not been re-read yet must not be the cheapest victim");
+    require(score(0) == 4U * 60U * kSecond / 8U,
+            "an unread owner keeps only the reuse-evidence floor of its value at risk");
+    require(score(2) == score(0) * 4U,
+            "the retention weight must scale the value at risk instead of only breaking ties");
+
+    require(reuse_evidence_q16(0, {}, now) == (1U << 16U) / 8U,
+            "a never-reused owner must keep a nonzero evidence floor");
+    require(reuse_evidence_q16(20, now - std::chrono::minutes(180), now) <
+                reuse_evidence_q16(20, now, now),
+            "reuse evidence must decay with the age of the last reuse");
+    require(reuse_evidence_q16(20, now, now) > reuse_evidence_q16(5, now, now),
+            "more reuses must mean more protection");
+}
+
 // Fair-share protection must hold on the capture path as well: a shared-capture offer whose
 // only feasible target would consume a protected session's checkpoint set falls back to the
 // private baseline / skip instead of evicting the bucket.
@@ -3764,6 +3828,8 @@ int main() {
              test_fair_share_releases_oldest_bucket_only_when_shared_pool_exhausted);
     run_test("fair-share capture protection",
              test_fair_share_capture_pressure_cannot_touch_protected_sessions);
+    run_test("victim score combines value and reuse evidence",
+             test_victim_score_ranks_by_value_not_by_one_field);
     if (failures != 0) { return 1; }
     std::cout << "ok\n";
     return 0;

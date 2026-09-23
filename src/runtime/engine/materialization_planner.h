@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -35,7 +36,92 @@ struct MaterializationOwnerPolicy {
     std::uint64_t last_hit_epoch           = 0;
     std::uint32_t private_retention_weight = 0;
     bool explicit_shared_credit            = false;
+    // Reuse evidence for this owner in Q16: how often this conversation has been reused as a base,
+    // decayed by how long ago that last happened, with a floor so a session that has not been
+    // re-read yet is cheap rather than worthless. Owner-scoped on purpose: a growing conversation
+    // replaces its own checkpoint every turn, so a per-checkpoint count cannot represent "this
+    // conversation has been reused fifty times".
+    std::uint64_t reuse_evidence_q16 = 1U << 16U;
 };
+
+// Reuse evidence in Q16: a floored, saturating hyperbola over the age-decayed lifetime reuse
+// count. It answers "how likely is this owner to be read again" and multiplies the value at risk
+// in the victim score. The floor keeps a session that has not been re-read yet cheap but never
+// free - without it "never reused" sorts as the cheapest owner, so a freshly built deep
+// conversation outranks every session a test loop has been hammering, no matter how much prefill
+// it holds. The decay is wall-clock, so evidence fades for a session nobody touches any more.
+[[nodiscard]] inline std::uint64_t reuse_evidence_q16(
+    std::uint64_t hits, std::chrono::steady_clock::time_point last,
+    std::chrono::steady_clock::time_point now) noexcept {
+    constexpr std::uint64_t kOne    = 1U << 16U;
+    constexpr std::uint64_t kFloor  = kOne / 8U; // 0.125 for a never-reused owner
+    constexpr std::uint64_t kHalf   = 8U * kOne; // 8 decayed reuses reach half saturation
+    constexpr std::uint64_t kHitCap = 4096U;     // bounds the fixed-point arithmetic
+    constexpr double kTauSeconds    = 1800.0;    // 30 minutes
+    std::uint64_t decayed_q16       = 0;
+    if (hits != 0 && last.time_since_epoch().count() > 0) {
+        const double age   = std::max(0.0, std::chrono::duration<double>(now - last).count());
+        const double decay = std::exp2(-age / kTauSeconds);
+        const std::uint64_t decay_q16 =
+            static_cast<std::uint64_t>(decay * static_cast<double>(kOne));
+        const std::uint64_t capped = std::min(hits, kHitCap);
+        decayed_q16                = ((capped << 16U) * decay_q16) >> 16U;
+    }
+    const std::uint64_t ratio_q16 = (decayed_q16 << 16U) / (decayed_q16 + kHalf);
+    return kFloor + (((kOne - kFloor) * ratio_q16) >> 16U);
+}
+
+// Victim ordering is one combined score in the planner's own currency, not a lexicographic field
+// chain. A field-first chain lets a single dimension decide alone - when the reuse count differs,
+// the retention weight and the recency are never read at all - which is how a deep endpoint that
+// had not been re-read yet lost to shallow probe sessions a test loop had just hammered, even
+// though the economic model already priced that endpoint at tens of seconds of prefill. The score
+// multiplies the value at risk (the largest rebuild saving the owner would lose, scaled by its
+// retention weight, plus the demand-observed public value) by the reuse evidence, so depth,
+// retention class, demand, recency, and reuse history contribute to one comparable number.
+[[nodiscard]] inline std::uint64_t materialization_victim_score(
+    std::span<const MaterializationOwnerPolicy> owners,
+    std::span<const MaterializationCheckpointPolicy> checkpoints, PlanningOwnerId owner) noexcept {
+    const MaterializationOwnerPolicy* policy = nullptr;
+    for (const MaterializationOwnerPolicy& candidate : owners) {
+        if (candidate.owner == owner) {
+            policy = &candidate;
+            break;
+        }
+    }
+    if (policy == nullptr) { return 0; }
+
+    std::uint64_t private_saving = 0;
+    std::array<std::uint64_t, 32> demand_best{};
+    for (const MaterializationCheckpointPolicy& checkpoint : checkpoints) {
+        if (checkpoint.owner != owner) { continue; }
+        const std::uint64_t saving = checkpoint.rebuild_ns > checkpoint.baseline_recovery_ns
+                                         ? checkpoint.rebuild_ns - checkpoint.baseline_recovery_ns
+                                         : 0;
+        private_saving = std::max(private_saving, saving);
+        for (std::uint32_t bit = 0; bit < demand_best.size(); ++bit) {
+            if ((checkpoint.demand_mask & (1U << bit)) == 0) { continue; }
+            demand_best[bit] = std::max(demand_best[bit], saving);
+        }
+    }
+
+    const auto saturating_add = [](std::uint64_t& value, std::uint64_t add) {
+        value = value > std::numeric_limits<std::uint64_t>::max() - add
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : value + add;
+    };
+    const auto saturating_mul = [](std::uint64_t value, std::uint64_t factor) {
+        if (value == 0 || factor == 0) { return std::uint64_t{0}; }
+        return value > std::numeric_limits<std::uint64_t>::max() / factor
+                   ? std::numeric_limits<std::uint64_t>::max()
+                   : value * factor;
+    };
+
+    std::uint64_t value_ns = saturating_mul(private_saving, policy->private_retention_weight);
+    for (const std::uint64_t demand_value : demand_best) { saturating_add(value_ns, demand_value); }
+    if (policy->explicit_shared_credit) { saturating_add(value_ns, private_saving); }
+    return saturating_mul(value_ns, policy->reuse_evidence_q16) >> 16U;
+}
 
 template <class Package>
 class MaterializationPlanner {
@@ -581,31 +667,33 @@ public:
             });
         };
 
-        std::vector<const MaterializationOwnerPolicy*> preferred_owners;
-        preferred_owners.reserve(pressure.owner_policy.size());
+        // The Program walks this list and sacrifices the first owner that can pay for the
+        // deficit, so the order is the victim decision. Rank by the combined score, cheapest
+        // first, and keep the owner id only as a deterministic tie-break.
+        struct PreferredOwner {
+            const MaterializationOwnerPolicy* policy = nullptr;
+            std::uint64_t victim_cost                = 0;
+        };
+        std::vector<PreferredOwner> preferred;
+        preferred.reserve(pressure.owner_policy.size());
         for (const MaterializationOwnerPolicy& policy : pressure.owner_policy) {
-            preferred_owners.push_back(&policy);
+            preferred.push_back(PreferredOwner{
+                .policy = &policy,
+                .victim_cost =
+                    materialization_victim_score(pressure.owner_policy, pressure.checkpoint_policy,
+                                                 policy.owner),
+            });
         }
-        std::sort(preferred_owners.begin(), preferred_owners.end(),
-                  [](const auto* left, const auto* right) {
-                      return std::tuple{
-                                 left->selected_hit_count,
-                                 left->explicit_shared_credit ? 1U : 0U,
-                                 left->private_retention_weight,
-                                 left->last_hit_epoch,
-                                 left->owner.value,
-                             } < std::tuple{
-                                     right->selected_hit_count,
-                                     right->explicit_shared_credit ? 1U : 0U,
-                                     right->private_retention_weight,
-                                     right->last_hit_epoch,
-                                     right->owner.value,
-                                 };
+        std::sort(preferred.begin(), preferred.end(),
+                  [](const PreferredOwner& left, const PreferredOwner& right) {
+                      return left.victim_cost != right.victim_cost
+                                 ? left.victim_cost < right.victim_cost
+                                 : left.policy->owner.value < right.policy->owner.value;
                   });
         std::vector<PlanningOwnerId> preferred_owner_ids;
-        preferred_owner_ids.reserve(preferred_owners.size());
-        for (const MaterializationOwnerPolicy* policy : preferred_owners) {
-            preferred_owner_ids.push_back(policy->owner);
+        preferred_owner_ids.reserve(preferred.size());
+        for (const PreferredOwner& entry : preferred) {
+            preferred_owner_ids.push_back(entry.policy->owner);
         }
 
         std::vector<IdentityRoot> closure_order;

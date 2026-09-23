@@ -1533,6 +1533,14 @@ private:
         // Monotonic last-activity marker (publication, reuse hit, restore) used to rank the
         // fair-share retention buckets most-recently-used first.
         std::uint64_t activity_epoch = 0;
+        // Lifetime reuse evidence for this conversation. It cannot live on a checkpoint
+        // observation: a growing session replaces its own endpoint every turn and
+        // migrate_observations drops the superseded ref together with its counters, so a
+        // conversation that only ever reuses itself would report zero reuse forever and rank as
+        // the cheapest victim however deep it is. Counted per owner, never reset by checkpoint
+        // turnover, and carried along when a turn publishes into another cell.
+        std::uint64_t lifetime_selected_hits = 0;
+        std::chrono::steady_clock::time_point last_selected_at{};
     };
 
     struct SharedCatalogEntry {
@@ -1545,6 +1553,9 @@ private:
         std::uint32_t transaction_pins    = 0;
         bool explicit_credit              = false;
         std::uint64_t credit_expiry_epoch = 0;
+        // Reuse recency for the same evidence term the private owners use; a shared prefix keeps a
+        // stable checkpoint, so its count stays on `observation` and only the age is tracked here.
+        std::chrono::steady_clock::time_point last_selected_at{};
     };
 
     enum class SessionIndexState : std::uint8_t {
@@ -1821,6 +1832,12 @@ private:
         return 0;
     }
 
+    // Reuse evidence in Q16: a floored, saturating hyperbola over the age-decayed lifetime reuse
+    // count (see materialization_planner.h). It answers "how likely is this owner to be read
+    // again" and multiplies the value at risk in the victim score; the floor keeps a session that
+    // has not been re-read yet cheap but never free, because "never reused" used to sort as the
+    // cheapest owner no matter how much prefill the session held.
+
     void require_lane(LaneId lane, LogicalLaneState expected) const {
         if (lane.value >= lane_count_ || lanes_[lane.value] != expected ||
             ((expected == LogicalLaneState::Active ||
@@ -1951,6 +1968,8 @@ private:
         entry.observations.clear();
         entry.retention = RetentionClass::RecentPrivate;
         entry.activity_epoch = 0;
+        entry.lifetime_selected_hits = 0;
+        entry.last_selected_at       = {};
         advance_revision(entry.revision);
     }
 
@@ -2105,24 +2124,16 @@ private:
     // sacrifice is rare (tens per hour) and is otherwise only visible as a bare `[evict] slot=N`,
     // which cannot say WHICH session died or why it lost.
     //
-    // A victim is chosen by the planner's preference order, but the Program may only sacrifice an
-    // owner it can physically target and release, so the executed eviction is not always the global
-    // minimum of that order. These lines print the key tuple the order uses for the sacrificed owner
-    // (copied verbatim from the planner's preference sort, so ranks are the planner's own order), the
-    // cheapest owners that stayed, and the count of strictly cheaper owners, which separates
-    // "nothing cheaper was sacrifiable" (`cheaper=0`, the order executed as designed) from "a cheaper
-    // owner was left resident" (`retained_cheaper>0`, either untargetable or priced above the victim
-    // by the fold). The owner set is this request's eligible pressure owners only: an active or
-    // pinned owner is absent from it rather than ranked low, so a rank is never a pool-wide rank.
+    // These lines print the combined victim score of the sacrificed owner, its rank inside this
+    // request's eligible owner set, the cheapest owners that stayed, and their count. `cheaper=0`
+    // means the order executed as designed (the score really was the minimum); `retained_cheaper>0`
+    // means cheaper owners stayed resident, either because the Program could not target them
+    // physically or because they were fair-share protected. The owner set is this request's
+    // eligible pressure owners only: an active, pinned, or fair-share-protected owner is absent
+    // from it rather than ranked low, so a rank here is never a pool-wide rank.
     [[nodiscard]] static bool evict_pick_logging_enabled() noexcept {
         const char* value = std::getenv("NINFER_EVICT_PICK");
         return value == nullptr || *value != '\0' && *value != '0';
-    }
-
-    [[nodiscard]] static auto owner_preference_key(const MaterializationOwnerPolicy& policy) noexcept {
-        return std::tuple{policy.selected_hit_count, policy.explicit_shared_credit ? 1U : 0U,
-                          policy.private_retention_weight, policy.last_hit_epoch,
-                          policy.owner.value};
     }
 
     [[nodiscard]] static const char* retention_class_label(RetentionClass retention) noexcept {
@@ -2141,6 +2152,7 @@ private:
 
     void log_evict_pick(PlanningOwnerId victim, std::uint32_t slot, bool shared,
                         std::span<const MaterializationOwnerPolicy> policies,
+                        std::span<const MaterializationCheckpointPolicy> checkpoints,
                         std::span<const PressureOwnerOutcome> outcomes) const {
         if (!evict_pick_logging_enabled()) { return; }
         const MaterializationOwnerPolicy* picked = nullptr;
@@ -2152,42 +2164,61 @@ private:
         }
         if (picked == nullptr) { return; }
 
-        const auto victim_key = owner_preference_key(*picked);
-        std::size_t cheaper   = 0;
-        std::vector<const MaterializationOwnerPolicy*> retained_cheaper;
+        struct PricedOwner {
+            const MaterializationOwnerPolicy* policy = nullptr;
+            std::uint64_t score                      = 0;
+        };
+        const auto score_of = [&](PlanningOwnerId owner) {
+            return materialization_victim_score(policies, checkpoints, owner);
+        };
+        const std::uint64_t victim_score = score_of(victim);
+        std::size_t cheaper               = 0;
+        std::vector<PricedOwner> retained_cheaper;
         for (const MaterializationOwnerPolicy& policy : policies) {
-            if (policy.owner == victim || !(owner_preference_key(policy) < victim_key)) { continue; }
+            if (policy.owner == victim) { continue; }
+            const std::uint64_t score = score_of(policy.owner);
+            if (score >= victim_score) { continue; }
             ++cheaper;
             const bool also_evicted = std::any_of(
                 outcomes.begin(), outcomes.end(), [&](const PressureOwnerOutcome& outcome) {
                     return outcome.owner == policy.owner &&
                            outcome.disposition == VictimDisposition::Evicted;
                 });
-            if (!also_evicted) { retained_cheaper.push_back(&policy); }
+            if (!also_evicted) {
+                retained_cheaper.push_back(PricedOwner{.policy = &policy, .score = score});
+            }
         }
         std::sort(retained_cheaper.begin(), retained_cheaper.end(),
-                  [](const auto* left, const auto* right) {
-                      return owner_preference_key(*left) < owner_preference_key(*right);
+                  [](const PricedOwner& left, const PricedOwner& right) {
+                      return left.score != right.score
+                                 ? left.score < right.score
+                                 : left.policy->owner.value < right.policy->owner.value;
                   });
         std::fprintf(stderr,
                      "[evict-pick] owner=%u slot=%u kind=%s class=%s hits=%llu credit=%u "
-                     "weight=%u last_hit=%llu rank=%zu/%zu cheaper=%zu retained_cheaper=%zu\n",
+                     "weight=%u last_hit=%llu evidence=%.3f score=%.3fs rank=%zu/%zu cheaper=%zu "
+                     "retained_cheaper=%zu\n",
                      victim.value, slot, shared ? "shared" : "private",
                      retention_class_label(picked->retention_class),
                      static_cast<unsigned long long>(picked->selected_hit_count),
                      picked->explicit_shared_credit ? 1U : 0U, picked->private_retention_weight,
-                     static_cast<unsigned long long>(picked->last_hit_epoch), cheaper + 1U,
-                     policies.size(), cheaper, retained_cheaper.size());
+                     static_cast<unsigned long long>(picked->last_hit_epoch),
+                     static_cast<double>(picked->reuse_evidence_q16) / 65536.0,
+                     static_cast<double>(victim_score) / 1.0e9, cheaper + 1U, policies.size(),
+                     cheaper, retained_cheaper.size());
         const std::size_t shown = std::min<std::size_t>(retained_cheaper.size(), 3U);
         for (std::size_t index = 0; index < shown; ++index) {
-            const MaterializationOwnerPolicy& policy = *retained_cheaper[index];
+            const PricedOwner& entry = retained_cheaper[index];
             std::fprintf(stderr,
                          "[evict-pick]   kept-cheaper owner=%u class=%s hits=%llu credit=%u "
-                         "weight=%u last_hit=%llu\n",
-                         policy.owner.value, retention_class_label(policy.retention_class),
-                         static_cast<unsigned long long>(policy.selected_hit_count),
-                         policy.explicit_shared_credit ? 1U : 0U, policy.private_retention_weight,
-                         static_cast<unsigned long long>(policy.last_hit_epoch));
+                         "weight=%u evidence=%.3f score=%.3fs\n",
+                         entry.policy->owner.value,
+                         retention_class_label(entry.policy->retention_class),
+                         static_cast<unsigned long long>(entry.policy->selected_hit_count),
+                         entry.policy->explicit_shared_credit ? 1U : 0U,
+                         entry.policy->private_retention_weight,
+                         static_cast<double>(entry.policy->reuse_evidence_q16) / 65536.0,
+                         static_cast<double>(entry.score) / 1.0e9);
         }
         std::fflush(stderr);
     }
@@ -2516,6 +2547,11 @@ private:
             owner_policies.reserve(catalog_count_ + shared_catalog_count_);
             checkpoint_policies.reserve(prefix_index_.size());
 
+            // One clock read for the whole policy generation: every owner's reuse evidence is aged
+            // against the same instant, so the ordering is a function of the pool state alone.
+            const std::chrono::steady_clock::time_point observation_now =
+                std::chrono::steady_clock::now();
+
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
                 const CatalogEntry& entry = catalog_[slot];
                 if (entry.state != CatalogState::Catalogued || !entry.handle ||
@@ -2542,14 +2578,12 @@ private:
                             .generation = entry.revision,
                         },
                 });
-                std::uint64_t selected_hits  = 0;
                 const auto append_checkpoint = [&](const auto& checkpoint) {
                     const RetentionObservation* observation =
                         find_observation(entry.observations, checkpoint.ref);
                     if (observation == nullptr) {
                         throw std::logic_error("catalogued checkpoint has no policy observation");
                     }
-                    selected_hits = std::max(selected_hits, observation->selected_hit_count);
                     const std::optional<std::uint64_t> baseline =
                         try_price_checkpoint_recovery(program, *entry.handle, checkpoint.ref);
                     if (!baseline) { return; }
@@ -2573,9 +2607,11 @@ private:
                 owner_policies.push_back(MaterializationOwnerPolicy{
                     .owner                    = owner,
                     .retention_class          = entry.retention,
-                    .selected_hit_count       = selected_hits,
+                    .selected_hit_count       = entry.lifetime_selected_hits,
                     .last_hit_epoch           = newest_hit_epoch(entry),
                     .private_retention_weight = private_retention_weight(entry.retention),
+                    .reuse_evidence_q16       = reuse_evidence_q16(
+                        entry.lifetime_selected_hits, entry.last_selected_at, observation_now),
                 });
             }
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
@@ -2608,6 +2644,9 @@ private:
                     .last_hit_epoch           = entry.observation.last_hit_epoch,
                     .private_retention_weight = 0,
                     .explicit_shared_credit   = entry.explicit_credit,
+                    .reuse_evidence_q16       = reuse_evidence_q16(
+                        entry.observation.selected_hit_count, entry.last_selected_at,
+                        observation_now),
                 });
                 const std::optional<std::uint64_t> baseline = try_price_checkpoint_recovery(
                     program, *entry.handle, entry.summary.checkpoint.ref);
@@ -2817,7 +2856,7 @@ private:
             }
             if (outcome.disposition == VictimDisposition::Evicted) {
                 log_evict_pick(outcome.owner, record->capability.slot, shared, owner_policies,
-                               planned->owner_outcomes);
+                               checkpoint_policies, planned->owner_outcomes);
             }
         }
         return choice;
@@ -3009,8 +3048,17 @@ private:
             if (selected) {
                 saturating_increment(selected->selected_hit_count);
                 selected->last_hit_epoch = ++retention_epoch_;
-                if (!record.selected_observation->shared) {
-                    touch_activity(record.selected_observation->slot);
+                const std::uint32_t slot  = record.selected_observation->slot;
+                if (record.selected_observation->shared) {
+                    if (slot < shared_catalog_count_) {
+                        shared_catalog_[slot].last_selected_at = std::chrono::steady_clock::now();
+                    }
+                } else if (slot < catalog_count_) {
+                    touch_activity(slot);
+                    // The conversation, not the checkpoint, was reused: this is the evidence the
+                    // victim score reads, and it survives every checkpoint the turn replaces.
+                    saturating_increment(catalog_[slot].lifetime_selected_hits);
+                    catalog_[slot].last_selected_at = std::chrono::steady_clock::now();
                 }
             }
         }
@@ -3584,6 +3632,16 @@ private:
         publication.id            = next_continuation_id_++;
         publication.session       = record->session;
         publication.retention     = record->retention;
+        // Reuse evidence follows the conversation, not the catalog cell. `observe_selected_hit`
+        // has already counted this turn's reuse on the source cell, which is the destination itself
+        // when the turn consumes its own state; when it publishes elsewhere (a retained sibling
+        // source, or a cell freed by an eviction) the count moves with it instead of restarting.
+        if (record->private_source &&
+            record->private_source->slot != record->publication_slot) {
+            const CatalogEntry& source = catalog_[record->private_source->slot];
+            publication.lifetime_selected_hits = source.lifetime_selected_hits;
+            publication.last_selected_at       = source.last_selected_at;
+        }
         touch_activity(record->publication_slot);
         advance_revision(publication.revision);
         if (publication.id == 0) { publication.id = next_continuation_id_++; }
