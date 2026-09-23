@@ -488,9 +488,9 @@ public:
             return false;
         }
         std::fprintf(stderr,
-                     "state-store: anchor host evict handle=%u host_slot=%d pinned=%u "
+                     "state-store: anchor host evict handle=%u host_slot=%u refs=%u "
                      "device_only_after=%d\n",
-                     handle.index_, *object.host_slot, object.checkpoint_references,
+                     handle.index_, object.host_slot->index, object.checkpoint_references,
                      object.device_slot ? 1 : 0);
         object.host_slot.reset();
         return true;

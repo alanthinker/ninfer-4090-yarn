@@ -10634,13 +10634,15 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     // Permanent diagnostic: this fires only when a plan's placement assumptions
                     // were broken after sealing, so the numbers are what identify the later fix.
                     std::fprintf(stderr,
-                                 "[capture] retained Fork source=%u is HostOnly but its reserved "
-                                 "destination role=%d was not published (reserved_count=%u "
-                                 "state_slots=%u restore=%d fork_dest=%d split=%d protected=%d)\n",
-                                 state_store->debug_index(selected),
+                                 "[capture] retained Fork source=%llu residency=%d is HostOnly "
+                                 "but its reserved destination role=%d was not published "
+                                 "(reserved_count=%llu state_slots=%llu restore=%d fork_dest=%d "
+                                 "split=%d protected=%d)\n",
+                                 static_cast<unsigned long long>(state_store->debug_index(selected)),
                                  static_cast<int>(state_store->residency(selected)),
                                  static_cast<int>(state_store->role(current)),
-                                 transaction.reserved_state_count, state_slots,
+                                 static_cast<unsigned long long>(transaction.reserved_state_count),
+                                 static_cast<unsigned long long>(state_slots),
                                  transaction.state_restore.has_value() ? 1 : 0,
                                  transaction.state_fork_destination.has_value() ? 1 : 0,
                                  transaction.split_state_identity ? 1 : 0,
