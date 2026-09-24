@@ -249,7 +249,7 @@ allocate_failed = text.count("allocate FAILED")
 print(f"  deletions refused: retire ok=0 -> {retire_failed} | demote failed -> {demote_failed} "
       f"| allocate FAILED -> {allocate_failed}")
 print("  fair-share released:", text.count("fair-share released"),
-      "| maximal fallback:", text.count("maximal fallback"),
+      "| capped fallback:", text.count("capped fallback"),
       "| offered-but-root:", text.count("but planned from root"),
       "| 500/503/fatal:", text.count("HTTP 500"), text.count("HTTP 503"),
       text.count("[engine] fatal"))

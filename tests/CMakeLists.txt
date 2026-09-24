@@ -416,3 +416,9 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
 
+
+# In-process joint-settle pressure driver (reproduced-bug tooling): tiny context-cache pools
+# saturate in seconds and the reason tags on every structural exit name the failing site.
+# Run manually with an artifact path; registered as a test only once it reproduces the bug.
+add_executable(ninfer_pressure_joint_settle_test test_pressure_joint_settle.cpp)
+target_link_libraries(ninfer_pressure_joint_settle_test PRIVATE ninfer_engine)
