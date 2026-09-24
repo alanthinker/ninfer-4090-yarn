@@ -810,7 +810,7 @@ struct MaterializationDiagnostics {
     MaterializationStopReason stop_reason    = MaterializationStopReason::NoPressure;
     bool budget_exhausted                    = false;
     std::uint32_t selected_degradation_units = 0;
-    bool selected_maximal_fallback           = false;
+    bool selected_capped_fallback           = false;
     // Capacity misses spent after admission: the sealed plan asked for state or KV the pools could
     // not produce, so the materialization was rolled back and the request re-planned (typically from
     // root). A request-log line showing a root prefill with a nonzero count here is a degradation,
@@ -1069,7 +1069,7 @@ struct RuntimeStats {
     std::uint64_t pressure_checkpoints_dropped         = 0;
     std::uint64_t pressure_searches                    = 0;
     std::uint64_t pressure_search_budget_exhaustions   = 0;
-    std::uint64_t pressure_maximal_fallback_selections = 0;
+    std::uint64_t pressure_capped_fallback_selections = 0;
     std::uint32_t shared_active_references             = 0;
     std::uint64_t historical_fork_hits                 = 0;
     double actual_context_transfer_seconds             = 0.0;

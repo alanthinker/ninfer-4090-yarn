@@ -344,7 +344,7 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"stop_reason", ninfer::materialization_stop_reason_name(diagnostics.stop_reason)},
         {"budget_exhausted", diagnostics.budget_exhausted},
         {"selected_degradation_units", diagnostics.selected_degradation_units},
-        {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
+        {"selected_capped_fallback", diagnostics.selected_capped_fallback},
         {"best_reuse_prompt_tokens", diagnostics.best_reuse_prompt_tokens},
         // Search shape: see MaterializationDiagnostics. One expansion that fans out to the whole
         // target budget is otherwise indistinguishable from a genuinely exhausted space.
@@ -790,9 +790,9 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
              {"search_budget_exhaustions",
               monotonic_delta(previous.pressure_search_budget_exhaustions,
                               current.pressure_search_budget_exhaustions)},
-             {"maximal_fallback_selections",
-              monotonic_delta(previous.pressure_maximal_fallback_selections,
-                              current.pressure_maximal_fallback_selections)},
+             {"capped_fallback_selections",
+              monotonic_delta(previous.pressure_capped_fallback_selections,
+                              current.pressure_capped_fallback_selections)},
              {"historical_fork_hits",
               monotonic_delta(previous.historical_fork_hits, current.historical_fork_hits)}}},
         {"occupancy", Json{{"device_state_slots", current.device_state_occupied_slots},

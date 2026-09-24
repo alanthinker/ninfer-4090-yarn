@@ -378,7 +378,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
                              std::tie(right.frontier, right.input_order);
                   });
         if (const char* reuse_diag = std::getenv("NINFER_REUSE_DIAG");
-            reuse_diag != nullptr && *reuse_diag != '\0' && *reuse_diag != '0') {
+            reuse_diag == nullptr || *reuse_diag != '0') {
             // Paired with the `capture:` decision lines: this is what the plan OFFERED, so a deep
             // boundary that never reaches the pool is distinguishable from one that was offered as
             // a turn closure only.

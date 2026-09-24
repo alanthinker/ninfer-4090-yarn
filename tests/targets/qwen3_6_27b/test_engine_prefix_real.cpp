@@ -700,7 +700,7 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
                   << after_reuse.shared_active_references
                   << " targets=" << reused.materialization.targets_evaluated
                   << " degradation=" << reused.materialization.selected_degradation_units
-                  << " maximal=" << reused.materialization.selected_maximal_fallback << " stop="
+                  << " capped=" << reused.materialization.selected_capped_fallback << " stop="
                   << ninfer::materialization_stop_reason_name(reused.materialization.stop_reason)
                   << '\n';
         return 1;
@@ -1553,7 +1553,7 @@ int exercise_rewrite_branch(const char* artifact) {
                   << " prompt=" << branch.prompt.prompt_tokens
                   << " target_count=" << branch.materialization.targets_evaluated
                   << " degradation=" << branch.materialization.selected_degradation_units
-                  << " maximal=" << branch.materialization.selected_maximal_fallback << " stop="
+                  << " capped=" << branch.materialization.selected_capped_fallback << " stop="
                   << ninfer::materialization_stop_reason_name(branch.materialization.stop_reason)
                   << " now_ns=" << branch.materialization.predicted_now_ns
                   << " future_ns=" << branch.materialization.predicted_future_loss_ns << '\n';
@@ -1880,7 +1880,7 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact) {
         pressure_spill_pages != 4 || pressure_drops != 1 || pressure_degraded != 1 ||
         pressure_evicted != 0 ||
         after_pressure.state_d2h_count != before_pressure.state_d2h_count ||
-        short_b.materialization.selected_maximal_fallback) {
+        short_b.materialization.selected_capped_fallback) {
         std::cerr << "pressure-resume did not select endpoint-drop plus four-page spill: main="
                   << pressure_main_pages << " spill=" << pressure_spill_pages
                   << " drops=" << pressure_drops << " degraded=" << pressure_degraded
@@ -1888,7 +1888,7 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact) {
                   << " state=" << (after_pressure.state_d2h_count - before_pressure.state_d2h_count)
                   << " device_pages=" << before_pressure.device_main_kv_occupied_pages << '/'
                   << after_pressure.device_main_kv_occupied_pages
-                  << " maximal=" << short_b.materialization.selected_maximal_fallback
+                  << " capped=" << short_b.materialization.selected_capped_fallback
                   << " budget=" << short_b.materialization.budget_exhausted << '\n';
         return 1;
     }
@@ -1976,14 +1976,14 @@ int exercise_materialization_source_pressure_protection(const char* artifact) {
     if (branched.generated_token_ids.size() != 1 || !private_partial_source ||
         branched.reused_prompt_tokens == 0 ||
         branched.reused_prompt_tokens >= branched.prompt.prompt_tokens || demoted_pages == 0 ||
-        degraded == 0 || branched.materialization.selected_maximal_fallback) {
+        degraded == 0 || branched.materialization.selected_capped_fallback) {
         std::cerr << "source-pressure branch did not preserve its source under guided Host KV "
                      "pressure: path="
                   << static_cast<int>(branched.prefix_reuse_path)
                   << " reused=" << branched.reused_prompt_tokens
                   << " prompt=" << branched.prompt.prompt_tokens << " demoted=" << demoted_pages
                   << " degraded=" << degraded
-                  << " maximal=" << branched.materialization.selected_maximal_fallback << " stop="
+                  << " capped=" << branched.materialization.selected_capped_fallback << " stop="
                   << ninfer::materialization_stop_reason_name(branched.materialization.stop_reason)
                   << '\n';
         return 1;

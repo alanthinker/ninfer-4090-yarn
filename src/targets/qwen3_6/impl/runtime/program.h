@@ -1451,7 +1451,7 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
         std::uint32_t victim_choice_count  = 0;
         std::optional<detail::PhysicalResources> assessed_residual;
         std::uint32_t stable_ordinal = 0;
-        bool root_maximal            = false;
+        bool root_capped            = false;
     };
 
     struct CandidateVictimOptions {
@@ -1492,7 +1492,9 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
     [[nodiscard]] qwen3_6::PressureTargetHandle
     identity_target(runtime::PlanningCandidateId candidate) const;
     [[nodiscard]] qwen3_6::PressureTargetHandle
-    root_maximal_target(runtime::PlanningCandidateId root_candidate);
+    root_capped_target(runtime::PlanningCandidateId root_candidate,
+                        std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+                        std::uint32_t max_evictions);
     [[nodiscard]] std::optional<qwen3_6::PressureTargetHandle>
     guided_closure_target(runtime::PlanningCandidateId candidate,
                           std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
@@ -1536,7 +1538,7 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
                 std::span<const std::uint16_t> choices) const noexcept;
     [[nodiscard]] std::uint32_t intern_target(std::uint32_t candidate_index,
                                               std::span<const std::uint16_t> choices,
-                                              bool root_maximal = false);
+                                              bool root_capped = false);
     void index_target(std::uint32_t target_index);
     void populate_options(std::uint32_t candidate_index);
     [[nodiscard]] std::vector<PressureDecision>

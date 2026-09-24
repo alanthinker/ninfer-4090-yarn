@@ -1007,7 +1007,7 @@ preserved for consumer validation, and a stable text-fallback reason. Fallback r
 
 `request_done.materialization` is the immutable decision committed for that request. It reports predicted immediate,
 future-loss and total nanoseconds; evaluated targets and projection work; planning/search nanoseconds; stop reason;
-the budget-exhausted flag; selected degradation units; and whether the selected target was the maximal root fallback.
+the budget-exhausted flag; selected degradation units; and whether the selected target was the capped root fallback (batches of8 evictions).
 Stop reasons are `no_pressure`, `queue_exhausted`, `target_budget`, `expansion_capacity`, `time_budget`, and
 `value_of_next_expansion`. Search is bounded and heuristic; these diagnostics do not claim model or global optimality.
 Aborted planning attempts are not published.
@@ -1060,7 +1060,7 @@ same interval. The
 `running`, `prefilling`, `decode_ready`, `waiting`, `materializing`, `capture_pending`, and
 `terminal_pending` fields are the Engine scheduler snapshot at the end of the interval. The JSONL
 `context_cache` object reports selection, capture, transfer, COW, pressure spill, private/shared
-owner degradation and eviction, checkpoint drop, pressure search, budget exhaustion, maximal fallback, and historical-fork
+owner degradation and eviction, checkpoint drop, pressure search, budget exhaustion, capped fallback, and historical-fork
 counters as interval deltas; `occupancy` and `last_selection` are end-of-interval gauges. Materialization predictions are
 request-owned and appear only on the corresponding `request_done` event.
 `pressure.searches` counts plans accepted into Program resource transactions, including a transaction that later ends in

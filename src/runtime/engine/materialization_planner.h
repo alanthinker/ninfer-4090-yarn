@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <span>
@@ -433,40 +435,141 @@ public:
             return static_cast<std::uint32_t>(found - candidates.begin());
         };
 
+        // The Program walks this list and sacrifices the first owner that can pay for the
+        // deficit, so the order is the victim decision. Rank by the combined score, cheapest
+        // first, and keep the owner id only as a deterministic tie-break.
+        struct PreferredOwner {
+            const MaterializationOwnerPolicy* policy = nullptr;
+            std::uint64_t victim_cost                = 0;
+        };
+        std::vector<PreferredOwner> preferred;
+        preferred.reserve(pressure.owner_policy.size());
+        for (const MaterializationOwnerPolicy& policy : pressure.owner_policy) {
+            preferred.push_back(PreferredOwner{
+                .policy = &policy,
+                .victim_cost =
+                    materialization_victim_score(pressure.owner_policy, pressure.checkpoint_policy,
+                                                 policy.owner),
+            });
+        }
+        // Idle owners first: an owner active within the recency horizon waits behind every owner
+        // that has been idle longer, and only then does value decide. Protection as an ordering
+        // keeps the last victim reachable - the ladder must always be able to free something -
+        // while still making a just-read conversation the last thing a newer one may retire
+        // (2026-09-24 fork_hit). Within a class, value first; ties break on least recently reused
+        // (never-hit owners carry epoch 0), then owner id for determinism.
+        std::sort(preferred.begin(), preferred.end(),
+                  [](const PreferredOwner& left, const PreferredOwner& right) {
+                      if (left.policy->within_recency_horizon != right.policy->within_recency_horizon) {
+                          return !left.policy->within_recency_horizon;
+                      }
+                      if (left.victim_cost != right.victim_cost) {
+                          return left.victim_cost < right.victim_cost;
+                      }
+                      if (left.policy->last_hit_epoch != right.policy->last_hit_epoch) {
+                          return left.policy->last_hit_epoch < right.policy->last_hit_epoch;
+                      }
+                      return left.policy->owner.value < right.policy->owner.value;
+                  });
+        std::vector<PlanningOwnerId> preferred_owner_ids;
+        preferred_owner_ids.reserve(preferred.size());
+        for (const PreferredOwner& entry : preferred) {
+            preferred_owner_ids.push_back(entry.policy->owner);
+        }
+
         Incumbent incumbent;
         std::uint32_t targets_evaluated = static_cast<std::uint32_t>(candidates.size());
+        const auto fallback_diag = [] {
+            const char* diag = std::getenv("NINFER_REUSE_DIAG");
+            return diag == nullptr || *diag != '0';
+        };
         if (identity_best) {
             incumbent        = std::move(*identity_best);
             incumbent.target = session.identity_target(candidates[incumbent.candidate_index].id);
         } else {
-            PressureTargetHandle root_maximal =
-                session.root_maximal_target(candidates[root_candidate_index].id);
-            AssessedPressureTarget assessed            = session.assess(root_maximal);
-            const PressureTargetAssessment& assessment = assessed.assessment();
-            if (assessment.candidate != candidates[root_candidate_index].id) {
-                throw std::logic_error("maximal pressure target changed admission candidate");
+            // Progressive destructive fallback (policy2026-09-24): batches of
+            // kEvictionBatchSize cheapest owners until the plan fits. There is deliberately NO
+            // evict-everything target. Eviction stays proportional to the deficit (one batch in
+            // the common case), a non-destructive guided closure still wins whenever it beats
+            // these costs, and only an exhausted victim domain - everything else protected or
+            // active - ends in a capacity error instead of a cache wipe. Every entry into this
+            // path logs its reason: enter, per-batch outcome, the selected batch, and the
+            // exhausted case (the operator-visible "fallback taken" signal).
+            constexpr std::uint32_t kEvictionBatchSize = 8U;
+            if (fallback_diag()) {
+                std::fprintf(stderr,
+                             "[fallback] enter: no feasible identity plan; building capped "
+                             "eviction batches (batch=%u); identity axis detail is on the "
+                             "[search] identity=1 line above\n",
+                             kEvictionBatchSize);
+                std::fflush(stderr);
             }
-            ++targets_evaluated;
-            planning_saturating_add(projection_work, assessment.projection_work);
-            std::optional<LogicalGoal> goal;
-            if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
-                goal = logical_goal(assessment.candidate, assessment.source_mode,
-                                    assessment.owner_outcomes);
+            std::optional<Incumbent> seeded;
+            for (std::uint32_t batch_cap = kEvictionBatchSize;; batch_cap += kEvictionBatchSize) {
+                PressureTargetHandle batch_target = session.root_capped_target(
+                    candidates[root_candidate_index].id, preferred_owner_ids, batch_cap);
+                AssessedPressureTarget assessed            = session.assess(batch_target);
+                const PressureTargetAssessment& assessment = assessed.assessment();
+                if (assessment.candidate != candidates[root_candidate_index].id) {
+                    throw std::logic_error("capped pressure target changed admission candidate");
+                }
+                ++targets_evaluated;
+                planning_saturating_add(projection_work, assessment.projection_work);
+                mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
+                const std::size_t evicted = static_cast<std::size_t>(
+                    std::count_if(assessment.owner_outcomes.begin(), assessment.owner_outcomes.end(),
+                                  [](const PressureOwnerOutcome& outcome) {
+                                      return outcome.disposition == VictimDisposition::Evicted;
+                                  }));
+                const bool physical =
+                    assessment.physical_status == MaterializationPhysicalStatus::Feasible;
+                std::optional<LogicalGoal> goal;
+                if (physical) {
+                    goal = logical_goal(assessment.candidate, assessment.source_mode,
+                                        assessment.owner_outcomes);
+                }
+                if (goal) {
+                    const FoldedCost cost = fold_assessment(
+                        candidates[root_candidate_index], assessment, pressure.owner_policy,
+                        pressure.checkpoint_policy, machine_cost);
+                    if (fallback_diag()) {
+                        std::fprintf(stderr,
+                                     "[fallback] batch seeded: cap=%u evicted=%zu (identity had "
+                                     "no plan)\n",
+                                     batch_cap, evicted);
+                        std::fflush(stderr);
+                    }
+                    seeded = make_incumbent(batch_target, root_candidate_index, assessment,
+                                            std::move(assessed), cost, *goal);
+                    break;
+                }
+                if (evicted < batch_cap) {
+                    // Fewer evictable owners than requested: the victim domain is exhausted and
+                    // still cannot cover the residual. This is the only fallback failure path;
+                    // memoize the negative conclusion (sound while the pool is unchanged) and
+                    // let the request fail on capacity - never fall back to evicting everything.
+                    if (fallback_diag()) {
+                        std::fprintf(stderr,
+                                     "[fallback] EXHAUSTED: victim domain evicted=%zu < cap=%u "
+                                     "and still no feasible goal (physical=%d); request fails "
+                                     "on capacity, no wider eviction exists\n",
+                                     evicted, batch_cap, physical ? 1 : 0);
+                        std::fflush(stderr);
+                    }
+                    if (negative_sound) { *negative_sound = true; }
+                    return std::nullopt;
+                }
+                if (fallback_diag()) {
+                    std::fprintf(stderr,
+                                 "[fallback] batch infeasible: cap=%u evicted=%zu physical=%d "
+                                 "goal=%d\n",
+                                 batch_cap, evicted, physical ? 1 : 0, goal.has_value() ? 1 : 0);
+                    std::fflush(stderr);
+                }
             }
-            if (!goal) {
-                // The root-maximal target is infeasible or cannot publish: neither any owner,
-                // checkpoint, nor capture can free the capacity, so the complete victim domain
-                // has no plan. Sound to memoize while the pool state is unchanged.
-                if (negative_sound) { *negative_sound = true; }
-                return std::nullopt;
-            }
-            const FoldedCost cost =
-                fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
-                                pressure.checkpoint_policy, machine_cost);
-            incumbent = make_incumbent(root_maximal, root_candidate_index, assessment,
-                                       std::move(assessed), cost, *goal);
-            mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
+            incumbent = std::move(*seeded);
         }
+
 
         const Clock::time_point search_started = Clock::now();
         // The budget bounds admission-time planning work. The relative term binds ordinary
@@ -499,7 +602,7 @@ public:
         // the cases that actually need it) and taper it toward a small constant for tiny
         // prompts, whose prefill a 15 s search could never be worth avoiding. Larger prompts
         // keep their window through the incumbent-cost/20 term, which grows with prompt size.
-        // The root-maximal fallback and any feasible reuse incumbent are seeded before the
+        // The root-capped fallback and any feasible reuse incumbent are seeded before the
         // budgeted search, so a smaller floor only trims eviction refinement - it can never turn
         // a reuse hit into a miss or a runnable request into a blocked one.
         constexpr std::uint64_t kPlanningFloorMinNs      = 250'000'000ULL;    // 0.25 s
@@ -644,7 +747,7 @@ public:
             last_assessment_feasible =
                 assessment.physical_status == MaterializationPhysicalStatus::Feasible;
             last_assessment_goal = goal.has_value();
-            if (goal && !assessment.root_maximal) {
+            if (goal && !assessment.root_capped) {
                 candidate_seed_complete_[expected_candidate] = true;
             }
             if (goal && cost.less(incumbent.cost)) {
@@ -718,47 +821,6 @@ public:
             });
         };
 
-        // The Program walks this list and sacrifices the first owner that can pay for the
-        // deficit, so the order is the victim decision. Rank by the combined score, cheapest
-        // first, and keep the owner id only as a deterministic tie-break.
-        struct PreferredOwner {
-            const MaterializationOwnerPolicy* policy = nullptr;
-            std::uint64_t victim_cost                = 0;
-        };
-        std::vector<PreferredOwner> preferred;
-        preferred.reserve(pressure.owner_policy.size());
-        for (const MaterializationOwnerPolicy& policy : pressure.owner_policy) {
-            preferred.push_back(PreferredOwner{
-                .policy = &policy,
-                .victim_cost =
-                    materialization_victim_score(pressure.owner_policy, pressure.checkpoint_policy,
-                                                 policy.owner),
-            });
-        }
-        // Idle owners first: an owner active within the recency horizon waits behind every owner
-        // that has been idle longer, and only then does value decide. Protection as an ordering
-        // keeps the last victim reachable - the ladder must always be able to free something -
-        // while still making a just-read conversation the last thing a newer one may retire
-        // (2026-09-24 fork_hit). Within a class, value first; ties break on least recently reused
-        // (never-hit owners carry epoch 0), then owner id for determinism.
-        std::sort(preferred.begin(), preferred.end(),
-                  [](const PreferredOwner& left, const PreferredOwner& right) {
-                      if (left.policy->within_recency_horizon != right.policy->within_recency_horizon) {
-                          return !left.policy->within_recency_horizon;
-                      }
-                      if (left.victim_cost != right.victim_cost) {
-                          return left.victim_cost < right.victim_cost;
-                      }
-                      if (left.policy->last_hit_epoch != right.policy->last_hit_epoch) {
-                          return left.policy->last_hit_epoch < right.policy->last_hit_epoch;
-                      }
-                      return left.policy->owner.value < right.policy->owner.value;
-                  });
-        std::vector<PlanningOwnerId> preferred_owner_ids;
-        preferred_owner_ids.reserve(preferred.size());
-        for (const PreferredOwner& entry : preferred) {
-            preferred_owner_ids.push_back(entry.policy->owner);
-        }
 
         std::vector<IdentityRoot> closure_order;
         closure_order.reserve(roots.size());
@@ -818,7 +880,7 @@ public:
                 // Physically closed, but logical_goal refused: a root candidate needs a Vacant
                 // catalog cell and with the catalog full only an Evicted outcome hands one over
                 // (resource_manager logical_goal). Without this retry the only goal-passing plan
-                // left is root_maximal - evict-everything - which wiped62 owners at
+                // left is root_capped - evict-everything - which wiped62 owners at
                 // 2026-09-24 18:59 while host_state sat at184/320. Rebuild the closure with
                 // exactly one forced eviction of the cheapest preferred owner: one cell, one
                 // owner, instead of clearing the catalog.
@@ -889,7 +951,7 @@ public:
         // class and must keep the guarantee that every preserving alternative is explored.
         constexpr std::uint64_t kSeedProbeSteps = 64U;
         bool seed_acceptable                    = false;
-        if (!incumbent.root_maximal && incumbent.assessed) {
+        if (!incumbent.root_capped && incumbent.assessed) {
             const bool seed_has_no_eviction = std::none_of(
                 incumbent.owner_outcomes.begin(), incumbent.owner_outcomes.end(),
                 [](const PressureOwnerOutcome& outcome) {
@@ -1023,10 +1085,23 @@ public:
                          FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
         if (!sealed) { throw std::logic_error("selected pressure target could not be sealed"); }
 
+        if (incumbent.root_capped) {
+            const char* diag = std::getenv("NINFER_REUSE_DIAG");
+            if (diag == nullptr || *diag != '0') {
+                std::fprintf(stderr,
+                             "[fallback] SELECTED destructive fallback: evicted=%u targets=%u "
+                             "closures=%u/%u stop=%d (the fallback the operator never wants; "
+                             "enter/batch reason detail is above on the [fallback] lines)\n",
+                             incumbent.cost.owner_evictions, targets_evaluated,
+                             guided_closures_ok, guided_closures_failed,
+                             static_cast<int>(stop_reason));
+                std::fflush(stderr);
+            }
+        }
         MaterializationDiagnostics diagnostics = make_diagnostics(
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
             search_budget_ns, stop_reason, budget_exhausted, incumbent.degradation_units,
-            incumbent.root_maximal);
+            incumbent.root_capped);
         diagnostics.candidates               = static_cast<std::uint32_t>(candidates.size());
         diagnostics.optional_targets         = optional_targets;
         diagnostics.expansions               = expansions;
@@ -1123,7 +1198,7 @@ private:
         std::vector<PressureOwnerOutcome> owner_outcomes;
         std::vector<PressureCheckpointOutcome> checkpoint_outcomes;
         std::uint32_t degradation_units = 0;
-        bool root_maximal               = false;
+        bool root_capped               = false;
         // True when the guided closure produced this incumbent. The closure applies victims in the
         // planner's own value order, so its release set is the greedy minimal one.
         bool guided_closure = false;
@@ -1500,7 +1575,7 @@ private:
                     return outcomes;
                 }(),
             .degradation_units = assessment.degradation_units,
-            .root_maximal      = assessment.root_maximal,
+            .root_capped      = assessment.root_capped,
         };
     }
 
@@ -1657,9 +1732,9 @@ private:
     [[nodiscard]] static MaterializationDiagnostics
     complete_diagnostics(const FoldedCost& cost, std::uint32_t targets_evaluated,
                          std::uint64_t projection_work, Clock::time_point planning_started,
-                         MaterializationStopReason reason, bool maximal_fallback) noexcept {
+                         MaterializationStopReason reason, bool capped_fallback) noexcept {
         return make_diagnostics(cost, targets_evaluated, projection_work, planning_started, 0,
-                                0, reason, false, 0, maximal_fallback);
+                                0, reason, false, 0, capped_fallback);
     }
 
     [[nodiscard]] static MaterializationDiagnostics
@@ -1667,7 +1742,7 @@ private:
                      std::uint64_t projection_work, Clock::time_point planning_started,
                      std::uint64_t search_elapsed_ns, std::uint64_t search_budget_ns,
                      MaterializationStopReason reason, bool budget_exhausted,
-                     std::uint32_t degradation_units, bool maximal_fallback) noexcept {
+                     std::uint32_t degradation_units, bool capped_fallback) noexcept {
         return MaterializationDiagnostics{
             .predicted_now_ns           = cost.now_ns,
             .predicted_future_loss_ns   = cost.future_loss_ns,
@@ -1680,7 +1755,7 @@ private:
             .stop_reason                = reason,
             .budget_exhausted           = budget_exhausted,
             .selected_degradation_units = degradation_units,
-            .selected_maximal_fallback  = maximal_fallback,
+            .selected_capped_fallback  = capped_fallback,
         };
     }
 

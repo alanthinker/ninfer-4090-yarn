@@ -1330,8 +1330,8 @@ public:
         out.pressure_checkpoints_dropped       = context_stats_.pressure_checkpoints_dropped;
         out.pressure_searches                  = context_stats_.pressure_searches;
         out.pressure_search_budget_exhaustions = context_stats_.pressure_search_budget_exhaustions;
-        out.pressure_maximal_fallback_selections =
-            context_stats_.pressure_maximal_fallback_selections;
+        out.pressure_capped_fallback_selections =
+            context_stats_.pressure_capped_fallback_selections;
         out.historical_fork_hits            = context_stats_.historical_fork_hits;
         out.actual_context_transfer_seconds = context_stats_.actual_context_transfer_seconds;
 
@@ -2222,7 +2222,7 @@ private:
     // it evaluates the same predicates the candidate loop evaluates and mutates no planning state.
     [[nodiscard]] static bool reuse_diagnostics_enabled() noexcept {
         const char* value = std::getenv("NINFER_REUSE_DIAG");
-        return value != nullptr && *value != '\0' && *value != '0';
+        return value == nullptr || *value != '0';
     }
 
     template <class BasePlan>
@@ -3303,8 +3303,8 @@ private:
         if (diagnostics.budget_exhausted) {
             saturating_increment(context_stats_.pressure_search_budget_exhaustions);
         }
-        if (diagnostics.selected_maximal_fallback) {
-            saturating_increment(context_stats_.pressure_maximal_fallback_selections);
+        if (diagnostics.selected_capped_fallback) {
+            saturating_increment(context_stats_.pressure_capped_fallback_selections);
         }
     }
 

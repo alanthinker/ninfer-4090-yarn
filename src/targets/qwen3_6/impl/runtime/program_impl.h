@@ -3037,6 +3037,17 @@ std::optional<detail::PressureTargetProjection> ProgramImplCore::evaluate_pressu
         throw std::invalid_argument("combined pressure selection is not row aligned");
     }
     begin_pressure_page_scratch();
+    // Reason tag for every structural rejection below (on by default; NINFER_REUSE_DIAG=0
+    // silences): a silently dead guided
+    // closure leaves root_capped as the only assessed plan (2026-09-24: fifty-owner wipe
+    // handing one request its KV gap). One line names the exact exit.
+    const auto reject_reason = [](const char* site) {
+        if (const char* diag = std::getenv("NINFER_REUSE_DIAG");
+            diag == nullptr || *diag != '0') {
+            std::fprintf(stderr, "[pressure] target rejected site=%s\n", site);
+            std::fflush(stderr);
+        }
+    };
 
     std::vector<std::uint8_t>& private_owner_state = pressure_private_owner_scratch_;
     std::vector<std::uint8_t>& shared_owner_state  = pressure_shared_owner_scratch_;
@@ -3085,8 +3096,8 @@ std::optional<detail::PressureTargetProjection> ProgramImplCore::evaluate_pressu
                 pressure_states.begin(), pressure_states.end(),
                 [&](const PressureSelectedState& selected) { return selected.state == *state; });
             if (!state_store->valid(*state) ||
-                (protected_state && !pressure_state_drops_host(change)) ||
-                existing != pressure_states.end()) {
+                (protected_state && !pressure_state_drops_host(change))) {
+                reject_reason("state-invalid-or-protected");
                 return false;
             }
             const StateReplicaResidency residency = state_store->residency(*state);
@@ -3102,6 +3113,20 @@ std::optional<detail::PressureTargetProjection> ProgramImplCore::evaluate_pressu
             } else {
                 selected.device = false;
                 selected.host   = true;
+            }
+            if (existing != pressure_states.end()) {
+                // Two selected owners can reference the SAME StateImage (one checkpoint bound
+                // to several sequences). An identical requested residency is a single joint
+                // settle - the settlement loop below counts every reference - so the duplicate
+                // is accepted; only genuinely conflicting residencies reject. Unconditionally
+                // rejecting here made any guided closure whose victims shared state
+                // structurally dead, which left root_capped the only assessed plan
+                // (2026-09-24:51 owners wiped while host_state sat at293/320 free).
+                if (existing->device != selected.device || existing->host != selected.host) {
+                    reject_reason("state-residency-conflict");
+                    return false;
+                }
+                continue;
             }
             pressure_states.push_back(selected);
         }
@@ -3131,21 +3156,38 @@ std::optional<detail::PressureTargetProjection> ProgramImplCore::evaluate_pressu
                 PressurePageScratchSlot& slot = pressure_page_scratch(*pages, page);
                 const bool protected_page     = protected_materialization_page(
                     protection, *addresses, action.begin_page + offset, page, backend);
-                if ((protected_page &&
-                     action.kind != qwen3_6::detail::PressureKVDecisionKind::DropHostDuplicate) ||
-                    slot.pressure_targeted) {
+                if (protected_page &&
+                    action.kind != qwen3_6::detail::PressureKVDecisionKind::DropHostDuplicate) {
+                    reject_reason("kv-protected-page");
                     return false;
+                }
+                bool next_device = pages->device_resident(page);
+                bool next_host   = pages->host_resident(page);
+                if (action.kind == qwen3_6::detail::PressureKVDecisionKind::DropHostDuplicate) {
+                    next_host = false;
+                } else {
+                    next_device = false;
+                    next_host   = true;
+                }
+                if (slot.projected) {
+                    // Two selected owners can address the SAME shared page. The same
+                    // requested residency (DemoteToHost and DropDeviceDuplicate both end
+                    // device-off/host-on) is one joint settle - settlement counts every
+                    // reference - so the duplicate is accepted; only conflicting residencies
+                    // reject. Unconditionally rejecting here made a guided closure whose
+                    // victims overlapped structurally dead, which left root_capped the only
+                    // assessed plan (2026-09-24:51 owners wiped for one request while
+                    // host_state sat at293/320 free).
+                    if (slot.device != next_device || slot.host != next_host) {
+                        reject_reason("kv-residency-conflict");
+                        return false;
+                    }
+                    continue;
                 }
                 slot.pressure_targeted = true;
                 slot.projected         = true;
-                slot.device            = pages->device_resident(page);
-                slot.host              = pages->host_resident(page);
-                if (action.kind == qwen3_6::detail::PressureKVDecisionKind::DropHostDuplicate) {
-                    slot.host = false;
-                } else {
-                    slot.device = false;
-                    slot.host   = true;
-                }
+                slot.device            = next_device;
+                slot.host              = next_host;
             }
             return true;
         };
@@ -3155,12 +3197,14 @@ std::optional<detail::PressureTargetProjection> ProgramImplCore::evaluate_pressu
             kv != nullptr ? kv->backend : std::nullopt;
         for (const qwen3_6::detail::PressureKVDecision& action : option.main_kv_changes) {
             if (!append_pages(text_kv_addresses.get(), text_kv_pages.get(), text, action)) {
+                reject_reason("kv-main-actions");
                 return false;
             }
         }
         for (const qwen3_6::detail::PressureKVDecision& action : option.backend_kv_changes) {
             if (!append_pages(backend_kv_addresses.get(), backend_kv_pages.get(), backend,
                               action)) {
+                reject_reason("kv-backend-actions");
                 return false;
             }
         }
@@ -3176,19 +3220,25 @@ std::optional<detail::PressureTargetProjection> ProgramImplCore::evaluate_pressu
         const qwen3_6::detail::PressureDecision& option = pressure_options[position];
         if (owner == nullptr || ContractAccess::owner(*owner) != this ||
             !valid_continuation(*owner) || option.shared_owner) {
+            reject_reason("private-owner-shape");
             return std::nullopt;
         }
         const std::uint32_t index = ContractAccess::index(*owner);
         if ((private_owner_state[index] & kOwnerSelected) != 0 ||
             (protection != nullptr && protection->private_source_index == index)) {
+            reject_reason("private-owner-duplicate-or-source");
             return std::nullopt;
         }
         private_owner_state[index] |= kOwnerSelected;
         if (option.evicts_continuation) {
-            if (option.effect.added != detail::PhysicalResources{}) { return std::nullopt; }
+            if (option.effect.added != detail::PhysicalResources{}) {
+                reject_reason("private-evict-option-added");
+                return std::nullopt;
+            }
             private_owner_state[index] |= kOwnerEvicted;
         } else {
             if (!append_pressure_targets(option, &continuation_states[index], nullptr)) {
+                reject_reason("private-pressure-targets");
                 return std::nullopt;
             }
             dropped_private[index] = option.dropped_checkpoints;
@@ -3788,9 +3838,19 @@ bool ProgramImplCore::compose_pressure_candidate(
         details.blocked_host_allocation_bytes != 0) {
         throw std::invalid_argument("materialization pressure composition is invalid");
     }
+    // Reason tags for this function's structural exits (on by default; NINFER_REUSE_DIAG=0
+    // silences): a silently dead compose
+    // kills the guided closure and leaves root_capped as the only assessed plan.
+    const auto reject_reason = [](const char* site) {
+        if (const char* diag = std::getenv("NINFER_REUSE_DIAG");
+            diag == nullptr || *diag != '0') {
+            std::fprintf(stderr, "[pressure] target rejected site=%s\n", site);
+            std::fflush(stderr);
+        }
+    };
     const std::optional<MaterializationSourceProtection> protection =
         materialization_source_protection(details);
-    if (!protection) { return false; }
+    if (!protection) { reject_reason("compose-no-protection"); return false; }
     details.pressure_options.reserve(pressure_options.size());
     details.pressure_owner_ids.reserve(pressure_owner_ids.size());
     details.pressure_indices.reserve(pressure_options.size());
@@ -3866,7 +3926,7 @@ bool ProgramImplCore::compose_pressure_candidate(
                       planning_owner) != details.pressure_owner_ids.end()) {
             throw std::invalid_argument("materialization pressure owner is invalid");
         }
-        if (!valid_continuation(*owner)) { return false; }
+        if (!valid_continuation(*owner)) { reject_reason("compose-owner-invalid"); return false; }
         const std::uint32_t index      = ContractAccess::index(*owner);
         const std::uint64_t generation = ContractAccess::epoch(*owner);
         if ((details.has_source && index == details.source_index &&
@@ -3880,11 +3940,12 @@ bool ProgramImplCore::compose_pressure_candidate(
             expected = inspect_eviction_option(continuation_states[index]);
         } else {
             if (!pressure_decision_valid(continuation_states[index], proposed, &*protection)) {
+                reject_reason("compose-early");
                 return false;
             }
             expected = proposed;
         }
-        if (expected != proposed || expected.shared_owner) { return false; }
+        if (expected != proposed || expected.shared_owner) { reject_reason("compose-outcome-mismatch"); return false; }
         details.pressure_options.push_back(expected);
         details.pressure_owner_ids.push_back(planning_owner);
         details.pressure_indices.push_back(index);
@@ -3892,11 +3953,15 @@ bool ProgramImplCore::compose_pressure_candidate(
         pressure_needs_transfer =
             pressure_needs_transfer || !expected.transfer_requirements.empty();
         const SequenceState& pressure_owner = continuation_states[index];
-        if (!pressure_owner.kv) { return false; }
+        if (!pressure_owner.kv) {
+            reject_reason("compose-early");
+            return false;
+        }
         append_kv_actions(*text_kv_addresses, *text_kv_pages, pressure_owner.kv->text,
                           expected.main_kv_changes, private_host_requests);
         if (!expected.backend_kv_changes.empty()) {
             if (!pressure_owner.kv->backend || !backend_kv_addresses || !backend_kv_pages) {
+                reject_reason("compose-early");
                 return false;
             }
             append_kv_actions(*backend_kv_addresses, *backend_kv_pages, *pressure_owner.kv->backend,
@@ -3921,7 +3986,7 @@ bool ProgramImplCore::compose_pressure_candidate(
                       planning_owner) != details.shared_pressure_owner_ids.end()) {
             throw std::invalid_argument("materialization shared pressure owner is invalid");
         }
-        if (!valid_shared_prefix(*owner)) { return false; }
+        if (!valid_shared_prefix(*owner)) { reject_reason("compose-shared-invalid"); return false; }
         const std::uint32_t index      = ContractAccess::index(*owner);
         const std::uint64_t generation = ContractAccess::epoch(*owner);
         if ((details.has_shared_source && index == details.shared_source_index &&
@@ -3937,11 +4002,12 @@ bool ProgramImplCore::compose_pressure_candidate(
         } else {
             if (!shared_pressure_decision_valid(shared_prefix_states[index], proposed,
                                                 &*protection)) {
+                reject_reason("compose-early");
                 return false;
             }
             expected = proposed;
         }
-        if (expected != proposed || !expected.shared_owner) { return false; }
+        if (expected != proposed || !expected.shared_owner) { reject_reason("compose-shared-outcome-mismatch"); return false; }
         details.shared_pressure_options.push_back(expected);
         details.shared_pressure_owner_ids.push_back(planning_owner);
         details.shared_pressure_indices.push_back(index);
@@ -3949,7 +4015,10 @@ bool ProgramImplCore::compose_pressure_candidate(
         pressure_needs_transfer =
             pressure_needs_transfer || !expected.transfer_requirements.empty();
         const SharedPrefixState& pressure_owner = shared_prefix_states[index];
-        if (!pressure_owner.kv) { return false; }
+        if (!pressure_owner.kv) {
+            reject_reason("compose-early");
+            return false;
+        }
         append_kv_actions(*text_kv_addresses, *text_kv_pages, pressure_owner.kv->text,
                           expected.main_kv_changes, shared_host_requests);
         if (!expected.backend_kv_changes.empty()) {
@@ -3970,9 +4039,9 @@ bool ProgramImplCore::compose_pressure_candidate(
     // Ledger-divergence probe (env-gated): what the composed OPTIONS claim to free versus what
     // the joint projection actually credits. A non-zero claim against a zero credit is exactly
     // the divergence that made every closure target assess infeasible and sent the planner to
-    // root_maximal (2026-09-24:62 owners wiped while Host pools had ample room).
+    // root_capped (2026-09-24:62 owners wiped while Host pools had ample room).
     if (const char* diag = std::getenv("NINFER_REUSE_DIAG");
-        diag != nullptr && *diag != '\0' && *diag != '0') {
+        diag == nullptr || *diag != '0') {
         std::uint32_t claim_main = 0, claim_backend = 0, claim_state = 0, drop_main = 0;
         std::size_t evict_opts = 0, kv_opts = 0;
         for (const qwen3_6::detail::PressureDecision& opt : details.pressure_options) {
@@ -6170,7 +6239,7 @@ ProgramImplCore::release_materialization_victim(MaterializationTransaction& tran
     out.delta.removed = owner_exclusive_resources(continuation_states[index]);
     // Closes the pressure path's attribution gap: planner victims released here previously printed
     // bare [evict] lines (no [exhaust], no site=seal, no handle-release). A burst of these is a
-    // COMMITTED pressure plan's victim set - e.g. the root_maximal fallback that wiped 47 private
+    // COMMITTED pressure plan's victim set - e.g. the root_capped fallback that wiped 47 private
     // + 11 shared owners in one request on 2026-09-24 17:43 while every other axis showed room.
     std::fprintf(stderr, "[evict-cause] site=materialization-victim slot=%u gen=%llu pos=%zu\n",
                  index, static_cast<unsigned long long>(generation), position);
@@ -12725,7 +12794,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         throw std::logic_error("prefill cannot advance while a capture offer is pending");
     }
     if (const char* reuse_diag = std::getenv("NINFER_REUSE_DIAG");
-        reuse_diag != nullptr && *reuse_diag != '\0' && *reuse_diag != '0') {
+        reuse_diag == nullptr || *reuse_diag != '0') {
         // Pairs with `capture-plan:`/`capture:`: a request that resumes its prefill deeper than a
         // planned capture frontier dropped that capture, which is the difference between "the deep
         // anchor was never planned" and "the deep anchor was planned and then passed over".

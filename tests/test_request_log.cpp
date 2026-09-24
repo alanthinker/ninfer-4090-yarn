@@ -409,7 +409,7 @@ int main() {
                           .stop_reason                = ninfer::MaterializationStopReason::QueueExhausted,
                           .budget_exhausted           = false,
                           .selected_degradation_units = 2,
-                          .selected_maximal_fallback  = false,
+                          .selected_capped_fallback  = false,
     };
     outcome.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
                                                    .model_thinking_tokens = 256,

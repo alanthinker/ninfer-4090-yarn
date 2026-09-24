@@ -580,7 +580,9 @@ public:
     [[nodiscard]] PressureTargetHandle
     identity_target(runtime::PlanningCandidateId candidate) const;
     [[nodiscard]] PressureTargetHandle
-    root_maximal_target(runtime::PlanningCandidateId root_candidate);
+    root_capped_target(runtime::PlanningCandidateId root_candidate,
+                        std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+                        std::uint32_t max_evictions);
     [[nodiscard]] std::optional<PressureTargetHandle>
     guided_closure_target(runtime::PlanningCandidateId candidate,
                           std::span<const runtime::PlanningOwnerId> preferred_owner_ids,

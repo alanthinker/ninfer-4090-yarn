@@ -419,8 +419,8 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.pressure_searches != report.previous.pressure_searches ||
            report.current.pressure_search_budget_exhaustions !=
                report.previous.pressure_search_budget_exhaustions ||
-           report.current.pressure_maximal_fallback_selections !=
-               report.previous.pressure_maximal_fallback_selections ||
+           report.current.pressure_capped_fallback_selections !=
+               report.previous.pressure_capped_fallback_selections ||
            report.current.historical_fork_hits != report.previous.historical_fork_hits ||
            report.current.device_state_occupied_slots !=
                report.previous.device_state_occupied_slots ||

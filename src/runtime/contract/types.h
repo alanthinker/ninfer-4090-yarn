@@ -634,7 +634,7 @@ struct PressureTargetAssessment {
     std::uint64_t projection_work       = 0;
     std::uint64_t assessment_digest     = 0;
     bool expandable                     = false;
-    bool root_maximal                   = false;
+    bool root_capped                   = false;
 };
 
 struct BeginSummary {

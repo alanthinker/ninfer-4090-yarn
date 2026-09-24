@@ -168,9 +168,12 @@ PressurePlanningSession<Variant>::identity_target(runtime::PlanningCandidateId c
 
 template <>
 PressureTargetHandle
-PressurePlanningSession<Variant>::root_maximal_target(runtime::PlanningCandidateId root_candidate) {
+PressurePlanningSession<Variant>::root_capped_target(
+    runtime::PlanningCandidateId root_candidate,
+    std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+    std::uint32_t max_evictions) {
     if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
-    return impl_->root_maximal_target(root_candidate);
+    return impl_->root_capped_target(root_candidate, preferred_owner_ids, max_evictions);
 }
 
 template <>

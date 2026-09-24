@@ -28,7 +28,7 @@ inline std::uint32_t planning_saturating_u32(std::uint64_t value) noexcept {
 // pins and shared references can legitimately refuse pages. Summing the raw effect here made
 // guided closures report residual=0 while the official projection still refused ~576 device-KV
 // pages, so every "successful" closure target assessed infeasible on the only tight axis and
-// the planner committed root_maximal instead (2026-09-24:62 owners wiped for a single 57,182
+// the planner committed root_capped instead (2026-09-24:62 owners wiped for a single 57,182
 // token root request while Host state and Host KV both had ample room). The guidance and the
 // gate must read the same books; explicit actions still credit exactly as before.
 inline detail::PhysicalResources
@@ -490,13 +490,13 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::victim_choices(const TargetN
 }
 
 inline std::uint32_t PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::intern_target(
-    std::uint32_t selected_candidate, std::span<const std::uint16_t> choices, bool root_maximal) {
+    std::uint32_t selected_candidate, std::span<const std::uint16_t> choices, bool root_capped) {
     if (selected_candidate >= candidate_options.size() ||
         choices.size() != candidate_options[selected_candidate].victims.size()) {
         throw std::logic_error("pressure target does not match its candidate victim domain");
     }
     if (TargetNode* existing = find_target(selected_candidate, choices)) {
-        existing->root_maximal = existing->root_maximal || root_maximal;
+        existing->root_capped = existing->root_capped || root_capped;
         return static_cast<std::uint32_t>(existing - targets.data());
     }
     const std::size_t maximum = candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
@@ -514,7 +514,7 @@ inline std::uint32_t PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::intern_
         .victim_choice_offset = offset,
         .victim_choice_count  = static_cast<std::uint32_t>(choices.size()),
         .stable_ordinal       = index,
-        .root_maximal         = root_maximal,
+        .root_capped         = root_capped,
     });
     index_target(index);
     return index;
@@ -639,29 +639,58 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::pressure_successors(
 }
 
 inline qwen3_6::PressureTargetHandle
-PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::root_maximal_target(
-    runtime::PlanningCandidateId root_candidate) {
+PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::root_capped_target(
+    runtime::PlanningCandidateId root_candidate,
+    std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+    std::uint32_t max_evictions) {
     if (scratch_live) { throw std::logic_error("pressure expansion scratch is still live"); }
     const std::uint32_t selected_candidate = candidate_index(root_candidate);
     populate_options(selected_candidate);
     choice_scratch.assign(candidate_options[selected_candidate].victims.size(), 0);
-    for (std::size_t index = 0; index < candidate_options[selected_candidate].victims.size();
-         ++index) {
-        choice_scratch[index] =
-            candidate_options[selected_candidate].victims[index].eviction_choice;
+    // Capped destructive batch: evict at most max_evictions owners, cheapest first (the same
+    // preferred/value order the guided closure uses). The planner grows this cap in batches of
+    // eight until the plan fits; there is no evict-everything target (policy2026-09-24: the old
+    // root_capped fallback wiped56 owners for one request while host_state sat at184/320).
+    const CandidateOptions& options = candidate_options[selected_candidate];
+    std::vector<std::size_t> victim_order;
+    victim_order.reserve(options.victims.size());
+    const auto append_victim = [&](std::size_t victim_index) {
+        if (std::find(victim_order.begin(), victim_order.end(), victim_index) ==
+            victim_order.end()) {
+            victim_order.push_back(victim_index);
+        }
+    };
+    for (const runtime::PlanningOwnerId id : preferred_owner_ids) {
+        const auto found =
+            std::find_if(options.victims.begin(), options.victims.end(), [&](const auto& victim) {
+                return victim.owner_index < owners.size() && owners[victim.owner_index].id == id;
+            });
+        if (found != options.victims.end()) {
+            append_victim(static_cast<std::size_t>(found - options.victims.begin()));
+        }
+    }
+    for (std::size_t index = 0; index < options.victims.size(); ++index) { append_victim(index); }
+    std::uint32_t evicted = 0;
+    for (const std::size_t victim_index : victim_order) {
+        if (evicted >= max_evictions) { break; }
+        const std::uint16_t eviction_choice = options.victims[victim_index].eviction_choice;
+        if (eviction_choice == 0 || choice_scratch[victim_index] != 0) { continue; }
+        choice_scratch[victim_index] = eviction_choice;
+        ++evicted;
     }
     const std::uint32_t target_index = intern_target(selected_candidate, choice_scratch, true);
     if (const char* diag = std::getenv("NINFER_REUSE_DIAG");
-        diag != nullptr && *diag != '\0' && *diag != '0') {
-        // 2026-09-23: the materialization search reported selected_maximal_fallback=true for a
-        // request whose pool had free room on every axis. This line settles which of two shapes
-        // the "maximal" target actually had: `victims=0 all_zero=1` means the maximal target IS
-        // the identity node (an empty victim domain makes all-zero choices equal both), while
-        // `victims=N all_zero=0` means a real evict-everything plan over N owners.
+        diag == nullptr || *diag != '0') {
+        // Shape of one destructive fallback batch: victims<=max_evictions cheapest owners;
+        // victims=0/all_zero=1 means an empty victim domain. See [fallback] lines in
+        // materialization_planner for why the fallback path was entered at all.
         const bool all_zero = std::all_of(choice_scratch.begin(), choice_scratch.end(),
                                           [](std::uint16_t choice) { return choice == 0; });
-        std::fprintf(stderr, "[search] root_maximal node=%u victims=%zu all_zero=%d\n",
-                     target_index, choice_scratch.size(), all_zero ? 1 : 0);
+        const std::size_t victims = static_cast<std::size_t>(
+            std::count_if(choice_scratch.begin(), choice_scratch.end(),
+                          [](std::uint16_t choice) { return choice != 0; }));
+        std::fprintf(stderr, "[search] root_capped node=%u victims=%zu all_zero=%d cap=%u\n",
+                     target_index, victims, all_zero ? 1 : 0, max_evictions);
     }
     qwen3_6::PressureTargetHandle handle;
     handle.session_    = this;
@@ -811,7 +840,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
             // Physically closed but the caller still demands Evicted outcomes
             // (minimum_evictions): a root candidate's logical goal needs a Vacant catalog cell,
             // and with the catalog full only an Evicted owner hands one over. Force the cheapest
-            // preferred owner's eviction choice - one owner, not root_maximal's
+            // preferred owner's eviction choice - one owner, not root_capped's
             // evict-everything (which wiped62 owners on2026-09-2418:59 while host_state sat at
             // 184/320).
             bool forced = false;
@@ -1239,7 +1268,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
     }
     if (status != runtime::MaterializationPhysicalStatus::Feasible &&
         [](const char* diag) {
-            return diag != nullptr && *diag != '\0' && *diag != '0';
+            return diag == nullptr || *diag != '0';
         }(std::getenv("NINFER_REUSE_DIAG"))) {
         // Why this target cannot be taken. A target that applies no victim decisions (all-zero
         // choices) is a plan that destroys nothing: when it fails here, the request is forced
@@ -1252,14 +1281,14 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
             const auto& residual = *node.assessed_residual;
             std::fprintf(
                 stderr,
-                "[search] target infeasible: identity=%d root_maximal=%d choices=%zu "
+                "[search] target infeasible: identity=%d root_capped=%d choices=%zu "
                 "status=%d | device.state used=%u peak=%u cap=%u resid=%u"
                 " | device.lanes used=%u peak=%u cap=%u"
                 " | device.main_kv used=%u peak=%u cap=%u"
                 " | device.backend_kv used=%u peak=%u cap=%u"
                 " | host.state used=%u peak=%u cap=%u resid=%u"
                 " | host.kv used=%zu peak=%zu cap=%zu resid=%zu blocked_host=%zu\n",
-                identity_target ? 1 : 0, node.root_maximal ? 1 : 0, choices.size(),
+                identity_target ? 1 : 0, node.root_capped ? 1 : 0, choices.size(),
                 static_cast<int>(status), used.device.state_slots, peak.device.state_slots,
                 cap.device.state_slots, residual.device.state_slots, used.device.active_lanes,
                 peak.device.active_lanes, cap.device.active_lanes, used.device.main_kv_pages,
@@ -1270,9 +1299,9 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
                 projected->blocked_host_allocation_bytes);
         } else {
             std::fprintf(stderr,
-                         "[search] target infeasible: identity=%d root_maximal=%d choices=%zu "
+                         "[search] target infeasible: identity=%d root_capped=%d choices=%zu "
                          "status=%d (no residual: structural) blocked_host=%zu\n",
-                         identity_target ? 1 : 0, node.root_maximal ? 1 : 0, choices.size(),
+                         identity_target ? 1 : 0, node.root_capped ? 1 : 0, choices.size(),
                          static_cast<int>(status), projected->blocked_host_allocation_bytes);
         }
     }
@@ -1329,7 +1358,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
         .projection_work       = projection_work,
         .assessment_digest     = digest,
         .expandable            = expandable,
-        .root_maximal          = node.root_maximal,
+        .root_capped          = node.root_capped,
     };
     std::optional<AdmissionCandidate> executable;
     std::optional<CapturePressureCandidate> capture_executable;

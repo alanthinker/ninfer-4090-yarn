@@ -308,7 +308,7 @@ OperationalRecord render_request_done(const RequestLogContext& context,
         if (metrics.materialization.fair_share_released_buckets != 0) {
             out << ", fair-share released " << metrics.materialization.fair_share_released_buckets;
         }
-        out << (metrics.materialization.selected_maximal_fallback ? ", maximal fallback)" : ")");
+        out << (metrics.materialization.selected_capped_fallback ? ", capped fallback)" : ")");
     } else if (offered == 0 && metrics.prefix_cache_hit_tokens == 0 &&
                outcome.prompt_tokens >= 65536) {
         out << " | reuse offered none ("

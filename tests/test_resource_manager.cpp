@@ -578,7 +578,9 @@ public:
         return PlanningCandidateId{.value = 0};
     }
 
-    [[nodiscard]] FakePressureTargetHandle root_maximal_target(PlanningCandidateId candidate);
+    [[nodiscard]] FakePressureTargetHandle root_capped_target(
+        PlanningCandidateId candidate, std::span<const PlanningOwnerId> preferred_owner_ids,
+        std::uint32_t max_evictions);
     [[nodiscard]] std::optional<FakePressureTargetHandle>
     guided_closure_target(PlanningCandidateId candidate,
                           std::span<const PlanningOwnerId> preferred_owner_ids,
@@ -612,7 +614,7 @@ private:
         std::uint32_t candidate_index = 0;
         std::vector<std::uint16_t> choices;
         std::uint32_t stable_ordinal = 0;
-        bool root_maximal            = false;
+        bool root_capped            = false;
     };
 
     [[nodiscard]] bool valid(FakePressureTargetHandle target) const noexcept;
@@ -1406,28 +1408,45 @@ FakePressureTargetHandle FakePressurePlanningSession::identity_target() const {
 }
 
 FakePressureTargetHandle
-FakePressurePlanningSession::root_maximal_target(PlanningCandidateId candidate) {
+FakePressurePlanningSession::root_capped_target(
+    PlanningCandidateId candidate, std::span<const PlanningOwnerId> preferred_owner_ids,
+    std::uint32_t max_evictions) {
     const std::uint32_t selected = candidate_index(candidate);
     populate_options(selected);
-    Target maximal{
+    Target capped{
         .candidate_index = selected,
         .choices         = std::vector<std::uint16_t>(owners_.size(), 0),
-        .root_maximal    = true,
+        .root_capped     = true,
     };
-    for (std::size_t index = 0; index < owners_.size(); ++index) {
-        maximal.choices[index] = static_cast<std::uint16_t>(options_[selected][index].size());
+    // Cheapest-first capped batch: preferred owners, then the rest, until max_evictions.
+    std::vector<std::size_t> order;
+    const auto push = [&](std::size_t index) {
+        if (std::find(order.begin(), order.end(), index) == order.end()) { order.push_back(index); }
+    };
+    for (const PlanningOwnerId id : preferred_owner_ids) {
+        const auto found = std::find_if(owners_.begin(), owners_.end(),
+                                        [&](const Owner& owner) { return owner.id == id; });
+        if (found != owners_.end()) { push(static_cast<std::size_t>(found - owners_.begin())); }
+    }
+    for (std::size_t index = 0; index < owners_.size(); ++index) { push(index); }
+    std::uint32_t evicted = 0;
+    for (const std::size_t index : order) {
+        if (evicted >= max_evictions) { break; }
+        if (options_[selected][index].empty()) { continue; }
+        capped.choices[index] = static_cast<std::uint16_t>(options_[selected][index].size());
+        ++evicted;
     }
     auto found = std::find_if(targets_.begin(), targets_.end(),
-                              [&](const Target& target) { return same_target(target, maximal); });
+                              [&](const Target& target) { return same_target(target, capped); });
     if (found != targets_.end()) {
-        found->root_maximal = true;
+        found->root_capped = true;
         return FakePressureTargetHandle{
             .generation = generation_,
             .index      = static_cast<std::uint32_t>(found - targets_.begin()),
         };
     }
-    maximal.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
-    targets_.push_back(std::move(maximal));
+    capped.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
+    targets_.push_back(std::move(capped));
     return FakePressureTargetHandle{
         .generation = generation_,
         .index      = static_cast<std::uint32_t>(targets_.size() - 1U),
@@ -1692,7 +1711,7 @@ FakeAssessedPressureTarget FakePressurePlanningSession::assess(FakePressureTarge
         .projection_work       = 1U + assessment_outcomes_.size(),
         .assessment_digest     = digest,
         .expandable            = expandable,
-        .root_maximal          = target.root_maximal,
+        .root_capped          = target.root_capped,
     };
     return FakeAssessedPressureTarget(handle, assessment);
 }
@@ -1710,7 +1729,7 @@ FakePressurePlanningSession::prepare_expansion(FakePressureTargetHandle handle) 
             for (std::size_t choice = 1; choice <= alternatives.size(); ++choice) {
                 Target child         = parent;
                 child.choices[owner] = static_cast<std::uint16_t>(choice);
-                child.root_maximal   = false;
+                child.root_capped   = false;
                 if (std::none_of(expansion_scratch_.begin(), expansion_scratch_.end(),
                                  [&](const Target& prior) { return same_target(prior, child); })) {
                     expansion_scratch_.push_back(std::move(child));
@@ -1720,7 +1739,7 @@ FakePressurePlanningSession::prepare_expansion(FakePressureTargetHandle handle) 
                    !alternatives[current - 1U].evicts_continuation) {
             Target child         = parent;
             child.choices[owner] = static_cast<std::uint16_t>(alternatives.size());
-            child.root_maximal   = false;
+            child.root_capped   = false;
             if (std::none_of(expansion_scratch_.begin(), expansion_scratch_.end(),
                              [&](const Target& prior) { return same_target(prior, child); })) {
                 expansion_scratch_.push_back(std::move(child));
@@ -3037,7 +3056,7 @@ void test_materialization_result_is_adopted_by_owner_identity() {
     }
 }
 
-void test_guided_pressure_reaches_deep_retention_before_maximal_fallback() {
+void test_guided_pressure_reaches_deep_retention_before_capped_fallback() {
     constexpr std::size_t owner_count = 7;
     FakeManager manager               = make_manager(1, owner_count + 1U);
     FakeProgram program;
@@ -3858,7 +3877,7 @@ int main() {
     run_test("materialization result owner identity",
              test_materialization_result_is_adopted_by_owner_identity);
     run_test("guided deep retention",
-             test_guided_pressure_reaches_deep_retention_before_maximal_fallback);
+             test_guided_pressure_reaches_deep_retention_before_capped_fallback);
     run_test("combined target exact repricing",
              test_combined_target_reprices_cancelled_pressure_copy);
     run_test("in-progress and capture", test_in_progress_adoption_and_private_capture);
