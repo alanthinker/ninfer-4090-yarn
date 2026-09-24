@@ -3967,6 +3967,42 @@ bool ProgramImplCore::compose_pressure_candidate(
     if (!projection) { return false; }
     const detail::PhysicalResources& removed = projection->unique_object_delta.removed;
     const detail::PhysicalResources& added   = projection->unique_object_delta.added;
+    // Ledger-divergence probe (env-gated): what the composed OPTIONS claim to free versus what
+    // the joint projection actually credits. A non-zero claim against a zero credit is exactly
+    // the divergence that made every closure target assess infeasible and sent the planner to
+    // root_maximal (2026-09-24:62 owners wiped while Host pools had ample room).
+    if (const char* diag = std::getenv("NINFER_REUSE_DIAG");
+        diag != nullptr && *diag != '\0' && *diag != '0') {
+        std::uint32_t claim_main = 0, claim_backend = 0, claim_state = 0, drop_main = 0;
+        std::size_t evict_opts = 0, kv_opts = 0;
+        for (const qwen3_6::detail::PressureDecision& opt : details.pressure_options) {
+            if (opt.evicts_continuation) { ++evict_opts; }
+            if (!opt.main_kv_changes.empty() || !opt.backend_kv_changes.empty()) { ++kv_opts; }
+            claim_main += opt.effect.removed.device.main_kv_pages;
+            claim_backend += opt.effect.removed.device.backend_kv_pages;
+            claim_state += opt.effect.removed.device.state_slots;
+            drop_main += opt.checkpoint_drop_effect.removed.device.main_kv_pages;
+        }
+        for (const qwen3_6::detail::PressureDecision& opt : details.shared_pressure_options) {
+            if (opt.evicts_continuation) { ++evict_opts; }
+            if (!opt.main_kv_changes.empty() || !opt.backend_kv_changes.empty()) { ++kv_opts; }
+            claim_main += opt.effect.removed.device.main_kv_pages;
+            claim_backend += opt.effect.removed.device.backend_kv_pages;
+            claim_state += opt.effect.removed.device.state_slots;
+            drop_main += opt.checkpoint_drop_effect.removed.device.main_kv_pages;
+        }
+        std::fprintf(stderr,
+                     "[compose] opts=%zu evict=%zu kvopt=%zu | claim main=%u bk=%u st=%u"
+                     " drop_main=%u | proj_removed main=%u bk=%u st=%u hostkv_mb=%zu"
+                     " | proj_added main=%u bk=%u\n",
+                     details.pressure_options.size() + details.shared_pressure_options.size(),
+                     evict_opts, kv_opts, claim_main, claim_backend, claim_state, drop_main,
+                     removed.device.main_kv_pages, removed.device.backend_kv_pages,
+                     removed.device.state_slots,
+                     removed.host.kv_bytes / static_cast<std::size_t>(1024U * 1024U),
+                     added.device.main_kv_pages, added.device.backend_kv_pages);
+        std::fflush(stderr);
+    }
 
     if (projection->source_state_fork_required &&
         details.state_fork_required != *projection->source_state_fork_required) {
@@ -6132,6 +6168,13 @@ ProgramImplCore::release_materialization_victim(MaterializationTransaction& tran
         throw std::logic_error("materialization victim is not strictly releasable");
     }
     out.delta.removed = owner_exclusive_resources(continuation_states[index]);
+    // Closes the pressure path's attribution gap: planner victims released here previously printed
+    // bare [evict] lines (no [exhaust], no site=seal, no handle-release). A burst of these is a
+    // COMMITTED pressure plan's victim set - e.g. the root_maximal fallback that wiped 47 private
+    // + 11 shared owners in one request on 2026-09-24 17:43 while every other axis showed room.
+    std::fprintf(stderr, "[evict-cause] site=materialization-victim slot=%u gen=%llu pos=%zu\n",
+                 index, static_cast<unsigned long long>(generation), position);
+    std::fflush(stderr);
     release_continuation_slot_strict(index);
     if (transaction.root_waiting_for_victim && transaction.root_continuation_index == index) {
         continuation_slots[index].role      = ContinuationSlotRole::ReservedMaterialization;
