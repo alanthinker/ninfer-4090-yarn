@@ -338,7 +338,11 @@ step capture_repro    300 python3 tools/smoke/agent_capture_repro.py
 step conc_at_limit    300 python3 tools/smoke/test_concurrency_decode.py "${CONC_SMALL[@]}"
 step conc_overload    300 python3 tools/smoke/test_concurrency_decode.py "${CONC_BIG[@]}"
 step replay_dumps     300 python3 tools/smoke/replay_dump.py "$PORT" \
-    $(ls "$NINFER_REQDUMP_DIR"/*.json | head -3)
+    $(ls -t "$NINFER_REQDUMP_DIR"/*.json | head -3)
+    # Newest first: the service prunes its dumps oldest-first at NINFER_DUMP_REQUESTS_LIMIT, so
+    # the oldest three (the old default) can be deleted mid-step while a big one replays - the
+    # observed 2026-09-24 failure was FileNotFoundError on the second file after an 86 s first
+    # replay. Fresh dumps are the ones guaranteed to survive the step.
 
 echo "== phase 5: final occupancy, transfer churn, error tally =="
 host_end=$(occ_host)
