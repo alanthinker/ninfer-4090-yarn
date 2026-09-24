@@ -3714,6 +3714,62 @@ std::optional<AdmissionCandidate> ProgramImplCore::seal_materialization(
         revalidate_materialization(copy, prompt) != runtime::PreflightStatus::Ready) {
         return std::nullopt;
     }
+    // Forensic cause for the cache removal this plan is about to perform, printed at the moment
+    // the victim set is sealed (every composed plan with owners passes through here):
+    //   base_resid  - the deficit BEFORE any victim acts: the axis with >0 is the axis that
+    //                 actually forced owner release/pressure;
+    //   final_resid - what the victims bought (a passing plan drives this to zero);
+    //   relief      - what the ladder could still deliver at this instant (state/host slots);
+    //   occ         - live occupancy: which OTHER pools had free room when this fired;
+    //   victim[i]   - what each owner gives up (evict=1 releases the whole owner; otherwise only
+    //                 the listed replica/KV changes degrade it).
+    // "Evicted while Host slots were free" is answered here, not guessed: occ.hstate below the
+    // cap next to base_resid>0 on another axis names both the binding axis and the free pool,
+    // and relief>0 beside a positive base_resid on the same axis is an under-credited relief
+    // (the guided_materialization_deficit host-slot credit corrected by this change).
+    if (!pressure_options.empty() || !shared_pressure_options.empty()) {
+        const detail::PhysicalResources base      = materialization_deficit(*admission.impl_);
+        const detail::PhysicalResources final_res = materialization_deficit(*copy.impl_);
+        const detail::PhysicalResources occ       = physical_occupancy();
+        const auto kb                             = [](std::size_t bytes) {
+            return bytes / static_cast<std::size_t>(1024U * 1024U);
+        };
+        std::fprintf(stderr,
+                     "[evict-cause] site=seal victims=%zu shared=%zu"
+                     " | base_resid dstate=%u hstate=%u mainkv=%u bkmkv=%u hostkv_mb=%zu"
+                     " | final_resid dstate=%u hstate=%u mainkv=%u bkmkv=%u hostkv_mb=%zu"
+                     " | relief state=%u host=%u"
+                     " | occ dstate=%u hstate=%u mainkv=%u bkmkv=%u hostkv_mb=%zu\n",
+                     pressure_options.size(), shared_pressure_options.size(),
+                     base.device.state_slots, base.host.state_slots, base.device.main_kv_pages,
+                     base.device.backend_kv_pages, kb(base.host.kv_bytes),
+                     final_res.device.state_slots, final_res.host.state_slots,
+                     final_res.device.main_kv_pages, final_res.device.backend_kv_pages,
+                     kb(final_res.host.kv_bytes), state_slot_relief(0), host_slot_relief(),
+                     occ.device.state_slots, occ.host.state_slots, occ.device.main_kv_pages,
+                     occ.device.backend_kv_pages, kb(occ.host.kv_bytes));
+        for (std::size_t i = 0; i < pressure_options.size(); ++i) {
+            const qwen3_6::detail::PressureDecision& opt = *pressure_options[i];
+            std::fprintf(stderr,
+                         "[evict-cause]   victim[%zu] owner=%u idx=%u gen=%llu evict=%d"
+                         " st=%zu mkv=%zu bkv=%zu\n",
+                         i, pressure_owner_ids[i].value,
+                         ContractAccess::index(*pressure_owners[i]),
+                         static_cast<unsigned long long>(
+                             ContractAccess::epoch(*pressure_owners[i])),
+                         opt.evicts_continuation ? 1 : 0, opt.state_changes.size(),
+                         opt.main_kv_changes.size(), opt.backend_kv_changes.size());
+        }
+        for (std::size_t i = 0; i < shared_pressure_options.size(); ++i) {
+            const qwen3_6::detail::PressureDecision& opt = *shared_pressure_options[i];
+            std::fprintf(stderr,
+                         "[evict-cause]   shared[%zu] owner=%u evict=%d st=%zu mkv=%zu bkv=%zu\n",
+                         i, shared_pressure_owner_ids[i].value,
+                         opt.evicts_continuation ? 1 : 0, opt.state_changes.size(),
+                         opt.main_kv_changes.size(), opt.backend_kv_changes.size());
+        }
+        std::fflush(stderr);
+    }
     return copy;
 }
 
@@ -7470,6 +7526,43 @@ bool ProgramImplCore::release_one_device_state_slot() {
             StateImageStore::SlotReleaseKind::Drop, keep_live_states)) {
         if (state_store->release(*victim)) { return true; }
     }
+    // Every non-destructive step found no eligible victim. Record the per-step eligibility so the
+    // retire that typically follows can be judged instead of guessed: Device full with
+    // demote=0 means every device-resident state is protected/live-bound (destruction justified);
+    // demote=1 with host_free>0 would instead name a veto or begin-failure (the begin path logs
+    // separately). This is the "slots were free, why destroy?" record.
+    std::fprintf(stderr,
+                 "[ladder] non-destructive-exhausted drop=%d demote=%d evicthost=%d dropck=%d"
+                 " host_free=%u dev=%u/%u protected=%d\n",
+                 state_store
+                         ->select_slot_release_victim(StateImageStore::SlotReleaseKind::
+                                                          DropDeviceReplica,
+                                                      keep_all)
+                         .has_value()
+                     ? 1
+                     : 0,
+                 state_store
+                         ->select_slot_release_victim(StateImageStore::SlotReleaseKind::CopyToHost,
+                                                      keep_all)
+                         .has_value()
+                     ? 1
+                     : 0,
+                 state_store
+                         ->select_slot_release_victim(StateImageStore::SlotReleaseKind::
+                                                          EvictHostReplica,
+                                                      keep_active_states)
+                         .has_value()
+                     ? 1
+                     : 0,
+                 state_store
+                         ->select_slot_release_victim(StateImageStore::SlotReleaseKind::Drop,
+                                                      keep_live_states)
+                         .has_value()
+                     ? 1
+                     : 0,
+                 state_store->host_free(), state_store->device_occupied(),
+                 state_store->device_capacity(), release_protected_state ? 1 : 0);
+    std::fflush(stderr);
     return false;
 }
 
@@ -7572,6 +7665,16 @@ ProgramImplCore::guided_materialization_deficit(const ResourceCandidateState& ad
     const std::uint32_t relief = state_slot_relief(pressure.removed.host.state_slots);
     if (relief > residual.device.state_slots) { residual.device.state_slots = 0; }
     else { residual.device.state_slots -= relief; }
+    // The same Host-state credit materialization_deficit and physical_peak_fits already take: an
+    // idle owner's Host replica (bounded, its retirement) is delivered by the ladder's 2b step at
+    // the restore site - refusing that credit mis-priced a reuse on 2026-09-22 (host_slot_relief).
+    // Without it this guidance counts one owner more of Host pressure than the runtime can have,
+    // steering the search toward host-freeing victims the plan never needed: evictions while the
+    // Host pool still had room. The terminal verdict above already credits it; the guidance must
+    // agree with it or the extra victims are invisible to every feasibility check downstream.
+    const std::uint32_t host_relief = host_slot_relief();
+    if (host_relief > residual.host.state_slots) { residual.host.state_slots = 0; }
+    else { residual.host.state_slots -= host_relief; }
     return residual;
 }
 
@@ -8227,7 +8330,25 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
             assessment.publishes_shared  = false;
             return assessment;
         }
-        if (!private_replacement) { return assessment; }
+        if (!private_replacement) {
+            // The anchor set is full and no replacement was chosen (the uniform-spacing selector
+            // skipped this offered anchor as redundant), so this group cannot publish - the same
+            // treatment a vanished replacement gets above. Leaving publishes_private=true here
+            // made every consumer read the UN-ASSESSED default physically_feasible=false (the
+            // demand is not built yet, runtime.h default) as a capacity verdict: the reserve path
+            // ran the whole capture-reclaim ladder - state demotes and, on exhaustion, retiring an
+            // idle owner - and could never succeed, destroying cache before skipping anyway
+            // (reproduced on the small rig2026-09-24: retire at host26/48 device1/8, then
+            // static-infeasible with an empty axis detail).
+            assessment.publishes_private   = false;
+            assessment.publishes_shared    = false;
+            std::fprintf(stderr,
+                         "capture: assess frontier=%u site=anchor-replacement-missing"
+                         " replacement=none -> unpublishable (not a capacity verdict)\n",
+                         assessment.frontier);
+            std::fflush(stderr);
+            return assessment;
+        }
     } else if (private_replacement) {
         throw std::invalid_argument("capture has no replaceable private anchor");
     }
@@ -8621,7 +8742,13 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
     // sibling message then cold-prefilled at 0%). Reclaim through the release ladder and assess
     // again, so the decision is always made against the pool the ladder actually produced: a plan
     // built on crediting retirement instead destroyed state a live reference still held.
-    if (!pressure.has_value() && !assessment.physically_feasible && assessment.publishes_private) {
+    // physically_feasible defaults to false, so an assessment that returned before the capacity
+    // gate (demand never built) must not enter the reclaim loop: freeing capacity cannot change a
+    // non-capacity verdict and would only destroy cache before the skip that follows anyway.
+    if (!pressure.has_value() && !assessment.physically_feasible && assessment.publishes_private &&
+        assessment.implementation != nullptr &&
+        assessment.implementation->demand.physical_peak_additional !=
+            detail::PhysicalResources{}) {
         // Non-destructive capacity first (demote a replica, reclaim a redundant host replica), then
         // destruction under a per-request budget and only for the newest boundaries. Retiring an
         // idle session releases hundreds of KV pages and every state image it held, which costs
@@ -8645,6 +8772,15 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
             if (did_retire && reclaim_prefill != nullptr) { ++reclaim_prefill->destructive_reclaims; }
             assessment = inspect_capture(offer, exact_shared, planned_replacement,
                                         private_replacement, permit_shared);
+            std::fprintf(stderr,
+                         "capture: reclaim frontier=%u attempt=%u retire=%d feasible=%d axis=%s\n",
+                         assessment.frontier, attempt, did_retire ? 1 : 0,
+                         assessment.physically_feasible ? 1 : 0,
+                         physical_peak_dimension_detail(
+                             assessment.implementation->demand.physical_peak_additional,
+                             physical_occupancy(), admission_capacity())
+                             .c_str());
+            std::fflush(stderr);
             if (assessment.physically_feasible) { break; }
         }
         if (!assessment.physically_feasible && !newest_boundary) {
@@ -10340,6 +10476,14 @@ ReleaseResult ProgramImplCore::release_continuation(ContinuationHandle&& continu
     try {
         if (!can_release_continuation_slot_strict(index)) { return out; }
     } catch (...) { return out; }
+    // Site marker for an externally requested owner release (client /slots erase, session
+    // teardown): any [evict] sweep preceded by neither [exhaust] (ladder) nor [evict-cause]
+    // site=seal (pressure plan) is explained here - the owner was released because its handle
+    // was consumed, not because any pool was short. Keeps "cache wiped with slots free" from
+    // being misattributed to capacity pressure when the client simply closed the handle.
+    std::fprintf(stderr, "[evict-cause] site=handle-release slot=%u gen=%llu\n", index,
+                 static_cast<unsigned long long>(generation));
+    std::fflush(stderr);
     release_continuation_slot_strict(index);
     ContractAccess::consume(continuation);
     advance_resource_revision();
