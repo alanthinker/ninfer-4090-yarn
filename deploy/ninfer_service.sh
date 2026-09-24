@@ -30,11 +30,12 @@
 #                                                             本服务 ~75 req/h, 100 个只有 ~1.5 小时; 0=不限)
 #                          NINFER_DUMP_REQUESTS_MAX_AGE_HOURS 超过多少小时删除, 默认 24 (0=不限)
 #                        只清理服务自己写的 req-*.json, 目录里其他文件不动。
-#   NINFER_REUSE_DIAG    前缀复用诊断, 默认 0 (生产关闭)。每个请求把前缀索引里
+#   NINFER_REUSE_DIAG    前缀复用诊断, 默认 1 (生产开启)。每个请求把前缀索引里
 #                        每一个 checkpoint 及拒绝它的具体门槛(index-invalid / 状态 / 内容不匹配
 #                        等)逐条打到 stderr(即服务日志)。只读不改行为, 用于区分 0% 命中到底是
 #                        "请求字节变了"还是"规划器没来得及评估候选"(长上下文的 time_budget 超时)。
-#                        日志量随 checkpoint 数线性增长(每请求上千行), 排查前缀缓存命中时设 1 开启。
+#                        日志量随 checkpoint 数线性增长(每请求上千行); 缓存大规模清除等事故的
+#                        取证依赖这些行(轴判/根最大化/组合账本/拒绝站点), 默认全开, 设 0 一键关闭。
 #   NINFER_LOG_LEVEL     日志级别, 默认 debug。相比 info 多出的只有: 启动时一条内存台账(权重后/
 #                        启动后/余量)、每个 prompt 一条上下文成本(传输/预填/画像)、warmup 两条
 #                        —— 共个位数行/请求, 对性能无可测影响。(trace 与 debug 输出完全相同:
@@ -127,7 +128,7 @@ start)
   # 同时保留的续算条目数(每个会话链一份端点/rewrite)。8 时,5~6 条会话每次发布都挤同一个
   # 上限,容易把别的会话的深度端点顶掉;16 给多会话留出余量。真正的上限是 Host KV 池
   # (32 GiB ≈ 188 万 token),条目再多也超不过它。
-  PRIVATE_CONTINUATIONS="${NINFER_MAX_PRIVATE_CONTINUATIONS:-64}"
+  PRIVATE_CONTINUATIONS="${NINFER_MAX_PRIVATE_CONTINUATIONS:-512}"
   # 共享前缀目录容量。引擎自己对每个 prompt 提出三个候选: 「全部 tools 之后」「连续 leading
   # System/Developer 之后」「full prompt」——第二个就是所有会话都相同的系统提示词末尾。
   # 但这些是 EngineStructural 证据, 按设计 (docs/maintainer/resource-scheduling-and-context-cache.md
@@ -298,14 +299,15 @@ start)
   # 前缀复用诊断(默认关闭)。同样是 getenv 读取(非命令行参数), 必须 export。
   # 每个请求逐条打印前缀索引里每个 checkpoint 的拒绝门槛: 排查长上下文 0% 命中时,
   # 用它区分"请求字节变了"(内容不匹配)与"规划器 time_budget 超时放弃"(候选没被评估)。
-  # 日志量每请求上千行, 只留作按需开关: 设 NINFER_REUSE_DIAG=1 开启。
-  REUSE_DIAG="${NINFER_REUSE_DIAG:-0}"
-  if [ -n "$REUSE_DIAG" ] && [ "$REUSE_DIAG" != "0" ]; then
+  # 缓存大规模清除一类事故的取证依赖这些行(压力轴判/根最大化形状/组合账本/拒绝站点),
+  # 默认开启; 仅显式 NINFER_REUSE_DIAG=0 关闭(日志量每请求上千行)。
+  REUSE_DIAG="${NINFER_REUSE_DIAG:-1}"
+  if [ "$REUSE_DIAG" = "0" ]; then
+    export NINFER_REUSE_DIAG=0
+    echo "前缀复用诊断: 已关闭 (设 NINFER_REUSE_DIAG=1 或留空开启)"
+  else
     export NINFER_REUSE_DIAG=1
     echo "前缀复用诊断: 开 (每个请求在日志里列出各 checkpoint 的拒绝原因; NINFER_REUSE_DIAG=0 关闭)"
-  else
-    unset NINFER_REUSE_DIAG
-    echo "前缀复用诊断: 已关闭 (设 NINFER_REUSE_DIAG=1 开启)"
   fi
   # 机器可读请求日志 (jsonl): 单请求全精度计时 (queue/CPU 五分解/复用路径/物化规划)
   # + 每 5 秒调度器与 host_work 采样, 是 TTFT 归因的事后数据源; 文本日志只有单行摘要。
