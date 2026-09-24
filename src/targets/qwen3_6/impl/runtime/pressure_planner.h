@@ -22,6 +22,43 @@ inline std::uint32_t planning_saturating_u32(std::uint64_t value) noexcept {
                : static_cast<std::uint32_t>(value);
 }
 
+// Mirror of evaluate_pressure_target's ledger (program_impl.h:3195-3201): checkpoint-drop
+// effects are NOT owner-additive. The official projection strips them from every private
+// non-evict option and settles them once from the joint post-reference state, where source
+// pins and shared references can legitimately refuse pages. Summing the raw effect here made
+// guided closures report residual=0 while the official projection still refused ~576 device-KV
+// pages, so every "successful" closure target assessed infeasible on the only tight axis and
+// the planner committed root_maximal instead (2026-09-24:62 owners wiped for a single 57,182
+// token root request while Host state and Host KV both had ample room). The guidance and the
+// gate must read the same books; explicit actions still credit exactly as before.
+inline detail::PhysicalResources
+pressure_explicit_removed(const qwen3_6::detail::PressureDecision& decision) {
+    const detail::PhysicalResources& value = decision.effect.removed;
+    const detail::PhysicalResources& drop   = decision.checkpoint_drop_effect.removed;
+    if (drop.device.active_lanes > value.device.active_lanes ||
+        drop.device.state_slots > value.device.state_slots ||
+        drop.device.main_kv_pages > value.device.main_kv_pages ||
+        drop.device.backend_kv_pages > value.device.backend_kv_pages ||
+        drop.host.state_slots > value.host.state_slots ||
+        drop.host.kv_bytes > value.host.kv_bytes) {
+        throw std::logic_error("pressure decision drop effect exceeds its effect");
+    }
+    return detail::PhysicalResources{
+        .device =
+            {
+                .active_lanes     = value.device.active_lanes - drop.device.active_lanes,
+                .state_slots      = value.device.state_slots - drop.device.state_slots,
+                .main_kv_pages    = value.device.main_kv_pages - drop.device.main_kv_pages,
+                .backend_kv_pages = value.device.backend_kv_pages - drop.device.backend_kv_pages,
+            },
+        .host =
+            {
+                .state_slots = value.host.state_slots - drop.host.state_slots,
+                .kv_bytes    = value.host.kv_bytes - drop.host.kv_bytes,
+            },
+    };
+}
+
 inline detail::PhysicalResources planning_resource_sum(detail::PhysicalResources left,
                                                        detail::PhysicalResources right) {
     const auto add_u32 = [](std::uint32_t lhs, std::uint32_t rhs) {
@@ -636,7 +673,8 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::root_maximal_target(
 inline std::optional<qwen3_6::PressureTargetHandle>
 PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
     runtime::PlanningCandidateId admission,
-    std::span<const runtime::PlanningOwnerId> preferred_owner_ids) {
+    std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+    std::uint32_t minimum_evictions) {
     if (scratch_live) {
         throw std::logic_error("guided pressure closure conflicts with expansion scratch");
     }
@@ -688,7 +726,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
             pressure.added = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
                 pressure.added, decision->effect.added);
             pressure.removed = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
-                pressure.removed, decision->effect.removed);
+                pressure.removed, NINFER_QWEN36_RUNTIME_NS::pressure_explicit_removed(*decision));
         }
         detail::PhysicalResources residual =
             program->guided_materialization_deficit(candidate, pressure);
@@ -734,6 +772,16 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
     };
 
     choice_scratch.assign(options.victims.size(), 0);
+    const auto chosen_evictions = [&]() {
+        std::uint32_t evictions = 0;
+        for (std::size_t index = 0; index < choice_scratch.size(); ++index) {
+            const std::uint16_t choice = choice_scratch[index];
+            if (choice != 0 && options.victims[index].decisions[choice - 1U].evicts_continuation) {
+                ++evictions;
+            }
+        }
+        return evictions;
+    };
 
     struct Selection {
         std::size_t victim_index = 0;
@@ -745,7 +793,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
     for (std::size_t step = 0; step < maximum_steps; ++step) {
         const detail::PhysicalResources residual =
             projected_residual(choice_scratch, std::nullopt, nullptr);
-        if (residual == detail::PhysicalResources{}) {
+        if (residual == detail::PhysicalResources{} && chosen_evictions() >= minimum_evictions) {
             TargetNode* existing = find_target(selected_candidate, choice_scratch);
             const std::size_t maximum =
                 candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
@@ -758,6 +806,32 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
             handle.generation_ = generation;
             handle.index_      = target_index;
             return handle;
+        }
+        if (residual == detail::PhysicalResources{}) {
+            // Physically closed but the caller still demands Evicted outcomes
+            // (minimum_evictions): a root candidate's logical goal needs a Vacant catalog cell,
+            // and with the catalog full only an Evicted owner hands one over. Force the cheapest
+            // preferred owner's eviction choice - one owner, not root_maximal's
+            // evict-everything (which wiped62 owners on2026-09-2418:59 while host_state sat at
+            // 184/320).
+            bool forced = false;
+            for (const std::size_t victim_index : victim_order) {
+                const std::uint16_t current = choice_scratch[victim_index];
+                if (current != 0 &&
+                    options.victims[victim_index].decisions[current - 1U].evicts_continuation) {
+                    continue;
+                }
+                const std::uint16_t eviction_choice = options.victims[victim_index].eviction_choice;
+                if (eviction_choice == 0 ||
+                    eviction_choice > options.victims[victim_index].decisions.size()) {
+                    continue;
+                }
+                choice_scratch[victim_index] = eviction_choice;
+                forced = true;
+                break;
+            }
+            if (!forced) { return std::nullopt; }
+            continue;
         }
 
         std::optional<Selection> selected;
@@ -902,7 +976,8 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guidance(qwen3_6::PressureTa
         approximate_pressure.added       = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
             approximate_pressure.added, decision.effect.added);
         approximate_pressure.removed = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
-            approximate_pressure.removed, decision.effect.removed);
+            approximate_pressure.removed,
+            NINFER_QWEN36_RUNTIME_NS::pressure_explicit_removed(decision));
         estimated_pressure.append(decision.transfer_requirements);
         const std::uint32_t units = NINFER_QWEN36_RUNTIME_NS::degradation_units(decision);
         total_degradation         = NINFER_QWEN36_RUNTIME_NS::planning_saturating_u32(
@@ -1181,14 +1256,16 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
                 "status=%d | device.state used=%u peak=%u cap=%u resid=%u"
                 " | device.lanes used=%u peak=%u cap=%u"
                 " | device.main_kv used=%u peak=%u cap=%u"
+                " | device.backend_kv used=%u peak=%u cap=%u"
                 " | host.state used=%u peak=%u cap=%u resid=%u"
                 " | host.kv used=%zu peak=%zu cap=%zu resid=%zu blocked_host=%zu\n",
                 identity_target ? 1 : 0, node.root_maximal ? 1 : 0, choices.size(),
                 static_cast<int>(status), used.device.state_slots, peak.device.state_slots,
                 cap.device.state_slots, residual.device.state_slots, used.device.active_lanes,
                 peak.device.active_lanes, cap.device.active_lanes, used.device.main_kv_pages,
-                peak.device.main_kv_pages, cap.device.main_kv_pages, used.host.state_slots,
-                peak.host.state_slots, cap.host.state_slots, residual.device.state_slots,
+                peak.device.main_kv_pages, cap.device.main_kv_pages, used.device.backend_kv_pages,
+                peak.device.backend_kv_pages, cap.device.backend_kv_pages, used.host.state_slots,
+                peak.host.state_slots, cap.host.state_slots, residual.host.state_slots,
                 used.host.kv_bytes, peak.host.kv_bytes, cap.host.kv_bytes, residual.host.kv_bytes,
                 projected->blocked_host_allocation_bytes);
         } else {

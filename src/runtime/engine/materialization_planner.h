@@ -617,6 +617,8 @@ public:
             };
         };
 
+        bool last_assessment_feasible = false;
+        bool last_assessment_goal     = false;
         const auto assess_target =
             [&](PressureTargetHandle target, std::uint32_t expected_candidate,
                 std::uint32_t expected_ordinal,
@@ -639,6 +641,9 @@ public:
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
+            last_assessment_feasible =
+                assessment.physical_status == MaterializationPhysicalStatus::Feasible;
+            last_assessment_goal = goal.has_value();
             if (goal && !assessment.root_maximal) {
                 candidate_seed_complete_[expected_candidate] = true;
             }
@@ -771,36 +776,62 @@ public:
                 optional_targets >= effective_target_budget) {
                 continue;
             }
+            const auto assess_one_closure =
+                [&](const std::optional<PressureTargetHandle>& handle) {
+                    if (!handle) {
+                        // A failed closure leaves this candidate unseeded for the whole search:
+                        // it is never retried, so its only remaining route is a full expansion of
+                        // its identity root. Count it instead of losing the fact.
+                        ++guided_closures_failed;
+                        return false;
+                    }
+                    const PressureTargetGuidance closure_guidance = session.guidance(*handle);
+                    if (closure_guidance.candidate != candidates[root.candidate_index].id) {
+                        throw std::logic_error("guided closure changed admission candidate");
+                    }
+                    if (target_marked(closure_guidance.stable_target_ordinal, kTargetAssessed)) {
+                        return true;
+                    }
+                    if (!target_marked(closure_guidance.stable_target_ordinal, kTargetDiscovered)) {
+                        mark_target(closure_guidance.stable_target_ordinal, kTargetDiscovered);
+                        ++optional_targets;
+                    }
+                    const Clock::time_point assessment_started = Clock::now();
+                    (void)assess_target(*handle, root.candidate_index,
+                                        closure_guidance.stable_target_ordinal,
+                                        /*from_guided_closure=*/true);
+                    ++guided_assessments;
+                    ++guided_closures_ok;
+                    maximum_step_ns =
+                        std::max(maximum_step_ns, elapsed_ns(assessment_started, Clock::now()));
+                    return true;
+                };
+
             const Clock::time_point step_started              = Clock::now();
+            last_assessment_feasible                          = false;
+            last_assessment_goal                              = false;
             const std::optional<PressureTargetHandle> closure = session.guided_closure_target(
                 candidates[root.candidate_index].id, preferred_owner_ids);
             maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
-            if (!closure) {
-                // A failed closure leaves this candidate unseeded for the whole search: it is
-                // never retried, so its only remaining route is a full expansion of its identity
-                // root. Count it instead of losing the fact.
-                ++guided_closures_failed;
-                continue;
+            if (!assess_one_closure(closure)) { continue; }
+            if (last_assessment_feasible && !last_assessment_goal) {
+                // Physically closed, but logical_goal refused: a root candidate needs a Vacant
+                // catalog cell and with the catalog full only an Evicted outcome hands one over
+                // (resource_manager logical_goal). Without this retry the only goal-passing plan
+                // left is root_maximal - evict-everything - which wiped62 owners at
+                // 2026-09-24 18:59 while host_state sat at184/320. Rebuild the closure with
+                // exactly one forced eviction of the cheapest preferred owner: one cell, one
+                // owner, instead of clearing the catalog.
+                const Clock::time_point variant_started = Clock::now();
+                last_assessment_feasible                = false;
+                last_assessment_goal                    = false;
+                const std::optional<PressureTargetHandle> variant = session.guided_closure_target(
+                    candidates[root.candidate_index].id, preferred_owner_ids,
+                    /*minimum_evictions=*/1U);
+                maximum_step_ns =
+                    std::max(maximum_step_ns, elapsed_ns(variant_started, Clock::now()));
+                (void)assess_one_closure(variant);
             }
-            const PressureTargetGuidance closure_guidance = session.guidance(*closure);
-            if (closure_guidance.candidate != candidates[root.candidate_index].id) {
-                throw std::logic_error("guided closure changed admission candidate");
-            }
-            if (target_marked(closure_guidance.stable_target_ordinal, kTargetAssessed)) {
-                continue;
-            }
-            if (!target_marked(closure_guidance.stable_target_ordinal, kTargetDiscovered)) {
-                mark_target(closure_guidance.stable_target_ordinal, kTargetDiscovered);
-                ++optional_targets;
-            }
-            const Clock::time_point assessment_started = Clock::now();
-            (void)assess_target(*closure, root.candidate_index,
-                                closure_guidance.stable_target_ordinal,
-                                /*from_guided_closure=*/true);
-            ++guided_assessments;
-            ++guided_closures_ok;
-            maximum_step_ns =
-                std::max(maximum_step_ns, elapsed_ns(assessment_started, Clock::now()));
         }
 
         // Build one ordinary feasible seed per expandable candidate. Estimated machine cost orders

@@ -581,7 +581,8 @@ public:
     [[nodiscard]] FakePressureTargetHandle root_maximal_target(PlanningCandidateId candidate);
     [[nodiscard]] std::optional<FakePressureTargetHandle>
     guided_closure_target(PlanningCandidateId candidate,
-                          std::span<const PlanningOwnerId> preferred_owner_ids);
+                          std::span<const PlanningOwnerId> preferred_owner_ids,
+                          std::uint32_t minimum_evictions = 0);
     bool retention_infeasible(PlanningCandidateId candidate);
     [[nodiscard]] ninfer::runtime::PressureTargetGuidance guidance(FakePressureTargetHandle target);
     [[nodiscard]] FakeAssessedPressureTarget assess(FakePressureTargetHandle target);
@@ -1434,7 +1435,8 @@ FakePressurePlanningSession::root_maximal_target(PlanningCandidateId candidate) 
 }
 
 std::optional<FakePressureTargetHandle> FakePressurePlanningSession::guided_closure_target(
-    PlanningCandidateId candidate, std::span<const PlanningOwnerId> preferred_owner_ids) {
+    PlanningCandidateId candidate, std::span<const PlanningOwnerId> preferred_owner_ids,
+    std::uint32_t minimum_evictions) {
     require(!scratch_live_, "fake guided pressure closure conflicts with expansion scratch");
     const std::uint32_t selected_candidate = candidate_index(candidate);
     populate_options(selected_candidate);
@@ -1479,7 +1481,16 @@ std::optional<FakePressureTargetHandle> FakePressurePlanningSession::guided_clos
             if (found == alternatives.end()) { continue; }
             target.choices[owner_index] =
                 static_cast<std::uint16_t>(1U + (found - alternatives.begin()));
-            if (program_->target_feasible(selected_decisions())) {
+            const std::vector<FakeTargetDecision> chosen = selected_decisions();
+            if (minimum_evictions > 0) {
+                // Mirror the real closure's contract: a plan handed minimum_evictions must
+                // actually contain that many Evicted outcomes (goal needs a catalog cell).
+                const auto evictions = static_cast<std::uint32_t>(std::count_if(
+                    chosen.begin(), chosen.end(),
+                    [](const FakeTargetDecision& decision) { return decision.evicts_continuation; }));
+                if (evictions < minimum_evictions) { continue; }
+            }
+            if (program_->target_feasible(chosen)) {
                 auto existing =
                     std::find_if(targets_.begin(), targets_.end(),
                                  [&](const Target& prior) { return same_target(prior, target); });

@@ -1495,7 +1495,8 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
     [[nodiscard]] std::optional<qwen3_6::PressureTargetHandle>
     guided_closure_target(runtime::PlanningCandidateId candidate,
-                          std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
+                          std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+                          std::uint32_t minimum_evictions);
     // Linear-capacity certificate for the evicting-seed fast path: true when no pressure
     // plan that keeps every owner alive can satisfy this candidate's device shortfall.  Each
     // eligible owner contributes its deepest non-evicting decision (per-dimension maximum
