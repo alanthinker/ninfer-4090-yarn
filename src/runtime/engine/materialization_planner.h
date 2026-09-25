@@ -487,19 +487,24 @@ public:
             incumbent        = std::move(*identity_best);
             incumbent.target = session.identity_target(candidates[incumbent.candidate_index].id);
         } else {
-            // Progressive destructive fallback (policy2026-09-24): batches of
-            // kEvictionBatchSize cheapest owners until the plan fits. There is deliberately NO
-            // evict-everything target. Eviction stays proportional to the deficit (one batch in
-            // the common case), a non-destructive guided closure still wins whenever it beats
-            // these costs, and only an exhausted victim domain - everything else protected or
-            // active - ends in a capacity error instead of a cache wipe. Every entry into this
-            // path logs its reason: enter, per-batch outcome, the selected batch, and the
-            // exhausted case (the operator-visible "fallback taken" signal).
-            constexpr std::uint32_t kEvictionBatchSize = 8U;
+            // Progressive destructive fallback (policy2026-09-24, exact-count revision): owners are
+            // added ONE AT A TIME, cheapest first, and the first cap that yields a feasible plan
+            // with a publication slot is the plan. `root_capped_target` assigns exactly `batch_cap`
+            // victims without consulting the deficit, so any stride > 1 deletes owners nobody
+            // needed: production (2026-09-25, 113 entries) seeded on the stride boundaries only -
+            // cap=8 x22, cap=16 x6, cap=32 x8, cap=40 x1 - and the one entry it actually selected
+            // deleted 40 sessions because 40 was the stride boundary, not because 40 were missing.
+            // With a stride of one the eviction count is the deficit, which is the rule "delete
+            // exactly what is missing". There is deliberately NO evict-everything target: only an
+            // exhausted victim domain - everything else protected or active - ends in a capacity
+            // error instead of a cache wipe. Every entry into this path logs its reason: enter,
+            // per-batch outcome, the selected batch, and the exhausted case (the operator-visible
+            // "fallback taken" signal).
+            constexpr std::uint32_t kEvictionBatchSize = 1U;
             if (fallback_diag()) {
                 std::fprintf(stderr,
                              "[fallback] enter: no feasible identity plan; building capped "
-                             "eviction batches (batch=%u); identity axis detail is on the "
+                             "eviction batches (stride=%u); identity axis detail is on the "
                              "[search] identity=1 line above\n",
                              kEvictionBatchSize);
                 std::fflush(stderr);
@@ -1166,12 +1171,19 @@ private:
         std::uint32_t target_ordinal            = 0;
 
         [[nodiscard]] auto key() const noexcept {
+            // Retention policy is lexicographic and comes BEFORE price: among feasible plans the
+            // planner first deletes the fewest sessions, then destroys the least cached work, and
+            // only then is cheapest. `total_ns` used to lead, so price - not retention - decided
+            // every pair of plans that differed in how much cache they destroyed, which inverts the
+            // contract "spill first, delete only what memory cannot absorb, and delete the
+            // minimum". Retention weight still breaks ties inside the same eviction/drop count and
+            // the demotion/copy price still decides every pair that ties on both.
             return std::tuple{
+                owner_evictions,
+                checkpoint_drops,
                 total_ns,
                 affected_selected_hits,
                 newest_affected_hit_epoch,
-                owner_evictions,
-                checkpoint_drops,
                 copy_operations,
                 transferred_bytes,
                 remaining_text_prefill,
@@ -1756,6 +1768,8 @@ private:
             .budget_exhausted           = budget_exhausted,
             .selected_degradation_units = degradation_units,
             .selected_capped_fallback  = capped_fallback,
+            .selected_owner_evictions   = cost.owner_evictions,
+            .selected_checkpoint_drops  = cost.checkpoint_drops,
         };
     }
 

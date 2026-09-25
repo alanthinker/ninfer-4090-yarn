@@ -31,7 +31,9 @@
 #include "ninfer/engine.h"
 #include "ninfer/types.h"
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -74,6 +76,11 @@ struct CaseResult {
     std::string detail;
 };
 
+// Sessions the SELECTED plans of this process destroyed, summed across every request the case ran.
+// The retention contract - spill first, delete only what memory cannot absorb, delete the minimum -
+// is what turns this number into a verdict, so a case whose pools provably have room asserts on it.
+std::atomic<std::uint64_t> g_selected_evictions{0};
+
 [[nodiscard]] CaseResult run(Engine& engine, std::vector<ChatMessage> messages,
                              std::uint32_t output_tokens, const char* tag) {
     CaseResult result;
@@ -86,12 +93,14 @@ struct CaseResult {
         GenerationResult gen   = engine.generate(std::move(prompt), small_output(output_tokens));
         const auto elapsed     = std::chrono::steady_clock::now() - start;
         const MaterializationDiagnostics& mat = gen.materialization;
+        g_selected_evictions += mat.selected_owner_evictions;
         std::printf("  %-18s prompt=%-6u reuse=%-6u %.1fs stop=%d maxfb=%d degr=%-3u "
-                    "replans=%u targets=%u closures=%u/%u\n",
+                    "evict=%-3u drops=%-3u replans=%u targets=%u closures=%u/%u\n",
                     tag, gen.prompt.prompt_tokens, gen.reused_prompt_tokens,
                     std::chrono::duration<double>(elapsed).count(),
                     static_cast<int>(mat.stop_reason), mat.selected_capped_fallback ? 1 : 0,
-                    mat.selected_degradation_units, mat.capacity_replans, mat.targets_evaluated,
+                    mat.selected_degradation_units, mat.selected_owner_evictions,
+                    mat.selected_checkpoint_drops, mat.capacity_replans, mat.targets_evaluated,
                     mat.guided_closures_succeeded, mat.guided_closures_failed);
     } catch (const std::exception& error) {
         result.hit    = true;
@@ -141,7 +150,8 @@ struct CaseResult {
 }
 
 EngineOptions options_for(const std::filesystem::path& artifact, std::uint32_t host_state,
-                          std::uint32_t kv_tokens) {
+                          std::uint32_t kv_tokens, std::uint32_t fair_share_buckets,
+                          std::uint32_t host_kv_mib, std::uint32_t max_private) {
     EngineOptions options;
     options.artifact_path       = artifact;
     options.max_context         = 16384;
@@ -153,11 +163,17 @@ EngineOptions options_for(const std::filesystem::path& artifact, std::uint32_t h
     // Host KV must be large enough for a demote to FIT: with a128 MiB pool the projection reports
     // blocked_host=~660 MiB on every candidate, the planner never selects a non-evict KV option,
     // and the prepare path that throws is simply never entered (production runs32 GiB with
-    // blocked_host=0). 4 GiB keeps the host axis open while staying far below production's pin.
-    options.context_cache.host_kv_capacity_bytes         = 4ull << 30;
-    options.context_cache.max_private_continuations      = 8;
+    // blocked_host=0). 4 GiB keeps the host axis open while staying far below production's pin,
+    // but it is exactly the size of the device KV pool, so a case that fills the device also fills
+    // the host arena; `fresh-dev-roomy` raises it so the host axis is never the binding one.
+    options.context_cache.host_kv_capacity_bytes         = std::uint64_t{host_kv_mib} << 20U;
+    options.context_cache.max_private_continuations      = max_private;
     options.context_cache.max_shared_prefixes            = 4;
     options.context_cache.max_long_anchors_per_continuation = 16;
+    // 0 disables fair-share protection, which removes protected sessions from the pressure-owner
+    // domain entirely (they can be neither evicted nor spilled). Used to A/B whether that
+    // exclusion is what starves the spill path.
+    options.context_cache.fair_share_buckets = fair_share_buckets;
     return options;
 }
 
@@ -258,6 +274,26 @@ CaseResult case_tiny_overlap(Engine& engine) {
                32, "BIG-ROOT");
 }
 
+// THE FAULT SHAPE (from production 2026-09-25): several brand-new, zero-reuse large prompts
+// arrive in parallel while the old sessions still hold cached state. Each fresh prompt needs its
+// whole KV on Device at once (cache 0% - nothing to borrow) and its own pages are being written,
+// so they cannot be spilled; the only spillable pages left are the old sessions' leftovers. When
+// the planner cannot cover the gap by spilling, it evicts whole old sessions - and their Host
+// cache goes with them, which nobody then uses (production:162 slots +3.68 GiB freed,0 used).
+//
+// A pass means: no planner-driven eviction while Host KV still had room.
+CaseResult case_parallel_fresh_roots(Engine& engine) {
+    saturate(engine, "fill");  // old sessions now hold Device + Host cache
+    std::vector<std::vector<ChatMessage>> requests;
+    for (int index = 0; index < 3; ++index) {
+        // Unique body per request: zero reuse, exactly like production's req#292.
+        requests.push_back({msg(ChatRole::System, "fresh root " + std::to_string(index) + " " +
+                                                      repeat("divergent token ", 2600)),
+                            msg(ChatRole::User, "begin " + std::to_string(index))});
+    }
+    return run_concurrent(engine, std::move(requests), 64, "FRESH");
+}
+
 CaseResult case_fill_big(Engine& engine) {
     saturate(engine, "fill");
     return run(engine, {msg(ChatRole::System, kRoot), msg(ChatRole::User, "begin")}, 32,
@@ -331,20 +367,55 @@ struct CaseEntry {
     // fill actually overflows the device pool; the default 32768 leaves the other cases the
     // headroom they were sized against.
     std::uint32_t kv_tokens;
+    // Fair-share buckets: the number of recently active sessions protected from the pressure
+    // domain (0 = no protection, every retained session may be spilled).
+    std::uint32_t fair_share_buckets;
+    // Host KV arena in MiB. 4096 equals the tight device pool, so the host axis saturates as soon
+    // as the device does; a roomy value makes the host axis provably non-binding, which is the
+    // condition under which deleting cached sessions is never justified.
+    std::uint32_t host_kv_mib;
+    // Private catalog capacity (== Engine `max_private_continuations`). Production runs512 against
+    //320 host slots, so the catalog can only fill when the host pool already has; the micro default
+    // of8 against32 host slots inverts that and makes a publication slot, not memory, the binding
+    // resource. `fresh-prod-shape` restores production's ratio.
+    std::uint32_t max_private;
+    // Upper bound on the sessions the selected plans of this case may destroy (-1 = unconstrained).
+    // Only a case whose memory and catalog axes are all provably roomy can state it: there the
+    // whole device deficit is payable by spilling, so any eviction is the regression under test.
+    std::int64_t eviction_budget;
     CaseResult (*body)(Engine&);
 };
 
 const CaseEntry kCases[] = {
-    {"tiny-overlap", 4, 16384, case_tiny_overlap},
-    {"clone-overlap", 4, 16384, case_clone_overlap},
-    {"shared-overlap", 4, 16384, case_shared_overlap},
-    {"decode-vs-plan", 4, 32768, case_decode_vs_plan},
-    {"fill-big", 4, 32768, case_fill_big},
-    {"twins", 4, 32768, case_twins},
-    {"same-session-race", 4, 32768, case_same_session_race},
-    {"dense-drops", 4, 32768, case_dense_drops},
-    {"spill-race", 4, 32768, case_spill_race},
-    {"host-full", 2, 32768, case_host_full},
+    {"parallel-fresh", 4, 32768, 8, 4096, 8, -1, case_parallel_fresh_roots},
+    // Same shape with the Host slot pool deliberately ROOMY (32) and Device KV tight (16384):
+    // now the only scarce resource is Device KV, which is production's situation. If the planner
+    // still evicts whole sessions here, the fault is reproduced - Host cache dies while Host had
+    // room for it. The 4 GiB host arena equals the device pool, so the host axis does saturate and
+    // an eviction there is policy-legal; `fresh-dev-roomy` removes that ambiguity.
+    {"fresh-dev-tight", 32, 16384, 8, 4096, 8, -1, case_parallel_fresh_roots},
+    // The same body with BOTH memory axes provably roomy (host state32, host KV16 GiB against a
+    //4 GiB device pool). Nothing but Device KV is scarce, so spilling is always sufficient in
+    // principle; any planner eviction here is the defect under test.
+    {"fresh-dev-roomy", 32, 16384, 8, 16384, 8, -1, case_parallel_fresh_roots},
+    // production's ratios: host KV16 GiB, host state32, catalog51 (> host state, as512 > 320).
+    // No axis except Device KV can be the reason to delete, so a zero-eviction spill plan exists
+    // and the case asserts on it: this is the regression guard for "spill first, delete nothing
+    // while memory has room".
+    {"fresh-prod-shape", 32, 16384, 8, 16384, 51, 0, case_parallel_fresh_roots},
+    {"tiny-overlap", 4, 16384, 8, 4096, 8, -1, case_tiny_overlap},
+    {"clone-overlap", 4, 16384, 8, 4096, 8, -1, case_clone_overlap},
+    {"shared-overlap", 4, 16384, 8, 4096, 8, -1, case_shared_overlap},
+    {"decode-vs-plan", 4, 32768, 8, 4096, 8, -1, case_decode_vs_plan},
+    {"fill-big", 4, 32768, 8, 4096, 8, -1, case_fill_big},
+    {"twins", 4, 32768, 8, 4096, 8, -1, case_twins},
+    {"same-session-race", 4, 32768, 8, 4096, 8, -1, case_same_session_race},
+    {"dense-drops", 4, 32768, 8, 4096, 8, -1, case_dense_drops},
+    // Same body with fair-share protection off: if the spill then suffices, the protected-owner
+    // exclusion (not the spill rule) was starving the plan.
+    {"dense-drops-np", 4, 32768, 0, 4096, 8, -1, case_dense_drops},
+    {"spill-race", 4, 32768, 8, 4096, 8, -1, case_spill_race},
+    {"host-full", 2, 32768, 8, 4096, 8, -1, case_host_full},
 };
 
 }  // namespace
@@ -375,14 +446,29 @@ int main(int argc, char** argv) {
         ran = true;
         std::printf("== case %s (host_state=%u) ==\n", entry.name, entry.host_state);
         std::fflush(stdout);
-        Engine engine(options_for(artifact, entry.host_state, entry.kv_tokens));
+        Engine engine(options_for(artifact, entry.host_state, entry.kv_tokens,
+                                entry.fair_share_buckets, entry.host_kv_mib, entry.max_private));
+        g_selected_evictions.store(0, std::memory_order_relaxed);
         CaseResult result = entry.body(engine);
         if (result.hit) {
             std::printf("CASE %s HIT: %s\n", entry.name, result.detail.c_str());
             std::fflush(stdout);
             return 1;
         }
-        std::printf("CASE %s clean\n", entry.name);
+        const std::uint64_t evicted =
+            g_selected_evictions.load(std::memory_order_relaxed);
+        if (entry.eviction_budget >= 0 &&
+            evicted > static_cast<std::uint64_t>(entry.eviction_budget)) {
+            std::printf("CASE %s HIT: selected plans destroyed %llu session(s), budget %lld "
+                        "(every memory and catalog axis in this case has room, so the whole "
+                        "device deficit is payable by spilling)\n",
+                        entry.name, static_cast<unsigned long long>(evicted),
+                        static_cast<long long>(entry.eviction_budget));
+            std::fflush(stdout);
+            return 1;
+        }
+        std::printf("CASE %s clean (selected evictions=%llu)\n", entry.name,
+                    static_cast<unsigned long long>(evicted));
         std::fflush(stdout);
     }
     if (!ran) {

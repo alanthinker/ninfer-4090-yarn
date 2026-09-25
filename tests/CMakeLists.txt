@@ -429,3 +429,14 @@ target_link_libraries(ninfer_pressure_joint_settle_test PRIVATE ninfer_engine)
 # case name; registered as a test only once it reproduces the bug.
 add_executable(ninfer_pressure_prepare_cases_test test_pressure_prepare_cases.cpp)
 target_link_libraries(ninfer_pressure_prepare_cases_test PRIVATE ninfer_engine)
+
+# Device-to-Host spill rule driven from synthetic page states: no artifact, no service, ms per
+# case. Answers "which condition blocks a spill" (pinned / active / protected / short) directly.
+ninfer_add_test(ninfer_spill_selection_test
+  SOURCES test_spill_selection.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_spill_selection_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/impl
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+set_tests_properties(ninfer_spill_selection_test PROPERTIES SKIP_RETURN_CODE 77)

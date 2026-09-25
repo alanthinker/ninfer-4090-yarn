@@ -811,6 +811,12 @@ struct MaterializationDiagnostics {
     bool budget_exhausted                    = false;
     std::uint32_t selected_degradation_units = 0;
     bool selected_capped_fallback           = false;
+    // How much cache the SELECTED plan destroys: whole sessions dropped and checkpoints dropped.
+    // The retention contract is "spill first, delete only what memory cannot absorb, and delete
+    // the minimum", so this is the pair an operator reads to see whether a request paid for its
+    // device capacity with other sessions' cache. Both are plan-time counts, not executed counts.
+    std::uint32_t selected_owner_evictions  = 0;
+    std::uint32_t selected_checkpoint_drops = 0;
     // Capacity misses spent after admission: the sealed plan asked for state or KV the pools could
     // not produce, so the materialization was rolled back and the request re-planned (typically from
     // root). A request-log line showing a root prefill with a nonzero count here is a degradation,

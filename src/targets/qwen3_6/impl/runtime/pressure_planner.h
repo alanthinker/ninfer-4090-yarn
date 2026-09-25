@@ -967,10 +967,26 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::retention_infeasible(
         total_backend  = std::min<std::uint32_t>(
             std::numeric_limits<std::uint32_t>::max(), total_backend + best_backend);
     }
-    return residual.device.active_lanes > total_lanes ||
-           residual.device.state_slots > total_state ||
-           residual.device.main_kv_pages > total_main ||
-           residual.device.backend_kv_pages > total_backend;
+    const bool infeasible = residual.device.active_lanes > total_lanes ||
+                            residual.device.state_slots > total_state ||
+                            residual.device.main_kv_pages > total_main ||
+                            residual.device.backend_kv_pages > total_backend;
+    // This verdict is what lets the planner accept an evicting seed instead of searching for a
+    // spilling one (materialization_planner.h retention_infeasible branch). Both sides of the
+    // comparison have to be visible: "max_relievable >= residual" means spilling every owner to
+    // its limit would have covered the gap, so the eviction came from the search, not from
+    // physics (2026-09-25: production deleted38 sessions while Host KV had22 GiB free).
+    if (const char* diag = std::getenv("NINFER_REUSE_DIAG"); diag == nullptr || *diag != '0') {
+        std::fprintf(stderr,
+                     "[retention] infeasible=%d victims=%zu | residual main=%u backend=%u"
+                     " lanes=%u state=%u | max_relievable main=%u backend=%u lanes=%u state=%u\n",
+                     infeasible ? 1 : 0, options.victims.size(), residual.device.main_kv_pages,
+                     residual.device.backend_kv_pages, residual.device.active_lanes,
+                     residual.device.state_slots, total_main, total_backend, total_lanes,
+                     total_state);
+        std::fflush(stderr);
+    }
+    return infeasible;
 }
 
 inline runtime::PressureTargetGuidance

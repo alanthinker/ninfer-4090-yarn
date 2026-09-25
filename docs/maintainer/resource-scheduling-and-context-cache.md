@@ -858,6 +858,18 @@ Materialization 与 shared capture 使用两个 typed entrypoint。Materializati
 evaluator。不存在另一套 source/victim eligibility 规则，也不存在 synthetic capture
 `AdmissionCandidate` 跨越 common planner 边界。
 
+**"最佳已验证 incumbent"按保留优先的字典序判定，时间排在保留之后（2026-09-25 修订）。** 排序键依次是：
+驱逐的 owner 数 → 丢弃的 checkpoint 数 → 折算时间 → 受影响的已选命中 → 命中 epoch → 拷贝数与传输字节 →
+剩余 prefill。含义是"能落内存就落内存；确需删除时先少删会话、再少丢 checkpoint，最后才比时间"：一个只搬
+不删的方案永远排在任何会删的方案之前，哪怕它更慢；删除更少的方案永远排在删除更多的方案之前。时间只在
+同一保留档位内部决定胜负。此前时间是首键，于是清空若干会话的方案可以靠纳秒击败一个只做搬迁的方案，与
+该契约相反。
+
+相应地 destructive fallback **每次只加一个 owner**（按价值序）：第一个物理可行且拿得到 publication slot
+的数量就是驱逐数量。`root_capped_target` 不看缺口、按 cap 原样指派受害者，所以任何大于 1 的步长都会删掉
+没人需要的 owner——按 8 的倍数增长时，2026-09-25 生产日志 113 次进入、39 次成种，成种全部落在倍数边界上
+（cap=8 x22、16 x6、32 x8、40 x1），唯一被选中的那次按边界删了 40 个会话。步长为 1 后"驱逐数 == 缺口"。
+
 **搜索的工作量同时受"时间预算"和"收益预算"约束（2026-09-21 补充）。** 除墙钟预算外，可评估的
 target 数还按"有风险的收益"折算：一次精确评估约 1 ms，一个整体重放只值几百毫秒的请求不该为此
 评估数千个方案（生产实例：一条已命中 89% 前缀的消息在池子近满时耗掉 5.36 s/3,968 个 target，

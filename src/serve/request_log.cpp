@@ -345,6 +345,8 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"budget_exhausted", diagnostics.budget_exhausted},
         {"selected_degradation_units", diagnostics.selected_degradation_units},
         {"selected_capped_fallback", diagnostics.selected_capped_fallback},
+        {"selected_owner_evictions", diagnostics.selected_owner_evictions},
+        {"selected_checkpoint_drops", diagnostics.selected_checkpoint_drops},
         {"best_reuse_prompt_tokens", diagnostics.best_reuse_prompt_tokens},
         // Search shape: see MaterializationDiagnostics. One expansion that fans out to the whole
         // target budget is otherwise indistinguishable from a genuinely exhausted space.
