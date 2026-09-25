@@ -42,7 +42,12 @@ export AGENT_DEV_SLOTS="${AGENT_DEV_SLOTS:-4}"
 export AGENT_HOST_SLOTS="${AGENT_HOST_SLOTS:-48}"
 export AGENT_HOST_KV_MIB="${AGENT_HOST_KV_MIB:-512}"
 export AGENT_MAX_CTX="${AGENT_MAX_CTX:-32768}" AGENT_KV_CAPACITY="${AGENT_KV_CAPACITY:-65536}"
-export AGENT_PRIVATE="${AGENT_PRIVATE:-16}" AGENT_FAIR_BUCKETS="${AGENT_FAIR_BUCKETS:-4}"
+# Catalog: production is 512 over 320 host state slots (1.6x) and never binds - observed peak
+# 66/512 - so a catalog that fills is a limit production does not run. The rig's host ceiling is
+# 48, so the catalog has to sit clear above it: at 16 it filled while host state was still 45/48,
+# every capacity axis then reported zero residual, and the request died with a thrown
+# `isolated-feasible ... idle Engine` instead of a plan (2026-09-26 battery req#74).
+export AGENT_PRIVATE="${AGENT_PRIVATE:-128}" AGENT_FAIR_BUCKETS="${AGENT_FAIR_BUCKETS:-4}"
 export AGENT_FIRST_SPACING="${AGENT_FIRST_SPACING:-256}" AGENT_ANCHOR_SPACING="${AGENT_ANCHOR_SPACING:-256}"
 export AGENT_AUTO_ANCHORS="${AGENT_AUTO_ANCHORS:-8}" AGENT_MAX_ANCHORS="${AGENT_MAX_ANCHORS:-8}"
 export AGENT_SHARED_PREFIXES="${AGENT_SHARED_PREFIXES:-4}"

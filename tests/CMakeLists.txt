@@ -6,6 +6,13 @@ add_executable(ninfer_public_api_test test_public_api.cpp)
 target_include_directories(ninfer_public_api_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
 
+# Two-tier cache policy (docs/maintainer/缓存模块v2.md): a pure decision function over a snapshot,
+# so the target deliberately takes no CUDA or engine library - the retention rules must be
+# verifiable without a GPU, an artifact, or a service.
+add_executable(ninfer_cache_tier_policy_test test_cache_tier_policy.cpp)
+target_include_directories(ninfer_cache_tier_policy_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME ninfer_cache_tier_policy_test COMMAND ninfer_cache_tier_policy_test)
+
 function(ninfer_add_test name)
   cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES" ${ARGN})
   add_executable(${name} ${arg_SOURCES})
@@ -26,6 +33,8 @@ function(ninfer_add_test name)
       NINFER_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}")
   endif()
   add_test(NAME ${name} COMMAND ${name})
+  # Collected so the whole directory can be given one GPU lock at the end of this file.
+  set_property(GLOBAL APPEND PROPERTY NINFER_TESTS ${name})
 endfunction()
 
 function(ninfer_add_op_test name)
@@ -417,12 +426,6 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
 endforeach()
 
 
-# In-process joint-settle pressure driver (reproduced-bug tooling): tiny context-cache pools
-# saturate in seconds and the reason tags on every structural exit name the failing site.
-# Run manually with an artifact path; registered as a test only once it reproduces the bug.
-add_executable(ninfer_pressure_joint_settle_test test_pressure_joint_settle.cpp)
-target_link_libraries(ninfer_pressure_joint_settle_test PRIVATE ninfer_engine)
-
 # Per-shape reproduction of `pressure KV replica changed before transfer`: one case per process
 # because that throw latches the engine (fail_all_locked -> 503 until restart), so a hit would
 # otherwise kill every later case in the same process. Run manually with an artifact path and a
@@ -440,3 +443,28 @@ target_include_directories(ninfer_spill_selection_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 set_tests_properties(ninfer_spill_selection_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# GPU tests take one shared resource lock, so exactly one of them runs at a time.
+#
+# Several of these allocate device memory and run kernels, and running them together makes an
+# asynchronous copy finish into an untouched buffer instead of its destination: with `-j`,
+# ninfer_state_store_test failed 2 times in 12 runs with
+#   copied conv slot expected byte 0x6b, got 0x0
+# while the same set passed 12/12 serially and the test alone passed 30/30. The CUDA calls are
+# CUDA_CHECKed, so the failure is not a reported error - it is a result that never arrived under
+# contention. A flaky suite cannot support the "no regression" acceptance criterion, so the GPU
+# half is serialized (a full serial ctest is 119 s); the hand-registered CPU-only tests below are
+# left out of the lock and keep their parallelism.
+get_property(_ninfer_tests GLOBAL PROPERTY NINFER_TESTS)
+if(_ninfer_tests)
+  list(REMOVE_ITEM _ninfer_tests ninfer_public_api_test ninfer_cache_tier_policy_test)
+  set_tests_properties(${_ninfer_tests} PROPERTIES RESOURCE_LOCK ninfer_gpu)
+endif()
+# Registered outside the helpers above, but they run the same GPU binaries.
+foreach(_ninfer_gpu_only IN ITEMS
+        ninfer_softmax_attention_nvfp4_test
+        ninfer_softmax_attention_k8v4_test
+        ninfer_kv_cache_append_nvfp4_test
+        ninfer_kv_cache_append_k8v4_test)
+  set_tests_properties(${_ninfer_gpu_only} PROPERTIES RESOURCE_LOCK ninfer_gpu)
+endforeach()

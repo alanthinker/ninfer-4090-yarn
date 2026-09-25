@@ -579,18 +579,9 @@ public:
 
     [[nodiscard]] PressureTargetHandle
     identity_target(runtime::PlanningCandidateId candidate) const;
-    [[nodiscard]] PressureTargetHandle
-    root_capped_target(runtime::PlanningCandidateId root_candidate,
-                        std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
-                        std::uint32_t max_evictions);
-    [[nodiscard]] std::optional<PressureTargetHandle>
-    guided_closure_target(runtime::PlanningCandidateId candidate,
-                          std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
-                          std::uint32_t minimum_evictions = 0);
-    // True when no retention-only pressure plan can satisfy this candidate's device shortfall
-    // (see detail::PressurePlanningSessionImpl::retention_infeasible for the certificate and
-    // its shared-page caveat).  Lets the planner accept an evicting seed without the full search.
-    bool retention_infeasible(runtime::PlanningCandidateId candidate);
+    [[nodiscard]] std::optional<PressureTargetHandle> tier_policy_target(
+        runtime::PlanningCandidateId root_candidate,
+        std::span<const runtime::OwnerImportance> owner_values);
     [[nodiscard]] runtime::PressureTargetGuidance guidance(PressureTargetHandle target);
     [[nodiscard]] AssessedPressureTarget<Variant> assess(PressureTargetHandle target);
     [[nodiscard]] PreparedPressureExpansion<Variant> prepare_expansion(PressureTargetHandle parent);

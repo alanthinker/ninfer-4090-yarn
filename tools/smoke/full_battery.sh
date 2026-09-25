@@ -153,7 +153,22 @@ step() {
     printf '%-24s rc=%-4s %4ss new_err=%-3s health=%s\n' \
         "$name" "$rc" "$((end - start))" "$errs" "$health"
     if [ "${errs:-0}" != "0" ]; then
-        tail -n +"$((before + 1))" "$S" | grep -E "$ERR_PAT" | head -3 | sed 's/^/    /'
+        local newlines
+        newlines=$(tail -n +"$((before + 1))" "$S" 2>/dev/null)
+        printf '%s\n' "$newlines" | grep -E "$ERR_PAT" | head -5 | sed 's/^/    /'
+        # Fail fast on an ENGINE failure. Once the engine has thrown, it stays latched until a
+        # restart, so every later step only measures a dead service: the run takes fifteen more
+        # minutes, accumulates a hundred identical 503s, and buries the one line that matters.
+        # An ordinary assertion failure (rc!=0 with no engine error) still runs to the end,
+        # because the rest of the suite is still meaningful.
+        if printf '%s\n' "$newlines" | grep -qE "$ERR_PAT"; then
+            printf '%-24s ENGINE FAILED - aborting here\n' "$name"
+            echo "    service log : $S"
+            echo "    step output : /tmp/fb_$name.out"
+            echo "    (every step after this would only measure a dead engine)"
+            FAILED_STEPS=$((FAILED_STEPS + 1))
+            exit 1
+        fi
     fi
     # A suite's own verdict must reach this battery's exit status: a step that printed FAIL and
     # returned 0 (verify_eviction_fix did exactly that until 2026-09-23) showed rc=0 here and the
@@ -195,6 +210,15 @@ echo "== phase 1a: base fill (big sessions; fill_anchors early-stops if the wind
 timeout 2400 python3 tools/smoke/fill_anchors.py "$PORT" "$FILL_CAP" "$TOTAL" |
     tee /tmp/fb_fill.out
 echo "(base fill ended rc=$?; top-up below carries the gate)"
+# Same rule for the fill: a500 here means the engine is already latched, and the top-up gate
+# would then spend its whole budget proving that a dead engine cannot fill the pool.
+if grep -qE "FAIL|Error" /tmp/fb_fill.out ||
+   ! curl -sf -m 3 "http://127.0.0.1:$PORT/health" >/dev/null; then
+    echo "FAIL: the base fill itself failed - stopping before the top-up measures a dead engine"
+    grep -E "FAIL|Error" /tmp/fb_fill.out | head -3 | sed 's/^/    /'
+    echo "    service log: $S"
+    exit 1
+fi
 
 echo "== phase 1b: top-up small sessions - stop at the FIRST record proving FULL =="
 {
@@ -232,8 +256,9 @@ def send(i):
     # A top-up session MUST be multi-message: the frontend only places long anchors when
     # message_count > 1 (single-message sessions came out as "anchors=0 endpoint=1", and a
     # catalog swap of anchor-less sessions has net-zero states, freezing the peak at44).
-    # Three messages at auto-spacing256 yield ~3-4 anchors + endpoint per session, so even
-    # when catalog=16/16 forces oldest-out swaps, new(4 states) > evicted(1) and the peak climbs.
+    # Three messages at auto-spacing256 yield ~3-4 anchors + endpoint per session, so even when
+    # the host state pool forces oldest-out swaps, new(4 states) > evicted(1) and the peak climbs.
+    # (The catalog is 128 here and never binds; the pool that swaps is host state, 48.)
     shared = "retention filler token "
     messages = [
         {"role": "user", "content": f"topup-{int(time.time())}-{i} " + shared * 300},
@@ -292,10 +317,11 @@ fi
 
 echo "== phase 3: pressure/eviction-sensitive tests (pool is FULL) =="
 # state_index FIRST: its invariant is idle-retention (build, wait5s, switch back hits), and its
-# conversations must PUBLISH checkpoints to exist at all. At gate time the catalog still holds
-# only the fill's sessions (room to publish; the pool is full either way); run it after the other
-# suites and the catalog is already16/16 with [exhaust] drop churn, so fresh checkpoints miss
-# publication and the all-hit expectation measures someone else's catalog pressure instead.
+# conversations must PUBLISH checkpoints to exist at all. At gate time the host state pool still
+# holds only the fill's sessions (room to publish; the pool is full either way); run it after the
+# other suites and the pool is already at its ceiling with [exhaust] drop churn, so fresh
+# checkpoints miss publication and the all-hit expectation measures someone else's pool pressure.
+# (The catalog is 128 and never binds - it was 16 when this ordering was written.)
 # conversations=verify=4 keeps every conversation inside the4 fair-share buckets (and avoids
 # the prompts[verify>conversations] IndexError the old defaults hit).
 step state_index      300 python3 tools/smoke/test_state_index_short.py \

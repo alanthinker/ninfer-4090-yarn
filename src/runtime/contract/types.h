@@ -440,6 +440,20 @@ struct PlanningOwnerId {
                                                    PlanningOwnerId) noexcept = default;
 };
 
+// How much a cached conversation is worth, in the one currency the cache rules use.
+//
+// The planner computes this and reports it; it does not hand over an ordering, so it no longer
+// names which conversation disappears first (docs/maintainer/缓存模块v2.md §6.2). Ranking happens
+// once, in the two-tier policy, on `value` alone.
+//
+// `value == UINT64_MAX` means protected: take this one last, while anything else remains.
+// Protection is a magnitude, not a separate rule (§2.2), so a protected owner needs no branch of
+// its own anywhere downstream.
+struct OwnerImportance {
+    PlanningOwnerId owner;
+    std::uint64_t value = 0;
+};
+
 struct PlanningCandidateId {
     std::uint32_t value = std::numeric_limits<std::uint32_t>::max();
 

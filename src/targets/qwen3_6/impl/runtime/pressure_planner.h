@@ -1,11 +1,14 @@
 #pragma once
 
+#include "runtime/cache/cache_tier_policy.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 
 #include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <span>
+#include <optional>
 #include <tuple>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
@@ -638,355 +641,266 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::pressure_successors(
     return successors;
 }
 
-inline qwen3_6::PressureTargetHandle
-PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::root_capped_target(
+
+inline std::optional<qwen3_6::PressureTargetHandle>
+PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
     runtime::PlanningCandidateId root_candidate,
-    std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
-    std::uint32_t max_evictions) {
-    if (scratch_live) { throw std::logic_error("pressure expansion scratch is still live"); }
+    std::span<const runtime::OwnerImportance> owner_values) {
+    namespace cachep = ::ninfer::runtime::cache;
+    // The controller pass runs only after the ordinary search has already given up, so every way
+    // this can decline is a dead end the request reports as "no plan". Print them: a silent
+    // nullopt here is indistinguishable from a policy that answered with an empty plan.
+    if (scratch_live) {
+        std::fprintf(stderr, "[cache] policy declined reason=scratch_live\n");
+        return std::nullopt;
+    }
     const std::uint32_t selected_candidate = candidate_index(root_candidate);
     populate_options(selected_candidate);
     choice_scratch.assign(candidate_options[selected_candidate].victims.size(), 0);
-    // Capped destructive batch: evict at most max_evictions owners, cheapest first (the same
-    // preferred/value order the guided closure uses). The planner grows this cap in batches of
-    // eight until the plan fits; there is no evict-everything target (policy2026-09-24: the old
-    // root_capped fallback wiped56 owners for one request while host_state sat at184/320).
-    const CandidateOptions& options = candidate_options[selected_candidate];
-    std::vector<std::size_t> victim_order;
-    victim_order.reserve(options.victims.size());
-    const auto append_victim = [&](std::size_t victim_index) {
-        if (std::find(victim_order.begin(), victim_order.end(), victim_index) ==
-            victim_order.end()) {
-            victim_order.push_back(victim_index);
-        }
+    CandidateOptions& options = candidate_options[selected_candidate];
+    const CandidateState& candidate_state = *candidates[selected_candidate].state;
+    const std::optional<typename Core::MaterializationSourceProtection> protection =
+        program->materialization_source_protection(candidate_state);
+    if (!protection) {
+        std::fprintf(stderr, "[cache] policy declined reason=no_source_protection\n");
+        return std::nullopt;
+    }
+
+    const detail::PhysicalResources residual =
+        program->guided_materialization_deficit(candidate_state, detail::PhysicalDelta{});
+    if (residual == detail::PhysicalResources{}) {
+        // Nothing is short, so the block is on an axis this policy does not own. Report the
+        // whole residual with occupancy and capacity in the same numbers the feasibility lines
+        // print, because "why did nothing happen" has to be answerable from this line alone.
+        const detail::PhysicalResources occupancy = program->physical_occupancy();
+        const detail::PhysicalResources capacity  = program->admission_capacity();
+        std::fprintf(stderr,
+                     "[cache] policy declined reason=no_residual | device.state %u+%u/%u"
+                     " device.kv %u+%u/%u | host.state %u+%u/%u host.kv %zu+%zu/%zu\n",
+                     occupancy.device.state_slots, residual.device.state_slots,
+                     capacity.device.state_slots,
+                     occupancy.device.main_kv_pages + occupancy.device.backend_kv_pages,
+                     residual.device.main_kv_pages + residual.device.backend_kv_pages,
+                     capacity.device.main_kv_pages + capacity.device.backend_kv_pages,
+                     occupancy.host.state_slots, residual.host.state_slots,
+                     capacity.host.state_slots, occupancy.host.kv_bytes, residual.host.kv_bytes,
+                     capacity.host.kv_bytes);
+        return std::nullopt;
+    }
+
+    // Four pools, four units, and no conversion between them anywhere except where a spill
+    // actually lands (see the demand below). Device KV stays in PAGES because that is what
+    // `claim main=` and the feasibility gate report; Host KV stays in BYTES because that is what
+    // the arena reports; state stays in SLOTS on both sides, because one image is one slot.
+    //
+    // Folding any pair of them into one number is what made the policy go blind: with Device and
+    // Host state reported through the KV axes, `host.state 48/48` and `device.state 8/8` were
+    // both full while this printed `gap dev=0 host=0` and the controller had nothing to move.
+    // §R2 of 缓存模块v2.md: the two pools each report their own fullness; only WHO moves or dies
+    // is decided by one ranking.
+    const std::uint64_t page_bytes  = program->text_host_kv_page_stride;
+    const std::uint64_t image_bytes =
+        program->state_images ? program->state_images->host_layout().image_bytes : 0;
+    const auto device_kv = [&](const detail::PhysicalResources& r) -> std::uint64_t {
+        return static_cast<std::uint64_t>(r.device.main_kv_pages + r.device.backend_kv_pages);
     };
-    for (const runtime::PlanningOwnerId id : preferred_owner_ids) {
-        const auto found =
-            std::find_if(options.victims.begin(), options.victims.end(), [&](const auto& victim) {
-                return victim.owner_index < owners.size() && owners[victim.owner_index].id == id;
-            });
-        if (found != options.victims.end()) {
-            append_victim(static_cast<std::size_t>(found - options.victims.begin()));
+    const auto device_state = [&](const detail::PhysicalResources& r) -> std::uint64_t {
+        return static_cast<std::uint64_t>(r.device.state_slots);
+    };
+    const auto host_kv = [&](const detail::PhysicalResources& r) -> std::uint64_t {
+        return r.host.kv_bytes;
+    };
+    const auto host_state = [&](const detail::PhysicalResources& r) -> std::uint64_t {
+        return static_cast<std::uint64_t>(r.host.state_slots);
+    };
+
+    // §6.2: the planner reports a VALUE per owner, not an ordering, so it never names a victim.
+    // Ranking happens in `cachep::plan` (ascending importance, then id) - one place, one rule.
+    // An owner the planner did not price is worth the maximum here, i.e. taken last, which is
+    // what the old "append the unpriced owners after the priced ones" ordering did; when nothing
+    // was priced at all every entry ties and the id tie-break reproduces that order exactly.
+    std::vector<std::uint64_t> importance_by_victim(options.victims.size(),
+                                                    std::numeric_limits<std::uint64_t>::max());
+    for (std::size_t victim_index = 0; victim_index < options.victims.size(); ++victim_index) {
+        const CandidateVictimOptions& victim = options.victims[victim_index];
+        if (victim.owner_index >= owners.size()) { continue; }
+        const runtime::PlanningOwnerId id = owners[victim.owner_index].id;
+        const auto found = std::find_if(
+            owner_values.begin(), owner_values.end(),
+            [&](const runtime::OwnerImportance& entry) { return entry.owner == id; });
+        if (found != owner_values.end()) { importance_by_victim[victim_index] = found->value; }
+    }
+    // Every victim falling back to the maximum means the value list does not reach this pool, and
+    // the ranking silently degrades to id order - the one thing §2.2 forbids.
+    std::size_t unpriced = 0;
+    for (const std::uint64_t value : importance_by_victim) {
+        if (value == std::numeric_limits<std::uint64_t>::max()) { ++unpriced; }
+    }
+    if (unpriced != 0) {
+        std::fprintf(stderr, "[cache] importance unpriced %zu/%zu owner_values=%zu\n", unpriced,
+                     importance_by_victim.size(), owner_values.size());
+    }
+
+    const detail::PhysicalResources occupancy  = program->physical_occupancy();
+    const detail::PhysicalResources capacity   = program->admission_capacity();
+    const cachep::TierOccupancy tiers{
+        .device_kv_used        = device_kv(occupancy),
+        .device_kv_capacity    = device_kv(capacity),
+        .device_state_used     = device_state(occupancy),
+        .device_state_capacity = device_state(capacity),
+        .host_kv_used          = host_kv(occupancy),
+        .host_kv_capacity      = host_kv(capacity),
+        .host_state_used       = host_state(occupancy),
+        .host_state_capacity   = host_state(capacity),
+    };
+    // The demand carries its own Host reservation: whatever moves off Device lands on Host, so the
+    // policy needs no conversion of its own. KV meets its Host landing unit here - one logical page
+    // is one Host page, so the stride is exact - and state is one slot on either side.
+    const cachep::Demand demand{
+        .device_kv    = device_kv(residual),
+        .device_state = device_state(residual),
+        .host_kv      = host_kv(residual) + device_kv(residual) * page_bytes,
+        .host_state   = host_state(residual) + device_state(residual),
+    };
+
+    // For every victim, ask what MOVING it can actually hand back to Device. This is NOT the same
+    // number as what tearing it down would free: a conversation's live pages may already be on
+    // Host, and its moving options only cover what is still Device-resident. Using the teardown
+    // footprint here made the policy promise 410 MB of relief that the composed target then could
+    // not deliver (proj_removed main=0), so the request stayed blocked.
+    struct MoveOption {
+        std::uint16_t choice       = 0;
+        std::uint64_t device_kv    = 0;  // relief per pool: pages ...
+        std::uint64_t device_state = 0;  // ... and state slots
+    };
+    std::vector<MoveOption> move_options(options.victims.size());
+    for (std::size_t victim_index = 0; victim_index < options.victims.size(); ++victim_index) {
+        CandidateVictimOptions& victim = options.victims[victim_index];
+        const std::vector<PressureDecision> successors =
+            pressure_successors(victim, residual, *protection, nullptr);
+        for (const PressureDecision& successor : successors) {
+            if (successor.evicts_continuation) { continue; }
+            const std::uint64_t relief_kv =
+                static_cast<std::uint64_t>(successor.effect.removed.device.main_kv_pages +
+                                           successor.effect.removed.device.backend_kv_pages);
+            const std::uint64_t relief_state =
+                static_cast<std::uint64_t>(successor.effect.removed.device.state_slots);
+            // Choosing between ONE victim's own alternatives is the only place two units meet,
+            // and there only as a preference: bytes weigh pages against slots the way the pools
+            // are actually sized. The relief that gets REPORTED stays per-pool.
+            const MoveOption& current = move_options[victim_index];
+            if (relief_kv * page_bytes + relief_state * image_bytes <=
+                current.device_kv * page_bytes + current.device_state * image_bytes) {
+                continue;
+            }
+            std::size_t index = victim.decisions.size();
+            const auto found =
+                std::find(victim.decisions.begin(), victim.decisions.end(), successor);
+            if (found != victim.decisions.end()) {
+                index = static_cast<std::size_t>(found - victim.decisions.begin());
+            } else {
+                if (victim.decisions.size() >= std::numeric_limits<std::uint16_t>::max()) {
+                    continue;
+                }
+                victim.decisions.push_back(successor);
+                index = victim.decisions.size() - 1U;
+            }
+            MoveOption& chosen       = move_options[victim_index];
+            chosen.choice            = static_cast<std::uint16_t>(index + 1U);
+            chosen.device_kv         = relief_kv;
+            chosen.device_state      = relief_state;
         }
     }
-    for (std::size_t index = 0; index < options.victims.size(); ++index) { append_victim(index); }
-    std::uint32_t evicted = 0;
-    for (const std::size_t victim_index : victim_order) {
-        if (evicted >= max_evictions) { break; }
-        const std::uint16_t eviction_choice = options.victims[victim_index].eviction_choice;
-        if (eviction_choice == 0 || choice_scratch[victim_index] != 0) { continue; }
-        choice_scratch[victim_index] = eviction_choice;
-        ++evicted;
+
+    std::vector<cachep::Datum> pool;
+    pool.reserve(options.victims.size());
+    for (std::size_t victim_index = 0; victim_index < options.victims.size(); ++victim_index) {
+        const CandidateVictimOptions& victim = options.victims[victim_index];
+        const MoveOption& move               = move_options[victim_index];
+        std::uint64_t droppable_kv           = 0;
+        std::uint64_t droppable_state        = 0;
+        if (victim.eviction_choice != 0 && victim.eviction_choice <= victim.decisions.size()) {
+            const detail::PhysicalResources& removed =
+                victim.decisions[victim.eviction_choice - 1U].effect.removed;
+            droppable_kv    = removed.host.kv_bytes;
+            droppable_state = static_cast<std::uint64_t>(removed.host.state_slots);
+        }
+        if (move.device_kv == 0 && move.device_state == 0 && droppable_kv == 0 &&
+            droppable_state == 0) {
+            continue;
+        }
+        pool.push_back(cachep::Datum{
+            .id           = victim_index,
+            .device_kv    = move.device_kv,     // what R1 can take off Device, in pages
+            .device_state = move.device_state,  // ... and the Device state slots it hands back
+            .host_kv      = droppable_kv,       // what R2 would free on Host, in bytes
+            .host_state   = droppable_state,    // ... and the Host state slots it hands back
+            .importance   = importance_by_victim[victim_index],
+            .active       = false,
+        });
     }
-    const std::uint32_t target_index = intern_target(selected_candidate, choice_scratch, true);
-    if (const char* diag = std::getenv("NINFER_REUSE_DIAG");
-        diag == nullptr || *diag != '0') {
-        // Shape of one destructive fallback batch: victims<=max_evictions cheapest owners;
-        // victims=0/all_zero=1 means an empty victim domain. See [fallback] lines in
-        // materialization_planner for why the fallback path was entered at all.
-        const bool all_zero = std::all_of(choice_scratch.begin(), choice_scratch.end(),
-                                          [](std::uint16_t choice) { return choice == 0; });
-        const std::size_t victims = static_cast<std::size_t>(
-            std::count_if(choice_scratch.begin(), choice_scratch.end(),
-                          [](std::uint16_t choice) { return choice != 0; }));
-        std::fprintf(stderr, "[search] root_capped node=%u victims=%zu all_zero=%d cap=%u\n",
-                     target_index, victims, all_zero ? 1 : 0, max_evictions);
+
+    const cachep::Plan plan = cachep::plan(demand, tiers, pool);
+    if (const char* diag = std::getenv("NINFER_REUSE_DIAG"); diag == nullptr || *diag != '0') {
+        std::fprintf(stderr, "%s\n", cachep::describe(plan, demand, tiers).c_str());
+        std::fflush(stderr);
     }
+    if (plan.enqueue) { return std::nullopt; }  // R0: the caller enqueues.
+
+    for (const cachep::Step& step : plan.steps) {
+        if (step.id >= options.victims.size()) { continue; }
+        if (step.action == cachep::Action::DropFromHost) {
+            const CandidateVictimOptions& victim = options.victims[step.id];
+            if (victim.eviction_choice == 0 ||
+                victim.eviction_choice > victim.decisions.size()) {
+                continue;
+            }
+            choice_scratch[step.id] = victim.eviction_choice;
+            continue;
+        }
+        const std::uint16_t choice = move_options[step.id].choice;
+        if (choice != 0 && choice <= options.victims[step.id].decisions.size()) {
+            choice_scratch[step.id] = choice;
+        }
+    }
+
+    const bool any = std::any_of(choice_scratch.begin(), choice_scratch.end(),
+                                 [](std::uint16_t choice) { return choice != 0; });
+    if (!any) { return std::nullopt; }
+    // What the policy asked for, next to what the composed target will actually remove. The two
+    // disagreeing is the "the plan promised relief the target did not deliver" failure, and it is
+    // invisible from either line alone.
+    if (const char* diag = std::getenv("NINFER_REUSE_DIAG"); diag == nullptr || *diag != '0') {
+        for (const cachep::Step& step : plan.steps) {
+            const std::size_t victim_index = static_cast<std::size_t>(step.id);
+            if (victim_index >= options.victims.size()) { continue; }
+            const std::uint16_t choice = choice_scratch[victim_index];
+            const CandidateVictimOptions& victim = options.victims[victim_index];
+            const char* action = step.action == cachep::Action::DropFromHost ? "drop" : "spill";
+            if (choice == 0 || choice > victim.decisions.size()) {
+                std::fprintf(stderr, "[cache]   apply id=%zu action=%s choice=NONE\n", step.id,
+                             action);
+                continue;
+            }
+            const detail::PhysicalResources& removed =
+                victim.decisions[choice - 1U].effect.removed;
+            std::fprintf(stderr,
+                         "[cache]   apply id=%zu action=%s choice=%u removed main=%u st=%u"
+                         " hostkv=%zu hostst=%u\n",
+                         step.id, action, choice,
+                         static_cast<unsigned>(removed.device.main_kv_pages +
+                                               removed.device.backend_kv_pages),
+                         static_cast<unsigned>(removed.device.state_slots), removed.host.kv_bytes,
+                         static_cast<unsigned>(removed.host.state_slots));
+        }
+        std::fflush(stderr);
+    }
+    const std::uint32_t target_index = intern_target(selected_candidate, choice_scratch, false);
     qwen3_6::PressureTargetHandle handle;
     handle.session_    = this;
     handle.generation_ = generation;
     handle.index_      = target_index;
     return handle;
-}
-
-inline std::optional<qwen3_6::PressureTargetHandle>
-PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
-    runtime::PlanningCandidateId admission,
-    std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
-    std::uint32_t minimum_evictions) {
-    if (scratch_live) {
-        throw std::logic_error("guided pressure closure conflicts with expansion scratch");
-    }
-    const std::uint32_t selected_candidate = candidate_index(admission);
-    populate_options(selected_candidate);
-    CandidateOptions& options       = candidate_options[selected_candidate];
-    const CandidateState& candidate = *candidates[selected_candidate].state;
-    const std::optional<typename Core::MaterializationSourceProtection> protection =
-        program->materialization_source_protection(candidate);
-    if (!protection) { return std::nullopt; }
-
-    std::vector<std::size_t> victim_order;
-    victim_order.reserve(options.victims.size());
-    const auto append_victim = [&](std::size_t victim_index) {
-        if (std::find(victim_order.begin(), victim_order.end(), victim_index) ==
-            victim_order.end()) {
-            victim_order.push_back(victim_index);
-        }
-    };
-    for (const runtime::PlanningOwnerId id : preferred_owner_ids) {
-        const auto found =
-            std::find_if(options.victims.begin(), options.victims.end(), [&](const auto& victim) {
-                return victim.owner_index < owners.size() && owners[victim.owner_index].id == id;
-            });
-        if (found != options.victims.end()) {
-            append_victim(static_cast<std::size_t>(found - options.victims.begin()));
-        }
-    }
-    for (std::size_t index = 0; index < options.victims.size(); ++index) { append_victim(index); }
-
-    const auto projected_residual = [&](std::span<const std::uint16_t> target_choices,
-                                        std::optional<std::size_t> override_owner,
-                                        const PressureDecision* override_decision) {
-        detail::PhysicalDelta pressure;
-        for (std::size_t index = 0; index < options.victims.size(); ++index) {
-            const PressureDecision* decision = nullptr;
-            if (override_owner && *override_owner == index) {
-                decision = override_decision;
-            } else {
-                const std::uint16_t choice = target_choices[index];
-                if (choice != 0) {
-                    if (choice > options.victims[index].decisions.size()) {
-                        throw std::logic_error("guided pressure choice is invalid");
-                    }
-                    decision = &options.victims[index].decisions[choice - 1U];
-                }
-            }
-            if (decision == nullptr) { continue; }
-            pressure.added = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
-                pressure.added, decision->effect.added);
-            pressure.removed = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
-                pressure.removed, NINFER_QWEN36_RUNTIME_NS::pressure_explicit_removed(*decision));
-        }
-        detail::PhysicalResources residual =
-            program->guided_materialization_deficit(candidate, pressure);
-        residual.host.kv_bytes =
-            std::max(residual.host.kv_bytes, candidate.blocked_host_allocation_bytes);
-        return residual;
-    };
-    const detail::PhysicalResources capacity = program->admission_capacity();
-    constexpr std::uint64_t kResidualOne     = 1ULL << 20U;
-    const auto normalized                    = [](std::uint64_t value, std::uint64_t limit) {
-        if (value == 0) { return std::uint64_t{0}; }
-        if (limit == 0 || value >= limit) { return kResidualOne; }
-        if (value > std::numeric_limits<std::uint64_t>::max() / kResidualOne) {
-            return kResidualOne;
-        }
-        const std::uint64_t scaled = value * kResidualOne;
-        return std::max<std::uint64_t>(1, scaled / limit + (scaled % limit != 0 ? 1U : 0U));
-    };
-    const auto residual_key = [&](const detail::PhysicalResources& residual) {
-        std::uint32_t constraints = 0;
-        std::uint64_t total       = 0;
-        const auto append         = [&](std::uint64_t value, std::uint64_t limit) {
-            if (value == 0) { return; }
-            ++constraints;
-            NINFER_QWEN36_RUNTIME_NS::planning_saturating_add(total, normalized(value, limit));
-        };
-        append(residual.device.active_lanes, capacity.device.active_lanes);
-        append(residual.device.state_slots, capacity.device.state_slots);
-        append(residual.device.main_kv_pages, capacity.device.main_kv_pages);
-        append(residual.device.backend_kv_pages, capacity.device.backend_kv_pages);
-        append(residual.host.state_slots, capacity.host.state_slots);
-        append(residual.host.kv_bytes, capacity.host.kv_bytes);
-        return std::tuple{constraints, total};
-    };
-    const auto transfer_bytes = [](const PressureDecision& decision) {
-        std::uint64_t bytes = 0;
-        for (const runtime::ContextTransferRequirement& requirement :
-             decision.transfer_requirements) {
-            NINFER_QWEN36_RUNTIME_NS::planning_saturating_add(bytes,
-                                                              requirement.work.payload_bytes);
-        }
-        return bytes;
-    };
-
-    choice_scratch.assign(options.victims.size(), 0);
-    const auto chosen_evictions = [&]() {
-        std::uint32_t evictions = 0;
-        for (std::size_t index = 0; index < choice_scratch.size(); ++index) {
-            const std::uint16_t choice = choice_scratch[index];
-            if (choice != 0 && options.victims[index].decisions[choice - 1U].evicts_continuation) {
-                ++evictions;
-            }
-        }
-        return evictions;
-    };
-
-    struct Selection {
-        std::size_t victim_index = 0;
-        PressureDecision decision;
-        detail::PhysicalResources residual;
-    };
-
-    const std::size_t maximum_steps = 16U * std::max<std::size_t>(1, options.victims.size()) + 16U;
-    for (std::size_t step = 0; step < maximum_steps; ++step) {
-        const detail::PhysicalResources residual =
-            projected_residual(choice_scratch, std::nullopt, nullptr);
-        if (residual == detail::PhysicalResources{} && chosen_evictions() >= minimum_evictions) {
-            TargetNode* existing = find_target(selected_candidate, choice_scratch);
-            const std::size_t maximum =
-                candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
-            if (existing == nullptr && targets.size() >= maximum) { return std::nullopt; }
-            const std::uint32_t target_index =
-                existing != nullptr ? static_cast<std::uint32_t>(existing - targets.data())
-                                    : intern_target(selected_candidate, choice_scratch);
-            qwen3_6::PressureTargetHandle handle;
-            handle.session_    = this;
-            handle.generation_ = generation;
-            handle.index_      = target_index;
-            return handle;
-        }
-        if (residual == detail::PhysicalResources{}) {
-            // Physically closed but the caller still demands Evicted outcomes
-            // (minimum_evictions): a root candidate's logical goal needs a Vacant catalog cell,
-            // and with the catalog full only an Evicted owner hands one over. Force the cheapest
-            // preferred owner's eviction choice - one owner, not root_capped's
-            // evict-everything (which wiped62 owners on2026-09-2418:59 while host_state sat at
-            // 184/320).
-            bool forced = false;
-            for (const std::size_t victim_index : victim_order) {
-                const std::uint16_t current = choice_scratch[victim_index];
-                if (current != 0 &&
-                    options.victims[victim_index].decisions[current - 1U].evicts_continuation) {
-                    continue;
-                }
-                const std::uint16_t eviction_choice = options.victims[victim_index].eviction_choice;
-                if (eviction_choice == 0 ||
-                    eviction_choice > options.victims[victim_index].decisions.size()) {
-                    continue;
-                }
-                choice_scratch[victim_index] = eviction_choice;
-                forced = true;
-                break;
-            }
-            if (!forced) { return std::nullopt; }
-            continue;
-        }
-
-        std::optional<Selection> selected;
-        for (int destructive = 0; destructive < 2 && !selected; ++destructive) {
-            for (const std::size_t victim_index : victim_order) {
-                const std::uint16_t current_choice = choice_scratch[victim_index];
-                const PressureDecision* current =
-                    current_choice == 0
-                        ? nullptr
-                        : &options.victims[victim_index].decisions[current_choice - 1U];
-                if (current != nullptr && current->evicts_continuation) { continue; }
-                std::vector<PressureDecision> successors = pressure_successors(
-                    options.victims[victim_index], residual, *protection, current);
-                std::optional<Selection> owner_best;
-                for (PressureDecision& successor : successors) {
-                    const std::uint32_t prior_drops =
-                        current == nullptr ? 0 : current->checkpoint_drops;
-                    const bool adds_destruction =
-                        successor.evicts_continuation || successor.checkpoint_drops > prior_drops;
-                    if (adds_destruction != (destructive != 0)) { continue; }
-                    const detail::PhysicalResources child_residual =
-                        projected_residual(choice_scratch, victim_index, &successor);
-                    if (child_residual == residual) { continue; }
-                    Selection candidate{
-                        .victim_index = victim_index,
-                        .decision     = std::move(successor),
-                        .residual     = child_residual,
-                    };
-                    const auto key = [&](const Selection& value) {
-                        return std::tuple{
-                            residual_key(value.residual),
-                            NINFER_QWEN36_RUNTIME_NS::degradation_units(value.decision),
-                            transfer_bytes(value.decision),
-                            value.decision.id,
-                        };
-                    };
-                    if (!owner_best || key(candidate) < key(*owner_best)) {
-                        owner_best = std::move(candidate);
-                    }
-                }
-                if (owner_best) {
-                    selected = std::move(owner_best);
-                    break;
-                }
-            }
-        }
-        if (!selected) { return std::nullopt; }
-
-        std::vector<PressureDecision>& decisions =
-            options.victims[selected->victim_index].decisions;
-        const auto existing  = std::find(decisions.begin(), decisions.end(), selected->decision);
-        std::uint16_t choice = 0;
-        if (existing != decisions.end()) {
-            choice = static_cast<std::uint16_t>(1U + (existing - decisions.begin()));
-        } else {
-            if (decisions.size() >= std::numeric_limits<std::uint16_t>::max()) {
-                return std::nullopt;
-            }
-            decisions.push_back(std::move(selected->decision));
-            choice = static_cast<std::uint16_t>(decisions.size());
-        }
-        choice_scratch[selected->victim_index] = choice;
-    }
-    return std::nullopt;
-}
-
-inline bool
-PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::retention_infeasible(
-    runtime::PlanningCandidateId candidate) {
-    const std::uint32_t selected_candidate = candidate_index(candidate);
-    populate_options(selected_candidate);
-    const CandidateOptions& options       = candidate_options[selected_candidate];
-    const CandidateState& candidate_state = *candidates[selected_candidate].state;
-    const auto protection                 = program->materialization_source_protection(candidate_state);
-    if (!protection) {
-        throw std::logic_error("pressure candidate source protection is stale");
-    }
-    const detail::PhysicalResources residual =
-        program->guided_materialization_deficit(candidate_state, detail::PhysicalDelta{});
-    if (residual == detail::PhysicalResources{}) { return false; }
-    std::uint32_t total_lanes   = 0;
-    std::uint32_t total_state   = 0;
-    std::uint32_t total_main    = 0;
-    std::uint32_t total_backend = 0;
-    for (const CandidateVictimOptions& victim : options.victims) {
-        std::uint32_t best_lanes   = 0;
-        std::uint32_t best_state   = 0;
-        std::uint32_t best_main    = 0;
-        std::uint32_t best_backend = 0;
-        for (const PressureDecision& successor :
-             pressure_successors(victim, residual, *protection, nullptr)) {
-            if (successor.evicts_continuation) { continue; }
-            best_lanes    = std::max(best_lanes, successor.effect.removed.device.active_lanes);
-            best_state    = std::max(best_state, successor.effect.removed.device.state_slots);
-            best_main     = std::max(best_main, successor.effect.removed.device.main_kv_pages);
-            best_backend  = std::max(best_backend, successor.effect.removed.device.backend_kv_pages);
-        }
-        total_lanes    = std::min<std::uint32_t>(
-            std::numeric_limits<std::uint32_t>::max(), total_lanes + best_lanes);
-        total_state    = std::min<std::uint32_t>(
-            std::numeric_limits<std::uint32_t>::max(), total_state + best_state);
-        total_main     = std::min<std::uint32_t>(
-            std::numeric_limits<std::uint32_t>::max(), total_main + best_main);
-        total_backend  = std::min<std::uint32_t>(
-            std::numeric_limits<std::uint32_t>::max(), total_backend + best_backend);
-    }
-    const bool infeasible = residual.device.active_lanes > total_lanes ||
-                            residual.device.state_slots > total_state ||
-                            residual.device.main_kv_pages > total_main ||
-                            residual.device.backend_kv_pages > total_backend;
-    // This verdict is what lets the planner accept an evicting seed instead of searching for a
-    // spilling one (materialization_planner.h retention_infeasible branch). Both sides of the
-    // comparison have to be visible: "max_relievable >= residual" means spilling every owner to
-    // its limit would have covered the gap, so the eviction came from the search, not from
-    // physics (2026-09-25: production deleted38 sessions while Host KV had22 GiB free).
-    if (const char* diag = std::getenv("NINFER_REUSE_DIAG"); diag == nullptr || *diag != '0') {
-        std::fprintf(stderr,
-                     "[retention] infeasible=%d victims=%zu | residual main=%u backend=%u"
-                     " lanes=%u state=%u | max_relievable main=%u backend=%u lanes=%u state=%u\n",
-                     infeasible ? 1 : 0, options.victims.size(), residual.device.main_kv_pages,
-                     residual.device.backend_kv_pages, residual.device.active_lanes,
-                     residual.device.state_slots, total_main, total_backend, total_lanes,
-                     total_state);
-        std::fflush(stderr);
-    }
-    return infeasible;
 }
 
 inline runtime::PressureTargetGuidance

@@ -1,4 +1,5 @@
 #include "core/site_bad_alloc.h"
+#include "runtime/cache/cache_tier_policy.h"
 #include "runtime/engine/resource_manager.h"
 
 #include <algorithm>
@@ -7,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -38,6 +40,7 @@ using ninfer::runtime::LaneId;
 using ninfer::runtime::MaterializationCheckpointPolicy;
 using ninfer::runtime::MaterializationMachineWork;
 using ninfer::runtime::MaterializationOwnerPolicy;
+using ninfer::runtime::OwnerImportance;
 using ninfer::runtime::PrefillWork;
 using ninfer::runtime::PlanningCandidateId;
 using ninfer::runtime::PlanningOwnerId;
@@ -578,14 +581,8 @@ public:
         return PlanningCandidateId{.value = 0};
     }
 
-    [[nodiscard]] FakePressureTargetHandle root_capped_target(
-        PlanningCandidateId candidate, std::span<const PlanningOwnerId> preferred_owner_ids,
-        std::uint32_t max_evictions);
-    [[nodiscard]] std::optional<FakePressureTargetHandle>
-    guided_closure_target(PlanningCandidateId candidate,
-                          std::span<const PlanningOwnerId> preferred_owner_ids,
-                          std::uint32_t minimum_evictions = 0);
-    bool retention_infeasible(PlanningCandidateId candidate);
+    [[nodiscard]] std::optional<FakePressureTargetHandle> tier_policy_target(
+        PlanningCandidateId candidate, std::span<const OwnerImportance> owner_values);
     [[nodiscard]] ninfer::runtime::PressureTargetGuidance guidance(FakePressureTargetHandle target);
     [[nodiscard]] FakeAssessedPressureTarget assess(FakePressureTargetHandle target);
     [[nodiscard]] FakePreparedPressureExpansion prepare_expansion(FakePressureTargetHandle parent);
@@ -1208,11 +1205,6 @@ public:
     std::uint32_t pressure_assessment_delay_us           = 0;
     std::uint64_t pressure_checkpoint_recovery_ns        = 100;
     bool require_evictions                               = false;
-    bool retention_infeasible_override                   = false;
-    // Models the family closure's step-based semantics, where a retention choice already
-    // made for an owner can be upgraded to that owner's eviction outcome in the destructive
-    // phase.  Off by default: the default two-pass closure never revisits assigned owners.
-    bool closure_upgrades_to_eviction                    = false;
     bool abort_start                                     = false;
     // Capacity miss raised from start_resource_transaction (the release ladder could not produce
     // the state or KV capacity the sealed plan needs).
@@ -1365,10 +1357,15 @@ FakePressurePlanningSession::decisions_for(std::uint32_t selected_candidate,
                 .dropped_checkpoints = 1,
             });
         }
+        // An eviction removes EVERY checkpoint the owner holds. Claiming one drop while the owner
+        // also holds a rewrite checkpoint made `selected_checkpoint_drops` reject the target as
+        // incomplete (observed=2, dropped=2, claimed=1).
+        const std::uint32_t eviction_drops =
+            1U + (program_->finish_with_rewrite ? 1U : 0U);
         decisions.push_back(FakeTargetDecision{
             .id                  = 2000U + owner.private_handle->id,
             .degradation_units   = 4,
-            .dropped_checkpoints = 1,
+            .dropped_checkpoints = eviction_drops,
             .evicts_continuation = true,
         });
     } else {
@@ -1407,133 +1404,114 @@ FakePressureTargetHandle FakePressurePlanningSession::identity_target() const {
     return FakePressureTargetHandle{.generation = generation_, .index = 0};
 }
 
-FakePressureTargetHandle
-FakePressurePlanningSession::root_capped_target(
-    PlanningCandidateId candidate, std::span<const PlanningOwnerId> preferred_owner_ids,
-    std::uint32_t max_evictions) {
+std::optional<FakePressureTargetHandle>
+FakePressurePlanningSession::tier_policy_target(
+    PlanningCandidateId candidate, std::span<const OwnerImportance> owner_values) {
+    namespace cachep = ::ninfer::runtime::cache;
+    if (scratch_live_) { return std::nullopt; }
     const std::uint32_t selected = candidate_index(candidate);
     populate_options(selected);
-    Target capped{
+    if (owners_.empty()) { return std::nullopt; }
+
+    // §6.2: the planner reports a VALUE per owner, never an ordering, so it does not name a
+    // victim. The policy ranks these itself - which is the whole point of handing over worth
+    // instead of a list. An owner the planner did not price is worth the maximum, i.e. taken
+    // last, matching what the old "priced first, unpriced appended after" order did.
+    std::vector<cachep::Datum> pool;
+    pool.reserve(owners_.size());
+    for (std::size_t index = 0; index < owners_.size(); ++index) {
+        const auto found = std::find_if(
+            owner_values.begin(), owner_values.end(),
+            [&](const OwnerImportance& entry) { return entry.owner == owners_[index].id; });
+        pool.push_back(cachep::Datum{
+            .id           = index,
+            .device_kv    = 1,
+            .device_state = 0,
+            .host_kv      = 1,
+            .host_state   = 0,
+            .importance   = found != owner_values.end()
+                                ? found->value
+                                : std::numeric_limits<std::uint64_t>::max(),
+            .active       = false});
+    }
+
+    // One unit of Device KV per conversation with Device full - the only condition in which this
+    // controller is reached, because the ordinary search has already failed. Host is given
+    // exactly the room the spill will consume, so R1 (move, never destroy) is the rule that
+    // fires here; the fake prices no state pool, so both state axes stay at zero capacity with
+    // zero demand and cannot open a gap. Host-side deletion has its own cases in
+    // tests/test_cache_tier_policy_test, which owns the rules. The demand is the scenario's own
+    // "how much room must be freed".
+    const auto units = static_cast<std::uint64_t>(program_->required_pressure_actions);
+    const cachep::TierOccupancy occupancy{
+        .device_kv_used        = owners_.size(),
+        .device_kv_capacity    = owners_.size(),
+        .device_state_used     = 0,
+        .device_state_capacity = 0,
+        .host_kv_used          = owners_.size(),
+        .host_kv_capacity      = owners_.size() + units,
+        .host_state_used       = 0,
+        .host_state_capacity   = 0,
+    };
+    const cachep::Demand demand{.device_kv = units, .host_kv = units};
+    const cachep::Plan outcome = cachep::plan(demand, occupancy, pool);
+    if (outcome.enqueue || outcome.steps.empty()) { return std::nullopt; }
+
+    Target target{
         .candidate_index = selected,
         .choices         = std::vector<std::uint16_t>(owners_.size(), 0),
-        .root_capped     = true,
     };
-    // Cheapest-first capped batch: preferred owners, then the rest, until max_evictions.
-    std::vector<std::size_t> order;
-    const auto push = [&](std::size_t index) {
-        if (std::find(order.begin(), order.end(), index) == order.end()) { order.push_back(index); }
-    };
-    for (const PlanningOwnerId id : preferred_owner_ids) {
-        const auto found = std::find_if(owners_.begin(), owners_.end(),
-                                        [&](const Owner& owner) { return owner.id == id; });
-        if (found != owners_.end()) { push(static_cast<std::size_t>(found - owners_.begin())); }
-    }
-    for (std::size_t index = 0; index < owners_.size(); ++index) { push(index); }
-    std::uint32_t evicted = 0;
-    for (const std::size_t index : order) {
-        if (evicted >= max_evictions) { break; }
-        if (options_[selected][index].empty()) { continue; }
-        capped.choices[index] = static_cast<std::uint16_t>(options_[selected][index].size());
-        ++evicted;
-    }
-    auto found = std::find_if(targets_.begin(), targets_.end(),
-                              [&](const Target& target) { return same_target(target, capped); });
-    if (found != targets_.end()) {
-        found->root_capped = true;
-        return FakePressureTargetHandle{
-            .generation = generation_,
-            .index      = static_cast<std::uint32_t>(found - targets_.begin()),
-        };
-    }
-    capped.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
-    targets_.push_back(std::move(capped));
-    return FakePressureTargetHandle{
-        .generation = generation_,
-        .index      = static_cast<std::uint32_t>(targets_.size() - 1U),
-    };
-}
-
-std::optional<FakePressureTargetHandle> FakePressurePlanningSession::guided_closure_target(
-    PlanningCandidateId candidate, std::span<const PlanningOwnerId> preferred_owner_ids,
-    std::uint32_t minimum_evictions) {
-    require(!scratch_live_, "fake guided pressure closure conflicts with expansion scratch");
-    const std::uint32_t selected_candidate = candidate_index(candidate);
-    populate_options(selected_candidate);
-    Target target{
-        .candidate_index = selected_candidate,
-        .choices         = std::vector<std::uint16_t>(owners_.size(), 0),
-    };
-    std::vector<std::size_t> order;
-    order.reserve(owners_.size());
-    const auto append = [&](std::size_t index) {
-        if (std::find(order.begin(), order.end(), index) == order.end()) { order.push_back(index); }
-    };
-    for (const PlanningOwnerId id : preferred_owner_ids) {
-        const auto found = std::find_if(owners_.begin(), owners_.end(),
-                                        [&](const Owner& owner) { return owner.id == id; });
-        if (found != owners_.end()) { append(static_cast<std::size_t>(found - owners_.begin())); }
-    }
-    for (std::size_t index = 0; index < owners_.size(); ++index) { append(index); }
-
     const auto selected_decisions = [&] {
         std::vector<FakeTargetDecision> decisions;
         for (std::size_t index = 0; index < owners_.size(); ++index) {
             const std::uint16_t choice = target.choices[index];
-            if (choice != 0) {
-                decisions.push_back(options_[selected_candidate][index][choice - 1U]);
-            }
+            if (choice != 0) { decisions.push_back(options_[selected][index][choice - 1U]); }
         }
         return decisions;
     };
-    for (int destructive = 0; destructive < 2; ++destructive) {
-        for (const std::size_t owner_index : order) {
-            const auto& alternatives = options_[selected_candidate][owner_index];
-            if (alternatives.empty()) { continue; }
-            if (target.choices[owner_index] != 0 &&
-                !(program_->closure_upgrades_to_eviction && destructive != 0)) {
-                continue;
-            }
-            const auto found = std::find_if(
-                alternatives.begin(), alternatives.end(), [&](const FakeTargetDecision& decision) {
-                    return decision.evicts_continuation == (destructive != 0);
-                });
-            if (found == alternatives.end()) { continue; }
-            target.choices[owner_index] =
-                static_cast<std::uint16_t>(1U + (found - alternatives.begin()));
-            const std::vector<FakeTargetDecision> chosen = selected_decisions();
-            if (minimum_evictions > 0) {
-                // Mirror the real closure's contract: a plan handed minimum_evictions must
-                // actually contain that many Evicted outcomes (goal needs a catalog cell).
-                const auto evictions = static_cast<std::uint32_t>(std::count_if(
-                    chosen.begin(), chosen.end(),
-                    [](const FakeTargetDecision& decision) { return decision.evicts_continuation; }));
-                if (evictions < minimum_evictions) { continue; }
-            }
-            if (program_->target_feasible(chosen)) {
-                auto existing =
-                    std::find_if(targets_.begin(), targets_.end(),
-                                 [&](const Target& prior) { return same_target(prior, target); });
-                std::uint32_t target_index = 0;
-                if (existing != targets_.end()) {
-                    target_index = static_cast<std::uint32_t>(existing - targets_.begin());
-                } else {
-                    target.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
-                    targets_.push_back(std::move(target));
-                    target_index = static_cast<std::uint32_t>(targets_.size() - 1U);
-                    program_->pressure_target_count_peak =
-                        std::max(program_->pressure_target_count_peak, targets_.size());
+    // The policy decides WHICH conversations act and HOW MANY. The polarity it asks for is a
+    // preference; the scenario's own feasibility predicate (`required_action_id`,
+    // `require_evictions`) has the last word, so a second pass flips every step to the opposite
+    // polarity before the controller gives up.
+    for (int pass = 0; pass < 2; ++pass) {
+        target.choices.assign(owners_.size(), 0);
+        bool assigned = true;
+        for (const cachep::Step& step : outcome.steps) {
+            const auto& alternatives = options_[selected][static_cast<std::size_t>(step.id)];
+            const bool want_evict = (step.action == cachep::Action::DropFromHost) != (pass != 0);
+            std::size_t picked = alternatives.size();
+            for (std::size_t alt = 0; alt < alternatives.size(); ++alt) {
+                if (alternatives[alt].evicts_continuation != want_evict) { continue; }
+                picked = alt;
+                if (program_->required_action_id &&
+                    alternatives[alt].id == *program_->required_action_id) {
+                    break;
                 }
-                return FakePressureTargetHandle{.generation = generation_, .index = target_index};
             }
+            if (picked == alternatives.size()) { assigned = false; break; }
+            target.choices[static_cast<std::size_t>(step.id)] =
+                static_cast<std::uint16_t>(picked + 1U);
         }
+        if (!assigned || !program_->target_feasible(selected_decisions())) { continue; }
+        auto existing = std::find_if(
+            targets_.begin(), targets_.end(),
+            [&](const Target& prior) { return same_target(prior, target); });
+        if (existing != targets_.end()) {
+            return FakePressureTargetHandle{
+                .generation = generation_,
+                .index      = static_cast<std::uint32_t>(existing - targets_.begin()),
+            };
+        }
+        target.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
+        targets_.push_back(std::move(target));
+        program_->pressure_target_count_peak =
+            std::max(program_->pressure_target_count_peak, targets_.size());
+        return FakePressureTargetHandle{
+            .generation = generation_,
+            .index      = static_cast<std::uint32_t>(targets_.size() - 1U),
+        };
     }
     return std::nullopt;
-}
-
-bool FakePressurePlanningSession::retention_infeasible(PlanningCandidateId candidate) {
-    (void)candidate;
-    require(program_ != nullptr, "fake pressure session is detached");
-    return program_->retention_infeasible_override;
 }
 
 ninfer::runtime::PressureTargetGuidance
@@ -2424,120 +2402,6 @@ void test_feasible_identity_expands_when_pressure_can_remove_copy() {
                 program.pressure_planning_sessions == 1 && !program.seal_attempts.empty() &&
                 program.seal_attempts.back() == std::vector<std::uint64_t>{1009},
             "feasible identity suppressed a cheaper complete pressure target");
-}
-
-void test_evicting_seed_accepted_when_retention_proven_infeasible() {
-    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
-
-    FakeProgram program;
-    // Units 6 with 3 owners x 2 units forces every owner evicted: the all-evicting closure
-    // seed is the only feasible plan, so no probe step can beat it.
-    program.required_pressure_actions         = 4;
-    program.require_evictions                 = true;
-    program.private_pressure_alternatives     = 4;
-    program.retention_infeasible_override     = true;
-    program.closure_upgrades_to_eviction      = true;
-    program.eviction_pressure_action_units    = 2;
-    program.pressure_action_immediate_ns      = 1'000'000;
-    program.pressure_action_degradation_units = 1;
-    program.pressure_assessment_delay_us      = 100;
-    program.pressure_checkpoint_recovery_ns   = 1'000'000;
-
-    FakeAdmissionCandidate root;
-    set_fake_machine_costs(root.identity.machine_work, 8'000'000'000ULL, 8'000'000'000ULL);
-    root.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
-    root.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
-    root.identity.expandable        = true;
-    root.identity.assessment_digest = 101;
-
-    FakeAdmissionCandidate reuse;
-    reuse.value.reusable_prompt_tokens = 55'048;
-    reuse.private_source_id            = 1;
-    set_fake_machine_costs(reuse.identity.machine_work, 100'000'000, 100'000'000);
-    reuse.identity.machine_work.reused_prompt_tokens = 55'048;
-    reuse.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
-    reuse.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
-    reuse.identity.expandable        = true;
-    reuse.identity.assessment_digest = 202;
-
-    const std::array<Planner::CandidateInput, 2> candidates{
-        Planner::CandidateInput{.candidate               = &root,
-                                .id                      = PlanningCandidateId{.value = 0},
-                                .stable_ordinal          = 0,
-                                .current_session_binding = false},
-        Planner::CandidateInput{.candidate               = &reuse,
-                                .id                      = PlanningCandidateId{.value = 1},
-                                .stable_ordinal          = 1,
-                                .current_session_binding = true},
-    };
-    std::array<FakeContinuationHandle, 3> owner_handles{
-        FakeContinuationHandle{1, 0},
-        FakeContinuationHandle{2, 0},
-        FakeContinuationHandle{3, 0},
-    };
-    const std::array<const FakeContinuationHandle*, 3> private_owners{
-        &owner_handles[0], &owner_handles[1], &owner_handles[2]};
-    const std::array<PlanningOwnerId, 3> private_owner_ids{
-        PlanningOwnerId{.value = 0}, PlanningOwnerId{.value = 1}, PlanningOwnerId{.value = 2}};
-    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 3> owner_policy{
-        ninfer::runtime::MaterializationOwnerPolicy{.owner           = PlanningOwnerId{.value = 0},
-                                                    .retention_class = RetentionClass::LiveSession,
-                                                    .private_retention_weight = 16},
-        ninfer::runtime::MaterializationOwnerPolicy{.owner           = PlanningOwnerId{.value = 1},
-                                                    .retention_class = RetentionClass::LiveSession,
-                                                    .private_retention_weight = 16},
-        ninfer::runtime::MaterializationOwnerPolicy{.owner           = PlanningOwnerId{.value = 2},
-                                                    .retention_class = RetentionClass::LiveSession,
-                                                    .private_retention_weight = 16},
-    };
-    const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 3> checkpoint_policy{
-        ninfer::runtime::MaterializationCheckpointPolicy{
-            .owner      = PlanningOwnerId{.value = 0},
-            .checkpoint = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
-                                        .frontier = 16,
-                                        .ordinal  = 0},
-            .rebuild_ns = 1'000'000},
-        ninfer::runtime::MaterializationCheckpointPolicy{
-            .owner      = PlanningOwnerId{.value = 1},
-            .checkpoint = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
-                                        .frontier = 16,
-                                        .ordinal  = 0},
-            .rebuild_ns = 1'000'000},
-        ninfer::runtime::MaterializationCheckpointPolicy{
-            .owner      = PlanningOwnerId{.value = 2},
-            .checkpoint = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
-                                        .frontier = 16,
-                                        .ordinal  = 0},
-            .rebuild_ns = 1'000'000},
-    };
-
-    Planner planner;
-    const auto pressure_inputs = [&]() -> Planner::PressureInputs {
-        return Planner::PressureInputs{
-            .private_owners    = private_owners,
-            .private_owner_ids = private_owner_ids,
-            .shared_owners     = {},
-            .shared_owner_ids  = {},
-            .owner_policy      = owner_policy,
-            .checkpoint_policy = checkpoint_policy,
-        };
-    };
-    const auto logical_goal = [](PlanningCandidateId, PrivateSourceMode,
-                                 std::span<const ninfer::runtime::PressureOwnerOutcome>)
-        -> std::optional<Planner::LogicalGoal> {
-        return Planner::LogicalGoal{.publication_slot = 0};
-    };
-    auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
-                               pressure_inputs, logical_goal, 1'000'000U, Planner::Clock::now());
-
-    require(result && result->plan &&
-                result->diagnostics.stop_reason == ninfer::MaterializationStopReason::SeedAccepted,
-            "certified evicting seed should be accepted by the bounded probe");
-    require(std::any_of(result->plan->private_actions.begin(), result->plan->private_actions.end(),
-                        [](const FakeTargetDecision& action) {
-                            return action.evicts_continuation;
-                        }),
-            "accepted evicting seed dropped its certified eviction");
 }
 
 void test_dominating_identity_does_not_build_pressure_graph() {
@@ -3850,8 +3714,6 @@ int main() {
              test_feasible_identity_expands_when_pressure_can_remove_copy);
     run_test("dominating identity fast path",
              test_dominating_identity_does_not_build_pressure_graph);
-    run_test("certified evicting seed acceptance",
-             test_evicting_seed_accepted_when_retention_proven_infeasible);
     run_test("root lifecycle and prefix reuse", test_root_lifecycle_and_prefix_reuse);
     run_test("retired owner catalog repair", test_retired_owner_is_not_offered_as_reuse_source);
     run_test("capacity miss is retryable", test_capacity_miss_is_retryable);

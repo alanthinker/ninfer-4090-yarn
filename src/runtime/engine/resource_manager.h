@@ -1973,23 +1973,24 @@ private:
                    [&](auto&& visit) { visit(entry.summary.checkpoint); });
         }
 
-        // Two-tier order, mirroring how the planner escalates into fair-share buckets:
-        //   1. unprotected owners, cheapest value first (ties: least recently active);
-        //   2. protected owners, least recently active first - the planner's escalation releases
-        //      the oldest bucket first, and value should not be able to reach inside the window.
+        // The ONE ranking: value (with protection folded in as its recency), then recency, then
+        // slot - the same chain the two-tier policy ranks its Datum by (缓存模块v2.md §6.4).
+        // Protection here is fair-share OR the recency horizon: an ordering, never an exclusion,
+        // so this list always contains somebody and the ladder can always find a victim. Within
+        // the protected group the oldest goes first, which is the bucket escalation this step
+        // documents - dropping that made Host KV stop accumulating entirely.
         std::sort(scored.begin(), scored.end(), [](const Scored& left, const Scored& right) {
-            if (left.protected_by_fair_share != right.protected_by_fair_share) {
-                return !left.protected_by_fair_share;
-            }
-            if (left.protected_by_fair_share) {
-                if (left.last_active != right.last_active) {
-                    return left.last_active < right.last_active;
-                }
-                return left.entry.slot < right.entry.slot;
-            }
-            if (left.score != right.score) { return left.score < right.score; }
-            if (left.last_active != right.last_active) { return left.last_active < right.last_active; }
-            return left.entry.slot < right.entry.slot;
+            return cache_owner_rank_less(
+                cache_owner_importance(left.score, left.protected_by_fair_share,
+                                       static_cast<std::int64_t>(
+                                           left.last_active.time_since_epoch().count())),
+                static_cast<std::int64_t>(left.last_active.time_since_epoch().count()),
+                left.entry.slot,
+                cache_owner_importance(right.score, right.protected_by_fair_share,
+                                       static_cast<std::int64_t>(
+                                           right.last_active.time_since_epoch().count())),
+                static_cast<std::int64_t>(right.last_active.time_since_epoch().count()),
+                right.entry.slot);
         });
         std::vector<RetirePreferenceEntry> order;
         order.reserve(scored.size());
@@ -2964,7 +2965,26 @@ private:
                     }
                 }
             }
-            if (publication_slot == kInvalidCatalogSlot) { return std::nullopt; }
+            if (publication_slot == kInvalidCatalogSlot) {
+                // The last thing this goal needs is somewhere to publish the request's own
+                // checkpoint, and the only ways to get one are a Vacant cell or an outcome that
+                // evicts an owner. Say which of those was missing: this branch is what turns
+                // "every axis has room" into "no plan", and the two facts are logged far apart.
+                std::uint32_t vacants = 0;
+                for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+                    if (catalog_[slot].state == CatalogState::Vacant) { ++vacants; }
+                }
+                std::size_t evicted = 0;
+                for (const PressureOwnerOutcome& row : outcomes) {
+                    if (row.disposition == VictimDisposition::Evicted) { ++evicted; }
+                }
+                std::fprintf(stderr,
+                             "[goal] declined reason=no-publication-slot catalog_vacant=%u/%u"
+                             " private_source=%d source_mode=%d outcomes=%zu evicted=%zu\n",
+                             vacants, catalog_count_, candidate.private_source ? 1 : 0,
+                             static_cast<int>(source_mode), outcomes.size(), evicted);
+                return std::nullopt;
+            }
             return typename Planner::LogicalGoal{.publication_slot = publication_slot};
         };
 
@@ -3367,7 +3387,16 @@ private:
         }
         if (observed != checkpoint_count || dropped.size() != expected_drop_count ||
             (disposition == VictimDisposition::Evicted) != (dropped.size() == checkpoint_count)) {
-            throw std::logic_error("selected checkpoint outcome is incomplete");
+            // This fires on a plan whose checkpoint bookkeeping disagrees with the catalog entry
+            // it will mutate, so the four counts ARE the diagnosis: which side is short, and by
+            // how much, has to be readable from the request log without a repro.
+            throw std::logic_error(
+                "selected checkpoint outcome is incomplete: owner=" +
+                std::to_string(owner.value) +
+                " disposition=" + std::to_string(static_cast<int>(disposition)) +
+                " observed=" + std::to_string(observed) + "/" +
+                std::to_string(checkpoint_count) + " dropped=" +
+                std::to_string(dropped.size()) + "/" + std::to_string(expected_drop_count));
         }
         return dropped;
     }

@@ -167,28 +167,11 @@ PressurePlanningSession<Variant>::identity_target(runtime::PlanningCandidateId c
 }
 
 template <>
-PressureTargetHandle
-PressurePlanningSession<Variant>::root_capped_target(
+std::optional<PressureTargetHandle> PressurePlanningSession<Variant>::tier_policy_target(
     runtime::PlanningCandidateId root_candidate,
-    std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
-    std::uint32_t max_evictions) {
+    std::span<const runtime::OwnerImportance> owner_values) {
     if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
-    return impl_->root_capped_target(root_candidate, preferred_owner_ids, max_evictions);
-}
-
-template <>
-std::optional<PressureTargetHandle> PressurePlanningSession<Variant>::guided_closure_target(
-    runtime::PlanningCandidateId candidate,
-    std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
-    std::uint32_t minimum_evictions) {
-    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
-    return impl_->guided_closure_target(candidate, preferred_owner_ids, minimum_evictions);
-}
-
-template <>
-bool PressurePlanningSession<Variant>::retention_infeasible(runtime::PlanningCandidateId candidate) {
-    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
-    return impl_->retention_infeasible(candidate);
+    return impl_->tier_policy_target(root_candidate, owner_values);
 }
 
 template <>
