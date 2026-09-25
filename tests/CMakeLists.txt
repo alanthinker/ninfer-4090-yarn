@@ -422,3 +422,10 @@ endforeach()
 # Run manually with an artifact path; registered as a test only once it reproduces the bug.
 add_executable(ninfer_pressure_joint_settle_test test_pressure_joint_settle.cpp)
 target_link_libraries(ninfer_pressure_joint_settle_test PRIVATE ninfer_engine)
+
+# Per-shape reproduction of `pressure KV replica changed before transfer`: one case per process
+# because that throw latches the engine (fail_all_locked -> 503 until restart), so a hit would
+# otherwise kill every later case in the same process. Run manually with an artifact path and a
+# case name; registered as a test only once it reproduces the bug.
+add_executable(ninfer_pressure_prepare_cases_test test_pressure_prepare_cases.cpp)
+target_link_libraries(ninfer_pressure_prepare_cases_test PRIVATE ninfer_engine)

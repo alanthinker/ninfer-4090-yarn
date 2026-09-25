@@ -3848,6 +3848,189 @@ bool ProgramImplCore::compose_pressure_candidate(
             std::fflush(stderr);
         }
     };
+    // One physical page may be transformed by exactly ONE pressure work. prepare_pressure_work
+    // stages every page it carries - HostKVExtentStore::prepare pins the source pages
+    // (host_kv_extent_store.h:129) - so a second work carrying the same shared-prefix page fails
+    // its own `source_pins != 0` validation and latches the engine: 2026-09-25 production, fatal
+    // `pressure KV replica changed before transfer ... pins=1`, with the colliding range
+    // (`begin=0 count=13`) printed twice as `[pressure] plan`. The joint-settle in
+    // evaluate_pressure_target accepts such duplicates for the projection only, so the later
+    // option has to give the page up here together with the relief it claimed for it - otherwise
+    // the feasibility gate counts the same physical page twice. Claims follow composition order,
+    // and each list is prepared in that same order (shared first, then private), so exactly one
+    // work ever carries the page.
+    std::vector<std::uint8_t> claimed_main(text_kv_pages ? text_kv_pages->capacity() : 0U, 0U);
+    std::vector<std::uint8_t> claimed_backend(backend_kv_pages ? backend_kv_pages->capacity() : 0U,
+                                              0U);
+    const auto claim_pressure_pages = [&](qwen3_6::detail::PressureDecision& option,
+                                          const SequenceKVBundle* kv) -> bool {
+        if (option.evicts_continuation || kv == nullptr) { return true; }
+        std::size_t stripped_pages = 0;
+        const auto claim_store = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                     std::vector<std::uint8_t>& claimed,
+                                     const std::optional<KVAddressSpaceHandle>& address,
+                                     std::vector<qwen3_6::detail::PressureKVDecision>& changes,
+                                     std::uint32_t& removed_device_pages) -> bool {
+            if (changes.empty()) { return true; }
+            if (!address || !addresses.valid(*address)) {
+                reject_reason("compose-early");
+                return false;
+            }
+            const std::size_t stride =
+                plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+            const auto encode = [](bool device, bool host) -> std::uint8_t {
+                return static_cast<std::uint8_t>(1U | (device ? 2U : 0U) | (host ? 4U : 0U));
+            };
+            std::vector<std::vector<std::uint8_t>> duplicates(changes.size());
+            for (std::size_t index = 0; index < changes.size(); ++index) {
+                const qwen3_6::detail::PressureKVDecision& action = changes[index];
+                const bool drop_host =
+                    action.kind == qwen3_6::detail::PressureKVDecisionKind::DropHostDuplicate;
+                const bool device_only =
+                    action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost;
+                duplicates[index].assign(action.page_count, 0U);
+                for (std::uint32_t offset = 0; offset < action.page_count; ++offset) {
+                    const LogicalKVPageHandle logical =
+                        addresses.logical_page(*address, action.begin_page + offset);
+                    const bool next_device = drop_host ? pages.device_resident(logical) : false;
+                    const bool next_host   = !drop_host;
+                    const std::uint8_t mark = claimed[pages.descriptor_index(logical)];
+                    if (mark == 0) { continue; }
+                    if (static_cast<bool>(mark & 2U) != next_device ||
+                        static_cast<bool>(mark & 4U) != next_host) {
+                        // The two owners disagree about this page's residency, so no single
+                        // physical step can serve both: reject the target (the conflict case the
+                        // joint-settle still has to refuse) instead of guessing.
+                        reject_reason("kv-residency-conflict");
+                        return false;
+                    }
+                    // Already delivered by an earlier option: drop it here and drop the relief
+                    // this option claimed for it, or the gate counts the page twice.
+                    duplicates[index][offset] = 1U;
+                    ++stripped_pages;
+                    if (drop_host) {
+                        if (option.effect.removed.host.kv_bytes < stride) {
+                            reject_reason("compose-effect-underflow");
+                            return false;
+                        }
+                        option.effect.removed.host.kv_bytes -= stride;
+                    } else {
+                        if (removed_device_pages == 0) {
+                            reject_reason("compose-effect-underflow");
+                            return false;
+                        }
+                        --removed_device_pages;
+                        if (device_only) {
+                            if (option.effect.added.host.kv_bytes < stride) {
+                                reject_reason("compose-effect-underflow");
+                                return false;
+                            }
+                            option.effect.added.host.kv_bytes -= stride;
+                        }
+                    }
+                }
+            }
+            std::vector<qwen3_6::detail::PressureKVDecision> survivors;
+            survivors.reserve(changes.size());
+            for (std::size_t index = 0; index < changes.size(); ++index) {
+                const qwen3_6::detail::PressureKVDecision& action = changes[index];
+                const bool drop_host =
+                    action.kind == qwen3_6::detail::PressureKVDecisionKind::DropHostDuplicate;
+                std::optional<std::uint32_t> run_begin;
+                std::uint32_t run_end = 0;
+                const auto flush = [&]() {
+                    if (!run_begin) { return; }
+                    survivors.push_back(qwen3_6::detail::PressureKVDecision{
+                        .begin_page = *run_begin,
+                        .page_count = run_end - *run_begin,
+                        .kind       = action.kind,
+                    });
+                    run_begin.reset();
+                };
+                for (std::uint32_t offset = 0; offset < action.page_count; ++offset) {
+                    if (duplicates[index][offset] != 0) {
+                        flush();
+                        continue;
+                    }
+                    const std::uint32_t page_index = action.begin_page + offset;
+                    const LogicalKVPageHandle logical = addresses.logical_page(*address, page_index);
+                    if (!run_begin) { run_begin = page_index; }
+                    run_end = page_index + 1;
+                    const bool next_device = drop_host ? pages.device_resident(logical) : false;
+                    claimed[pages.descriptor_index(logical)] = encode(next_device, !drop_host);
+                }
+                flush();
+            }
+            changes.swap(survivors);
+            return true;
+        };
+        std::uint32_t* main_removed  = &option.effect.removed.device.main_kv_pages;
+        std::uint32_t* backend_removed = &option.effect.removed.device.backend_kv_pages;
+        if (!claim_store(*text_kv_addresses, *text_kv_pages, claimed_main, kv->text,
+                         option.main_kv_changes, *main_removed)) {
+            return false;
+        }
+        if (!option.backend_kv_changes.empty()) {
+            if (!kv->backend || !backend_kv_addresses || !backend_kv_pages) {
+                reject_reason("compose-early");
+                return false;
+            }
+            if (!claim_store(*backend_kv_addresses, *backend_kv_pages, claimed_backend,
+                             std::optional<KVAddressSpaceHandle>(kv->backend),
+                             option.backend_kv_changes, *backend_removed)) {
+                return false;
+            }
+        }
+        if (stripped_pages == 0) { return true; }
+        // Proof the joint-settle actually fired on this input: without it the second work carries
+        // the same pages into prepare and latches the engine.
+        if (const char* diag = std::getenv("NINFER_REUSE_DIAG"); diag == nullptr || *diag != '0') {
+            std::fprintf(stderr,
+                         "[pressure] joint-settle stripped %zu duplicate KV page(s): main=%zu"
+                         " backend=%zu\n",
+                         stripped_pages, option.main_kv_changes.size(),
+                         option.backend_kv_changes.size());
+            std::fflush(stderr);
+        }
+        // Re-derive the KV transfer requirements from the surviving DemoteToHost actions. State
+        // requirements stay as they are: a StateImage is settled once and never duplicated.
+        std::vector<runtime::ContextTransferRequirement> requirements;
+        requirements.reserve(option.transfer_requirements.size());
+        for (runtime::ContextTransferRequirement& requirement : option.transfer_requirements) {
+            if (requirement.resource == runtime::ContextResourceClass::MainKV ||
+                requirement.resource == runtime::ContextResourceClass::BackendKV) {
+                continue;
+            }
+            requirements.push_back(std::move(requirement));
+        }
+        const auto append_demotes = [&](std::span<const qwen3_6::detail::PressureKVDecision> changes,
+                                        runtime::ContextResourceClass resource,
+                                        KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                        const std::optional<KVAddressSpaceHandle>& address) {
+            if (!address || !addresses.valid(*address)) { return; }
+            const HostKVPageLayout layout =
+                plan_host_kv_page_layout(pages.physical_pool().geometry());
+            for (const qwen3_6::detail::PressureKVDecision& action : changes) {
+                if (action.kind != qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
+                    continue;
+                }
+                requirements.push_back(kv_transfer_requirement(
+                    resource, runtime::ContextTransferDirection::DeviceToHost, layout,
+                    action.page_count,
+                    physical_kv_runs(addresses, pages, *address, action.begin_page,
+                                     action.page_count)));
+            }
+        };
+        append_demotes(option.main_kv_changes, runtime::ContextResourceClass::MainKV,
+                       *text_kv_addresses, *text_kv_pages, kv->text);
+        if (kv->backend && backend_kv_addresses && backend_kv_pages) {
+            append_demotes(option.backend_kv_changes, runtime::ContextResourceClass::BackendKV,
+                           *backend_kv_addresses, *backend_kv_pages,
+                           std::optional<KVAddressSpaceHandle>(kv->backend));
+        }
+        option.transfer_requirements.swap(requirements);
+        return true;
+    };
     const std::optional<MaterializationSourceProtection> protection =
         materialization_source_protection(details);
     if (!protection) { reject_reason("compose-no-protection"); return false; }
@@ -3946,6 +4129,11 @@ bool ProgramImplCore::compose_pressure_candidate(
             expected = proposed;
         }
         if (expected != proposed || expected.shared_owner) { reject_reason("compose-outcome-mismatch"); return false; }
+        const SequenceState& composing_owner = continuation_states[index];
+        if (!claim_pressure_pages(expected,
+                                  composing_owner.kv ? &*composing_owner.kv : nullptr)) {
+            return false;
+        }
         details.pressure_options.push_back(expected);
         details.pressure_owner_ids.push_back(planning_owner);
         details.pressure_indices.push_back(index);
@@ -4008,6 +4196,11 @@ bool ProgramImplCore::compose_pressure_candidate(
             expected = proposed;
         }
         if (expected != proposed || !expected.shared_owner) { reject_reason("compose-shared-outcome-mismatch"); return false; }
+        const SharedPrefixState& composing_owner = shared_prefix_states[index];
+        if (!claim_pressure_pages(expected,
+                                  composing_owner.kv ? &*composing_owner.kv : nullptr)) {
+            return false;
+        }
         details.shared_pressure_options.push_back(expected);
         details.shared_pressure_owner_ids.push_back(planning_owner);
         details.shared_pressure_indices.push_back(index);
@@ -5835,6 +6028,31 @@ void ProgramImplCore::prepare_pressure_bookkeeping(MaterializationTransaction::P
                 if (action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
                     change.sources.resize(action.page_count);
                 }
+                // Baseline for the prepare-time verdict below: this runs when the committed plan
+                // is bound to its owner, so the five conditions read here are what the plan was
+                // built against. prepare_pressure_work re-reads them and throws - latching the
+                // engine - when any of them moved; printing both ends names WHICH one moved
+                // instead of only the class (2026-09-25: `pressure KV replica changed before
+                // transfer` said nothing about the flip).
+                if (const char* diag = std::getenv("NINFER_REUSE_DIAG");
+                    diag == nullptr || *diag != '0') {
+                    std::uint32_t dev_off = 0, host_on = 0, writers = 0, pins = 0, active = 0;
+                    for (const LogicalKVPageHandle page : change.pages) {
+                        dev_off += pages->device_resident(page) ? 0U : 1U;
+                        host_on += pages->host_resident(page) ? 1U : 0U;
+                        writers += pages->writer_references(page) != 0 ? 1U : 0U;
+                        pins += pages->source_pins(page) != 0 ? 1U : 0U;
+                        active += addresses->has_active_reference(page) ? 1U : 0U;
+                    }
+                    std::fprintf(stderr,
+                                 "[pressure] plan kind=%d space=%s begin=%u count=%u dev_off=%u"
+                                 " host_on=%u writers=%u pins=%u active=%u\n",
+                                 static_cast<int>(action.kind),
+                                 addresses == backend_kv_addresses.get() ? "bk" : "main",
+                                 action.begin_page, action.page_count, dev_off, host_on, writers,
+                                 pins, active);
+                    std::fflush(stderr);
+                }
             }
         };
     prepare(text_kv_addresses.get(), text_kv_pages.get(), kv->text, work.option.main_kv_changes,
@@ -6057,10 +6275,26 @@ void ProgramImplCore::prepare_pressure_work(MaterializationTransaction::Pressure
                     : host_resident;
             const bool removes_device =
                 action.kind != qwen3_6::detail::PressureKVDecisionKind::DropHostDuplicate;
-            if (!pages.device_resident(logical) || pages.writer_references(logical) != 0 ||
-                pages.source_pins(logical) != 0 || !valid_residency ||
-                (removes_device && addresses.has_active_reference(logical))) {
-                throw std::logic_error("pressure KV replica changed before transfer");
+            const bool device_resident  = pages.device_resident(logical);
+            const std::uint32_t writers = pages.writer_references(logical);
+            const std::uint32_t pins    = pages.source_pins(logical);
+            const bool active_reference = addresses.has_active_reference(logical);
+            if (!device_resident || writers != 0 || pins != 0 || !valid_residency ||
+                (removes_device && active_reference)) {
+                // This throw latches the whole engine (fail_all_locked -> 503 until restart), so
+                // the first reproduction has to name the flipped condition instead of the class:
+                // a residency mismatch is a planner/prepare disagreement, while device/writers/
+                // pins/active say the plan went stale between selection and this pass.
+                throw std::logic_error(
+                    "pressure KV replica changed before transfer: kind=" +
+                    std::to_string(static_cast<int>(action.kind)) + " page=" +
+                    std::to_string(action.begin_page + offset) + "/" +
+                    std::to_string(action.page_count) + " device=" +
+                    std::to_string(device_resident ? 1 : 0) + " host=" +
+                    std::to_string(host_resident ? 1 : 0) + " residency=" +
+                    std::to_string(valid_residency ? 1 : 0) + " writers=" +
+                    std::to_string(writers) + " pins=" + std::to_string(pins) + " active=" +
+                    std::to_string(active_reference ? 1 : 0));
             }
             if (change.pages[offset] != logical) {
                 throw std::logic_error("pressure KV membership changed before transfer");
@@ -7056,6 +7290,36 @@ ProgramImplCore::RetireVictim ProgramImplCore::select_retire_victim() const noex
     retire_pick_from_order_ = false;
     retire_pick_rank_       = 0;
     retire_pick_score_      = 0;
+    // This ladder runs INSIDE a live materialization transaction: prepare_pressure_work calls
+    // release_state_capacity_step("capture-destination") when Host state is full. Retiring an
+    // owner that transaction still has to prepare makes that work's own `valid_owner` check fail
+    // (-> `pressure work source changed before transfer`, latching the engine), and retiring an
+    // eviction victim makes release_materialization_victim report a changed reservation. Same
+    // shape as the KV pin bug: one step mutates what another step's validation reads.
+    // `owner_holds_release_protected_state` already guards the reservation's own state; these two
+    // guard the transaction's owners.
+    const auto pinned_private = [&](std::uint32_t slot) -> bool {
+        return slot < continuation_capacity &&
+               materialization_pins(slot, continuation_slots[slot].generation);
+    };
+    const auto pinned_shared = [&](std::uint32_t slot) -> bool {
+        if (slot >= shared_prefix_capacity) { return true; }
+        const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_);
+        if (transaction == nullptr) { return false; }
+        const std::uint64_t generation = shared_prefix_slots[slot].generation;
+        if (transaction->has_shared_source && transaction->shared_source_index == slot &&
+            transaction->shared_source_generation == generation) {
+            return true;
+        }
+        for (std::size_t position = 0; position < transaction->shared_victim_count; ++position) {
+            if (!transaction->shared_victim_released[position] &&
+                transaction->shared_victim_indices[position] == slot &&
+                transaction->shared_victim_generations[position] == generation) {
+                return true;
+            }
+        }
+        return false;
+    };
     // The common layer's value order first. Retirement is destructive and used to be decided by
     // age alone, which is how a 237k-token conversation was dropped at 22:19 while nine freshly
     // created 31k test sessions stayed (2026-09-23): its state was simply the longest untouched.
@@ -7069,6 +7333,7 @@ ProgramImplCore::RetireVictim ProgramImplCore::select_retire_victim() const noex
             const SharedPrefixSlotRole role = shared_prefix_slots[entry.slot].role;
             if (role == SharedPrefixSlotRole::Free) { continue; }
             if (!can_release_shared_prefix_state(entry.slot, role)) { continue; }
+            if (pinned_shared(entry.slot)) { continue; }
             victim.shared = entry.slot;
             victim.continuation.reset();
             retire_pick_from_order_ = true;
@@ -7081,6 +7346,7 @@ ProgramImplCore::RetireVictim ProgramImplCore::select_retire_victim() const noex
         if (!can_release_continuation_slot_strict(entry.slot)) { continue; }
         // Retiring this owner would release the very state the in-flight reservation restores.
         if (owner_holds_release_protected_state(entry.slot)) { continue; }
+        if (pinned_private(entry.slot)) { continue; }
         victim.continuation = entry.slot;
         victim.shared.reset();
         retire_pick_from_order_ = true;
@@ -7098,6 +7364,7 @@ ProgramImplCore::RetireVictim ProgramImplCore::select_retire_victim() const noex
         if (!can_release_continuation_slot_strict(index)) { continue; }
         // Retiring this owner would release the very state the in-flight reservation restores.
         if (owner_holds_release_protected_state(index)) { continue; }
+        if (pinned_private(index)) { continue; }
         const std::uint64_t age =
             state_store->last_touched(continuation_states[index].state.read);
         if (!best_continuation && !best_shared) {
@@ -7113,6 +7380,7 @@ ProgramImplCore::RetireVictim ProgramImplCore::select_retire_victim() const noex
         const SharedPrefixSlotRole role = shared_prefix_slots[index].role;
         if (role == SharedPrefixSlotRole::Free) { continue; }
         if (!can_release_shared_prefix_state(index, role)) { continue; }
+        if (pinned_shared(index)) { continue; }
         const std::uint64_t age = state_store->last_touched(shared_prefix_states[index].state);
         if (age < best_age) {
             best_shared.reset();
