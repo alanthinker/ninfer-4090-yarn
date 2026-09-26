@@ -1168,7 +1168,10 @@ private:
     // earlier victim of this round has claimed, keyed by physical descriptor exactly like
     // compose's claim_pressure_pages. Host-side actions (DropHostDuplicate) deliver no Device
     // relief and are ignored here.
-    [[nodiscard]] std::uint32_t attribute_pressure_move_relief(
+    // Per pool: (MAIN pages, BACKEND pages) first-wins attributed to this decision. The plan
+    // closes the two Device pools separately (the feasibility gate checks them separately), so
+    // the attribution has to stay split too.
+    [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> attribute_pressure_move_relief(
         const qwen3_6::detail::PressureDecision& decision, const SequenceKVBundle& kv,
         PressureReliefClaim& claim) const;
     // Device StateImage slots the capacity-release ladder can still free: Both-resident

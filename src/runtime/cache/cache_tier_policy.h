@@ -37,8 +37,15 @@ namespace ninfer::runtime::cache {
 // Capacity and occupancy of all four pools, each in its own unit.
 // `*_used <= *_capacity` holds per pool.
 struct TierOccupancy {
-    std::uint64_t device_kv_used       = 0;
+    std::uint64_t device_kv_used       = 0;   // MAIN KV pool
     std::uint64_t device_kv_capacity   = 0;
+    // The speculative BACKEND KV pool is a SEPARATE pool the feasibility gate checks on its own
+    // (physical_peak_fits checks backend used+peak against backend capacity). A plan that closes
+    // main+backend as one sum while this pool stays pinned is rejected at assessment - battery
+    // 2026-09-26: controller target Infeasible with backend_kv 10288+66/10288 while main was
+    // fully closed by 489 pages of relief.
+    std::uint64_t device_backend_kv_used    = 0;
+    std::uint64_t device_backend_kv_capacity = 0;
     std::uint64_t device_state_used    = 0;
     std::uint64_t device_state_capacity = 0;
     std::uint64_t host_kv_used         = 0;
@@ -52,6 +59,11 @@ struct TierOccupancy {
 
     [[nodiscard]] std::uint64_t device_kv_free() const noexcept {
         return device_kv_capacity > device_kv_used ? device_kv_capacity - device_kv_used : 0;
+    }
+    [[nodiscard]] std::uint64_t device_backend_kv_free() const noexcept {
+        return device_backend_kv_capacity > device_backend_kv_used
+                   ? device_backend_kv_capacity - device_backend_kv_used
+                   : 0;
     }
     [[nodiscard]] std::uint64_t device_state_free() const noexcept {
         return device_state_capacity > device_state_used
@@ -72,7 +84,8 @@ struct TierOccupancy {
 // and the state images - because the policy performs no conversion between tiers or between
 // pools. Only the caller, which owns both layouts, can assemble those numbers.
 struct Demand {
-    std::uint64_t device_kv    = 0;
+    std::uint64_t device_kv         = 0;  // MAIN pool pages
+    std::uint64_t device_backend_kv = 0;  // BACKEND pool pages: never interchangeable with main
     std::uint64_t device_state = 0;
     std::uint64_t host_kv      = 0;
     std::uint64_t host_state   = 0;
@@ -93,8 +106,16 @@ struct Demand {
 // excluded from every candidate list below.
 struct Datum {
     std::uint64_t id           = 0;  // catalog row: the conversation's identity
-    std::uint64_t device_kv    = 0;  // its Device KV, in Device KV units
+    std::uint64_t device_kv    = 0;  // MAIN pages a SPILL of this owner takes off Device
+    std::uint64_t device_backend_kv = 0;  // BACKEND pages (the separate pool)
     std::uint64_t device_state = 0;  // its Device state images, in Device state slots
+    // Device relief a whole-conversation RELEASE delivers (the eviction option's full
+    // footprint). Distinct from the three fields above: the release loop credits THESE (a drop
+    // evicts everything it holds), the spill loop credits the move attribution above (a spill
+    // moves what the option's per-store actions actually touch).
+    std::uint64_t evict_device_kv      = 0;
+    std::uint64_t evict_device_backend_kv = 0;
+    std::uint64_t evict_device_state   = 0;
     std::uint64_t host_kv      = 0;  // its Host KV, in bytes
     std::uint64_t host_state   = 0;  // its Host state images, in Host state slots
     // The catalog row this conversation occupies (1 for every pooled owner - the pool IS the
@@ -178,14 +199,16 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
     // `need.host_*` already carries what a Device spill will consume on Host.
     const std::uint64_t device_kv_gap =
         shortfall(need.device_kv, occupancy.device_kv_free());
+    const std::uint64_t device_backend_gap =
+        shortfall(need.device_backend_kv, occupancy.device_backend_kv_free());
     const std::uint64_t device_state_gap =
         shortfall(need.device_state, occupancy.device_state_free());
     const std::uint64_t host_kv_gap    = shortfall(need.host_kv, occupancy.host_kv_free());
     const std::uint64_t host_state_gap = shortfall(need.host_state, occupancy.host_state_free());
     const std::uint64_t rows_gap = shortfall(need.catalog_rows, occupancy.catalog_rows_vacant);
 
-    if (device_kv_gap == 0 && device_state_gap == 0 && host_kv_gap == 0 &&
-        host_state_gap == 0 && rows_gap == 0) {
+    if (device_kv_gap == 0 && device_backend_gap == 0 && device_state_gap == 0 &&
+        host_kv_gap == 0 && host_state_gap == 0 && rows_gap == 0) {
         return out;  // R3: everything the request needs is already placeable.
     }
 
@@ -211,9 +234,10 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
     dropped.reserve(candidates.size());
     std::uint64_t host_kv_freed        = 0;
     std::uint64_t host_state_freed     = 0;
-    std::uint64_t rows_freed           = 0;
-    std::uint64_t released_device_kv    = 0;
-    std::uint64_t released_device_state = 0;
+    std::uint64_t rows_freed             = 0;
+    std::uint64_t released_device_kv      = 0;
+    std::uint64_t released_device_backend = 0;
+    std::uint64_t released_device_state   = 0;
     for (const Datum* datum : candidates) {
         if (host_kv_freed >= host_kv_gap && host_state_freed >= host_state_gap &&
             rows_freed >= rows_gap) {
@@ -229,8 +253,18 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
         host_kv_freed += datum->host_kv;
         host_state_freed += datum->host_state;
         rows_freed += datum->catalog_row;
-        released_device_kv += datum->device_kv;
-        released_device_state += datum->device_state;
+        // The RELEASE delivers the eviction option's full footprint; fall back to the move
+        // attribution when no eviction footprint was recorded (the drop subsumes the move
+        // anyway - the prelude moves its pages first, then the release frees them all).
+        released_device_kv += datum->evict_device_kv > datum->device_kv
+                                  ? datum->evict_device_kv
+                                  : datum->device_kv;
+        released_device_backend += datum->evict_device_backend_kv > datum->device_backend_kv
+                                       ? datum->evict_device_backend_kv
+                                       : datum->device_backend_kv;
+        released_device_state += datum->evict_device_state > datum->device_state
+                                     ? datum->evict_device_state
+                                     : datum->device_state;
     }
 
     // R1: move Device-resident SURVIVORS to Host, least important first, until the Device gaps
@@ -240,26 +274,38 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
     // and latch the engine (plan and execution must agree on one action per conversation).
     const std::uint64_t device_kv_needed =
         device_kv_gap > released_device_kv ? device_kv_gap - released_device_kv : 0;
+    const std::uint64_t device_backend_needed =
+        device_backend_gap > released_device_backend
+            ? device_backend_gap - released_device_backend
+            : 0;
     const std::uint64_t device_state_needed =
         device_state_gap > released_device_state ? device_state_gap - released_device_state : 0;
     std::vector<Step> spills;
     spills.reserve(candidates.size());
-    std::uint64_t device_kv_moved    = 0;
-    std::uint64_t device_state_moved = 0;
+    std::uint64_t device_kv_moved      = 0;
+    std::uint64_t device_backend_moved = 0;
+    std::uint64_t device_state_moved   = 0;
     for (const Datum* datum : candidates) {
         if (std::find(dropped.begin(), dropped.end(), datum->id) != dropped.end()) { continue; }
         if (device_kv_moved >= device_kv_needed &&
+            device_backend_moved >= device_backend_needed &&
             device_state_moved >= device_state_needed) {
             break;
         }
+        // Per-pool: a victim counts only toward the pool it actually relieves. Main-heavy owners
+        // cannot close a Backend gap however large their main relief is - and the assessment
+        // checks the pools separately, so the plan must too.
         const bool helps_kv =
             device_kv_moved < device_kv_needed && datum->device_kv > 0;
+        const bool helps_backend = device_backend_moved < device_backend_needed &&
+                                   datum->device_backend_kv > 0;
         const bool helps_state =
             device_state_moved < device_state_needed && datum->device_state > 0;
-        if (!helps_kv && !helps_state) { continue; }
+        if (!helps_kv && !helps_backend && !helps_state) { continue; }
         spills.push_back(Step{datum->id, Action::SpillToHost, datum->device_kv,
                               datum->device_state, datum->importance});
         device_kv_moved += datum->device_kv;
+        device_backend_moved += datum->device_backend_kv;
         device_state_moved += datum->device_state;
     }
 
@@ -267,8 +313,9 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
     // applied at all - nothing is deleted, nothing is moved, the caller waits instead (R0).
     const bool host_short =
         host_kv_freed < host_kv_gap || host_state_freed < host_state_gap;
-    const bool device_short =
-        device_kv_moved < device_kv_needed || device_state_moved < device_state_needed;
+    const bool device_short = device_kv_moved < device_kv_needed ||
+                              device_backend_moved < device_backend_needed ||
+                              device_state_moved < device_state_needed;
     const bool rows_short = rows_freed < rows_gap;
     if (device_short || host_short || rows_short) {
         out.enqueue = true;
@@ -308,12 +355,16 @@ inline std::string describe(const Plan& outcome, const Demand& need,
     };
     std::string line =
         "[cache] gap dkv=" + std::to_string(need.device_kv) +
+        " dbkv=" + std::to_string(need.device_backend_kv) +
         " dstate=" + std::to_string(need.device_state) + " hkv=" + std::to_string(need.host_kv) +
-        " hstate=" + std::to_string(need.host_state) + " | free dkv=" +
-        std::to_string(occupancy.device_kv_free()) + " dstate=" +
+        " hstate=" + std::to_string(need.host_state) + " rows=" +
+        std::to_string(need.catalog_rows) + " | free dkv=" +
+        std::to_string(occupancy.device_kv_free()) + " dbkv=" +
+        std::to_string(occupancy.device_backend_kv_free()) + " dstate=" +
         std::to_string(occupancy.device_state_free()) + " hkv=" +
         std::to_string(occupancy.host_kv_free()) + " hstate=" +
-        std::to_string(occupancy.host_state_free()) + " | steps=" +
+        std::to_string(occupancy.host_state_free()) + " rows=" +
+        std::to_string(occupancy.catalog_rows_vacant) + " | steps=" +
         std::to_string(outcome.steps.size());
     if (outcome.enqueue) {
         line += " enqueue reason=";

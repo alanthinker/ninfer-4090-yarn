@@ -8525,19 +8525,20 @@ ProgramImplCore::PressureReliefClaim ProgramImplCore::begin_pressure_relief_clai
     return claim;
 }
 
-std::uint32_t ProgramImplCore::attribute_pressure_move_relief(
+std::pair<std::uint32_t, std::uint32_t> ProgramImplCore::attribute_pressure_move_relief(
     const qwen3_6::detail::PressureDecision& decision, const SequenceKVBundle& kv,
     PressureReliefClaim& claim) const {
     // Keyed by physical descriptor (the same identity compose's claim_pressure_pages strips
     // duplicates by), so a page shared by several victims is promised by exactly the first of
     // them: the policy's sum over any chosen subset can no longer exceed the union that is
     // actually delivered (缓存模块v2.md §八).
-    std::uint32_t attributed = 0;
     const auto walk          = [&](const KVAddressSpaceStore& addresses,
                                    const LogicalKVPageStore& pages, const KVAddressSpaceHandle& address,
                                    std::vector<std::uint8_t>& claimed,
-                                   const std::vector<qwen3_6::detail::PressureKVDecision>& changes) {
-        if (changes.empty() || !addresses.valid(address)) { return; }
+                                   const std::vector<qwen3_6::detail::PressureKVDecision>& changes)
+        -> std::uint32_t {
+        if (changes.empty() || !addresses.valid(address)) { return 0; }
+        std::uint32_t attributed = 0;
         const std::uint32_t mapped = addresses.mapped_pages(address);
         for (const qwen3_6::detail::PressureKVDecision& action : changes) {
             if (action.kind == qwen3_6::detail::PressureKVDecisionKind::DropHostDuplicate) {
@@ -8556,15 +8557,18 @@ std::uint32_t ProgramImplCore::attribute_pressure_move_relief(
                 ++attributed;
             }
         }
+        return attributed;
     };
-    if (!text_kv_addresses || !text_kv_pages) { return 0; }
-    walk(*text_kv_addresses, *text_kv_pages, kv.text, claim.main, decision.main_kv_changes);
+    if (!text_kv_addresses || !text_kv_pages) { return {0, 0}; }
+    const std::uint32_t main =
+        walk(*text_kv_addresses, *text_kv_pages, kv.text, claim.main, decision.main_kv_changes);
+    std::uint32_t backend = 0;
     if (!decision.backend_kv_changes.empty() && kv.backend && backend_kv_addresses &&
         backend_kv_pages) {
-        walk(*backend_kv_addresses, *backend_kv_pages, *kv.backend, claim.backend,
-             decision.backend_kv_changes);
+        backend = walk(*backend_kv_addresses, *backend_kv_pages, *kv.backend, claim.backend,
+                       decision.backend_kv_changes);
     }
-    return attributed;
+    return {main, backend};
 }
 
 bool ProgramImplCore::physical_peak_fits(detail::PhysicalResources peak) const noexcept {
@@ -9462,7 +9466,13 @@ ProgramImplCore::checkpoint_recovery_work(const ContinuationHandle& owner,
         return source.checkpoint->ref == checkpoint;
     });
     if (selected == sources.end() || !state_store->valid(selected->state)) {
-        throw std::logic_error("checkpoint recovery target is unavailable");
+        // Stale, not broken: the emergency release ladder may have dropped this ONE checkpoint
+        // (degrade_idle_owner_host_state) between the caller's catalog view and this pricing
+        // call while the owner itself stays alive. The pricing caller treats
+        // StalePlanningReference as "no realizable saving - skip" (resource_manager.h
+        // try_price_checkpoint_recovery); a logic_error here would latch the whole engine over
+        // a race the design explicitly tolerates.
+        throw runtime::StalePlanningReference("checkpoint recovery target is unavailable");
     }
     std::vector<runtime::CheckpointRecoveryAlternativeWork> alternatives;
     alternatives.reserve(sources.size() + 1U);
@@ -9494,7 +9504,10 @@ ProgramImplCore::checkpoint_recovery_work(const SharedPrefixHandle& owner,
     if (!shared.kv) { throw std::logic_error("shared checkpoint recovery owner has no KV bundle"); }
     const qwen3_6::CheckpointSummary summary = shared_prefix_summary(shared).checkpoint;
     if (summary.ref != checkpoint || !state_store->valid(shared.state)) {
-        throw std::logic_error("shared checkpoint recovery target is unavailable");
+        // Same ladder race as the private overload: the owner is alive but the checkpoint this
+        // caller priced is gone - a stale planning reference, skipped by the caller, never a
+        // reason to latch the engine.
+        throw runtime::StalePlanningReference("shared checkpoint recovery target is unavailable");
     }
     std::vector<runtime::CheckpointRecoveryAlternativeWork> alternatives;
     alternatives.reserve(2);

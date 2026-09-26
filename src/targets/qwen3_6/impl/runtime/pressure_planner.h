@@ -765,8 +765,10 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
     const detail::PhysicalResources occupancy  = program->physical_occupancy();
     const detail::PhysicalResources capacity   = program->admission_capacity();
     const cachep::TierOccupancy tiers{
-        .device_kv_used        = device_kv(occupancy),
-        .device_kv_capacity    = device_kv(capacity),
+        .device_kv_used        = occupancy.device.main_kv_pages,
+        .device_kv_capacity    = capacity.device.main_kv_pages,
+        .device_backend_kv_used    = occupancy.device.backend_kv_pages,
+        .device_backend_kv_capacity = capacity.device.backend_kv_pages,
         .device_state_used     = device_state(occupancy),
         .device_state_capacity = device_state(capacity),
         .host_kv_used          = host_kv(occupancy),
@@ -779,11 +781,14 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
     // policy needs no conversion of its own. KV meets its Host landing unit here - one logical page
     // is one Host page, so the stride is exact - and state is one slot on either side.
     const cachep::Demand demand{
-        .device_kv     = device_kv(residual),
-        .device_state  = device_state(residual),
-        .host_kv       = host_kv(residual) + device_kv(residual) * page_bytes,
-        .host_state    = host_state(residual) + device_state(residual),
-        .catalog_rows  = need_rows,
+        .device_kv         = residual.device.main_kv_pages,
+        .device_backend_kv = residual.device.backend_kv_pages,
+        .device_state      = device_state(residual),
+        // The Host landing budget covers BOTH pools: every page that moves off Device (main or
+        // backend) lands here, and one logical page is one Host page either way.
+        .host_kv           = host_kv(residual) + device_kv(residual) * page_bytes,
+        .host_state        = host_state(residual) + device_state(residual),
+        .catalog_rows      = need_rows,
     };
 
     // For every victim, ask what MOVING it can actually hand back to Device. This is NOT the same
@@ -850,23 +855,34 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         const CandidateVictimOptions& victim = options.victims[victim_index];
         const Owner& owner_entry             = owners[victim.owner_index];
         const MoveOption& move               = move_options[victim_index];
-        std::uint64_t droppable_kv           = 0;
-        std::uint64_t droppable_state        = 0;
+        std::uint64_t droppable_kv              = 0;
+        std::uint64_t droppable_state           = 0;
+        std::uint64_t evict_device_kv           = 0;
+        std::uint64_t evict_device_backend_kv   = 0;
+        std::uint64_t evict_device_state        = 0;
         if (victim.eviction_choice != 0 && victim.eviction_choice <= victim.decisions.size()) {
             const detail::PhysicalResources& removed =
                 victim.decisions[victim.eviction_choice - 1U].effect.removed;
-            droppable_kv    = removed.host.kv_bytes;
-            droppable_state = static_cast<std::uint64_t>(removed.host.state_slots);
+            droppable_kv           = removed.host.kv_bytes;
+            droppable_state        = static_cast<std::uint64_t>(removed.host.state_slots);
+            // What a whole-conversation RELEASE frees on Device: the eviction option's full
+            // footprint. The release loop credits exactly this; the spill loop credits the move
+            // attribution below - two actions, two ledgers, no double count (the release loop's
+            // victims are skipped by the spill loop entirely).
+            evict_device_kv         = removed.device.main_kv_pages;
+            evict_device_backend_kv = removed.device.backend_kv_pages;
+            evict_device_state      = removed.device.state_slots;
         }
         if (move.device_kv == 0 && move.device_state == 0 && droppable_kv == 0 &&
-            droppable_state == 0) {
+            droppable_state == 0 && need_rows == 0) {
             continue;
         }
         // Device relief of the move the apply step will run (move.choice), counted once per
         // physical page across this round. Host/state effects need no claims: eviction effects
         // come from owner_exclusive_resources (skips address_references > 1) and StateImages are
         // settled once.
-        std::uint64_t attributed_device_kv = 0;
+        std::uint64_t attributed_device_kv      = 0;
+        std::uint64_t attributed_backend_kv      = 0;
         if (move.choice != 0 && move.choice <= victim.decisions.size()) {
             const PressureDecision& chosen = victim.decisions[move.choice - 1U];
             if (!chosen.evicts_continuation) {
@@ -885,16 +901,22 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
                               return sequence.kv ? &*sequence.kv : nullptr;
                           }();
                 if (kv != nullptr) {
-                    attributed_device_kv = program->attribute_pressure_move_relief(
-                        chosen, *kv, relief_claim);
+                    const std::pair<std::uint32_t, std::uint32_t> attributed =
+                        program->attribute_pressure_move_relief(chosen, *kv, relief_claim);
+                    attributed_device_kv = attributed.first;
+                    attributed_backend_kv = attributed.second;
                 }
             }
         }
         pool.push_back(cachep::Datum{
             .id           = victim_index,
-            .device_kv    = attributed_device_kv, // what R1 can take off Device, in pages:
+            .device_kv    = attributed_device_kv, // what R1's SPILL takes off Device, per pool:
                                                   // union-honest, first-wins across victims
+            .device_backend_kv = attributed_backend_kv,
             .device_state = move.device_state,  // ... and the Device state slots it hands back
+            .evict_device_kv      = evict_device_kv,
+            .evict_device_backend_kv = evict_device_backend_kv,
+            .evict_device_state   = evict_device_state,
             .host_kv      = droppable_kv,       // what R2 would free on Host, in bytes
             .host_state   = droppable_state,    // ... and the Host state slots it hands back
             // A shared prefix occupies a SHARED catalog row: releasing it never gives a fresh

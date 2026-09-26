@@ -105,6 +105,36 @@ void check(bool condition, const char* what) {
 // §7 acceptance #1: Device is full, Host has room -> delete NOTHING and move Device pages to
 // Host. "删除数 = 0" is asserted outright: a Device shortage with Host roomy must never cost a
 // single cached conversation.
+// The two Device KV pools are checked separately by the feasibility gate, so the plan must
+// close them separately: a Main-heavy victim cannot answer a Backend gap however large its
+// Main relief, and vice versa (battery 2026-09-26: controller targets rejected with
+// backend_kv 10288+66/10288 while Main was closed by489 pages).
+void case_backend_pool_closes_independently() {
+    std::printf("case_backend_pool_closes_independently\n");
+    const std::vector<Datum> pool{
+        // huge Main, zero Backend - cannot answer the Backend gap at any priority
+        {.id = 1, .device_kv = 500, .device_backend_kv = 0, .importance = 1},
+        // modest Backend relief - the only one that counts for it
+        {.id = 2, .device_kv = 0, .device_backend_kv = 40, .importance = 9},
+        {.id = 3, .device_kv = 40, .device_backend_kv = 10, .importance = 50},
+    };
+    TierOccupancy occ = occupancy(100, 100, 1000, 0);
+    occ.device_backend_kv_used     = 100;
+    occ.device_backend_kv_capacity = 100;
+    const Plan outcome =
+        decide(Demand{.device_kv = 30, .device_backend_kv = 30}, occ, pool);
+
+    check(!outcome.enqueue, "both pools close");
+    bool took_id1 = false, took_backend_holder = false;
+    for (const auto& step : outcome.steps) {
+        if (step.action != Action::SpillToHost) { continue; }
+        if (step.id == 1) { took_id1 = true; }
+        if (step.id == 2 || step.id == 3) { took_backend_holder = true; }
+    }
+    check(took_backend_holder, "the Backend gap takes a victim that has Backend relief");
+    check(took_id1, "the Main gap still takes the Main-heavy victim first");
+}
+
 void case_device_short_host_roomy() {
     std::printf("case device_short_host_roomy\n");
     const std::vector<Datum> pool{
@@ -453,6 +483,7 @@ void case_equal_importance_ranks_by_age_then_id() {
 }  // namespace
 
 int main() {
+    case_backend_pool_closes_independently();
     case_device_short_host_roomy();
     case_host_room_reserved_for_spill();
     case_nothing_spillable_enqueues_without_dropping();
