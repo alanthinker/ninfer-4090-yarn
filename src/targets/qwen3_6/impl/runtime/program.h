@@ -1168,6 +1168,14 @@ private:
     // earlier victim of this round has claimed, keyed by physical descriptor exactly like
     // compose's claim_pressure_pages. Host-side actions (DropHostDuplicate) deliver no Device
     // relief and are ignored here.
+    // JOINT-FREEABLE Device pages per droppable owner: (main, backend) pages that are shared
+    // with other owners (address_references > 1) yet EVERY referent sits inside this same
+    // droppable set - releasing the whole set returns them physically, once each. Pages shared
+    // with anyone outside the set (active/protected) are NOT counted: they cannot be promised.
+    // The policy's shell pass needs this because owner_exclusive_resources is0 for such owners
+    // (rig soak: cand=20 steps=0 while1024/1024 Device pages sat under fork-shared sessions).
+    [[nodiscard]] std::vector<std::pair<std::uint32_t, std::uint32_t>> joint_device_pages(
+        std::span<const std::uint32_t> droppable_indices) const;
     // Per pool: (MAIN pages, BACKEND pages) first-wins attributed to this decision. The plan
     // closes the two Device pools separately (the feasibility gate checks them separately), so
     // the attribution has to stay split too.

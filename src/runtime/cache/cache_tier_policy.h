@@ -116,6 +116,15 @@ struct Datum {
     std::uint64_t evict_device_kv      = 0;
     std::uint64_t evict_device_backend_kv = 0;
     std::uint64_t evict_device_state   = 0;
+    // JOINT-FREEABLE Device pages: shared with other owners (fork/copy-on-write,
+    // address_references > 1) but EVERY referent is inside the droppable candidate set - so
+    // releasing those referents together frees these pages physically, exactly once each. The
+    // program fills this (it owns the address spaces); a zero here means the page is shared
+    // with someone we may NOT release (active/protected) and cannot be promised at all.
+    // owner_exclusive_resources is0 for pure-shared shells - evicting one frees nothing - which
+    // is why these pages need their own field and their own pass (rig soak: cand=20 steps=0).
+    std::uint64_t joint_device_kv      = 0;
+    std::uint64_t joint_device_backend_kv = 0;
     std::uint64_t host_kv      = 0;  // its Host KV, in bytes
     std::uint64_t host_state   = 0;  // its Host state images, in Host state slots
     // The catalog row this conversation occupies (1 for every pooled owner - the pool IS the
@@ -303,6 +312,48 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
     // delivers. A released conversation never receives a second step: its address space is
     // gone by the time the spill phase would run, so a spill step for it would fail prepare
     // and latch the engine (plan and execution must agree on one action per conversation).
+    // Shell pass: owners whose ONLY estate is joint-freeable shared pages (exclusive=0, no
+    // move, no Host) would never be picked by the main loop - 'evicting it frees nothing' -
+    // even though releasing their WHOLE referent group frees the shared physical pages. Drop
+    // every such shell still standing (their joint pages are by construction fully inside the
+    // candidate set, and a shared page only returns when its LAST referent goes), then credit
+    // the pages ONCE - the maximum single owner's joint claim is a sound lower bound for one
+    // group and never double-counts a page listed by both referents.
+    if (device_kv_gap > released_device_kv || device_backend_gap > released_device_backend ||
+        device_state_gap > released_device_state) {
+        std::uint64_t joint_main_max = 0, joint_bkv_max = 0, joint_state_max = 0;
+        std::size_t shells = 0;
+        for (const Datum* datum : candidates) {
+            if (std::find(dropped.begin(), dropped.end(), datum->id) != dropped.end()) {
+                continue;
+            }
+            // A TRUE shell: no exclusive estate, no move option (spill-first still wins when
+            // a move exists), no Host release - its pages exist only jointly.
+            const bool shell =
+                datum->evict_device_kv == 0 && datum->evict_device_state == 0 &&
+                datum->device_kv == 0 && datum->device_state == 0 && datum->host_kv == 0 &&
+                (datum->joint_device_kv > 0 || datum->joint_device_backend_kv > 0);
+            if (!shell) { continue; }
+            if (device_kv_gap <= released_device_kv &&
+                device_backend_gap <= released_device_backend &&
+                device_state_gap <= released_device_state) {
+                break;
+            }
+            dropped.push_back(datum->id);
+            ++shells;
+            host_kv_freed += datum->host_kv;
+            host_state_freed += datum->host_state;
+            rows_freed += datum->catalog_row;
+            joint_main_max = std::max(joint_main_max, datum->joint_device_kv);
+            joint_bkv_max = std::max(joint_bkv_max, datum->joint_device_backend_kv);
+        }
+        if (shells > 0) {
+            released_device_kv += std::min(joint_main_max, device_kv_gap - std::min(released_device_kv, device_kv_gap));
+            released_device_backend += std::min(joint_bkv_max, device_backend_gap - std::min(released_device_backend, device_backend_gap));
+            released_device_state += joint_state_max;
+        }
+    }
+
     const std::uint64_t device_kv_needed =
         device_kv_gap > released_device_kv ? device_kv_gap - released_device_kv : 0;
     const std::uint64_t device_backend_needed =
@@ -374,7 +425,8 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
 // under the existing NINFER_REUSE_DIAG switch, so every move and every drop is traceable to the
 // gap that caused it without the policy knowing what a log is.
 inline std::string describe(const Plan& outcome, const Demand& need,
-                            const TierOccupancy& occupancy) {
+                            const TierOccupancy& occupancy,
+                            std::size_t candidates = 0) {
     const auto reason_name = [](EnqueueReason reason) -> const char* {
         switch (reason) {
             case EnqueueReason::None: return "-";
@@ -396,7 +448,7 @@ inline std::string describe(const Plan& outcome, const Demand& need,
         std::to_string(occupancy.host_kv_free()) + " hstate=" +
         std::to_string(occupancy.host_state_free()) + " rows=" +
         std::to_string(occupancy.catalog_rows_vacant) + " | cand=" +
-        std::to_string(pool.size()) + " steps=" +
+        std::to_string(candidates) + " steps=" +
         std::to_string(outcome.steps.size());
     if (outcome.enqueue) {
         line += " enqueue reason=";

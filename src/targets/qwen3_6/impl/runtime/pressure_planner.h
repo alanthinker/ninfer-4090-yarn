@@ -866,6 +866,32 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
     auto relief_claim = program->begin_pressure_relief_claim();
     using PlanningContractAccess =
         qwen3_6::detail::RuntimeContractAccess<NINFER_QWEN36_VARIANT>;
+    // Joint-freeable Device pages (fork-shared shells): ONE query for the whole droppable set
+    // - pages whose every referent is inside the set can be returned by releasing the set, and
+    // the policy's shell pass is what drops them (owner_exclusive is0 for their owners, which
+    // is exactly the rig soak's cand=20 steps=0 stall).
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> joint_by_victim(options.victims.size(),
+                                                                         {0, 0});
+    {
+        std::vector<std::uint32_t> droppable;
+        std::vector<std::size_t> positions;
+        for (std::size_t victim_index = 0; victim_index < options.victims.size();
+             ++victim_index) {
+            const Owner& owner = owners[options.victims[victim_index].owner_index];
+            if (owner.shared || !owner.private_handle) { continue; }
+            droppable.push_back(
+                qwen3_6::detail::RuntimeContractAccess<NINFER_QWEN36_VARIANT>::index(
+                    *owner.private_handle));
+            positions.push_back(victim_index);
+        }
+        if (!droppable.empty()) {
+            const std::vector<std::pair<std::uint32_t, std::uint32_t>> joint =
+                program->joint_device_pages(droppable);
+            for (std::size_t k = 0; k < positions.size() && k < joint.size(); ++k) {
+                joint_by_victim[positions[k]] = joint[k];
+            }
+        }
+    }
     std::vector<cachep::Datum> pool;
     pool.reserve(options.victims.size());
     for (std::size_t victim_index = 0; victim_index < options.victims.size(); ++victim_index) {
@@ -877,6 +903,9 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         std::uint64_t evict_device_kv           = 0;
         std::uint64_t evict_device_backend_kv   = 0;
         std::uint64_t evict_device_state        = 0;
+        const std::pair<std::uint32_t, std::uint32_t> joint = joint_by_victim[victim_index];
+        const std::uint64_t joint_device_kv        = joint.first;
+        const std::uint64_t joint_device_backend_kv = joint.second;
         if (victim.eviction_choice != 0 && victim.eviction_choice <= victim.decisions.size()) {
             const detail::PhysicalResources& removed =
                 victim.decisions[victim.eviction_choice - 1U].effect.removed;
@@ -892,7 +921,8 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         }
         if (move.device_kv == 0 && move.device_state == 0 && droppable_kv == 0 &&
             droppable_state == 0 && need_rows == 0 && evict_device_kv == 0 &&
-            evict_device_backend_kv == 0 && evict_device_state == 0) {
+            evict_device_backend_kv == 0 && evict_device_state == 0 &&
+            joint_device_kv == 0 && joint_device_backend_kv == 0) {
             // Nothing this owner could answer on ANY axis - no move relief, no Host release,
             // no row, no Device release. The evict_device_* fields must stay in the filter:
             // without them an owner whose ONLY value is its Device footprint (no move option,
@@ -941,6 +971,8 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
             .evict_device_kv      = evict_device_kv,
             .evict_device_backend_kv = evict_device_backend_kv,
             .evict_device_state   = evict_device_state,
+            .joint_device_kv      = joint_device_kv,
+            .joint_device_backend_kv = joint_device_backend_kv,
             .host_kv      = droppable_kv,       // what R2 would free on Host, in bytes
             .host_state   = droppable_state,    // ... and the Host state slots it hands back
             // A shared prefix occupies a SHARED catalog row: releasing it never gives a fresh
@@ -953,6 +985,49 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         });
     }
 
+    if (const char* diag = std::getenv("NINFER_REUSE_DIAG"); diag == nullptr || *diag != '0') {
+        // Per-field pool truth: 'nothing can be freed' is only believable when the fields say
+        // so. A session that should own SOME exclusive estate showing all-zero across every
+        // candidate is the reference-leak signature (address_references stuck >1 on pages only
+        // one live address space still maps), not a policy verdict - print the fields first.
+        std::uint64_t ev_main = 0, ev_bkv = 0, ev_state = 0, hkv = 0, hst = 0;
+        std::uint64_t mv_main = 0, mv_state = 0, rows = 0;
+        for (const cachep::Datum& datum : pool) {
+            ev_main += datum.evict_device_kv;
+            ev_bkv += datum.evict_device_backend_kv;
+            ev_state += datum.evict_device_state;
+            hkv += datum.host_kv;
+            hst += datum.host_state;
+            mv_main += datum.device_kv;
+            mv_state += datum.device_state;
+            rows += datum.catalog_row;
+        }
+        std::fprintf(stderr,
+                     "[cache] pool sums cand=%zu ev_main=%llu ev_bkv=%llu ev_state=%llu"
+                     " host_kv=%llu host_st=%llu mv_main=%llu mv_state=%llu rows=%llu\n",
+                     pool.size(),
+                     static_cast<unsigned long long>(ev_main),
+                     static_cast<unsigned long long>(ev_bkv),
+                     static_cast<unsigned long long>(ev_state),
+                     static_cast<unsigned long long>(hkv),
+                     static_cast<unsigned long long>(hst),
+                     static_cast<unsigned long long>(mv_main),
+                     static_cast<unsigned long long>(mv_state),
+                     static_cast<unsigned long long>(rows));
+        for (std::size_t i = 0; i < pool.size() && i < 4; ++i) {
+            const cachep::Datum& datum = pool[i];
+            std::fprintf(stderr,
+                         "[cache]   datum[%zu] id=%llu ev_main=%llu ev_state=%llu"
+                         " host_kv=%llu host_st=%llu mv=%llu\n",
+                         i, static_cast<unsigned long long>(datum.id),
+                         static_cast<unsigned long long>(datum.evict_device_kv),
+                         static_cast<unsigned long long>(datum.evict_device_state),
+                         static_cast<unsigned long long>(datum.host_kv),
+                         static_cast<unsigned long long>(datum.host_state),
+                         static_cast<unsigned long long>(datum.device_kv));
+        }
+        std::fflush(stderr);
+    }
     cachep::Plan plan = cachep::plan(demand, tiers, pool);
     // The R1 loop picks whole conversations, so its landing can overshoot the budgeted device
     // gap (rig fill[3]: gap239 pages budgeted,251 pages chosen -48 MiB of landing nobody made
@@ -1017,7 +1092,8 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
     }
     if (plan.enqueue) { apply_plan(); } // keep the diagnostic views consistent
     if (const char* diag = std::getenv("NINFER_REUSE_DIAG"); diag == nullptr || *diag != '0') {
-        std::fprintf(stderr, "%s\n", cachep::describe(plan, demand, tiers).c_str());
+        std::fprintf(stderr, "%s\n",
+                     cachep::describe(plan, demand, tiers, pool.size()).c_str());
         std::fflush(stderr);
     }
     if (plan.enqueue) { return std::nullopt; }  // R0: the caller enqueues.

@@ -8614,6 +8614,53 @@ ProgramImplCore::PressureReliefClaim ProgramImplCore::begin_pressure_relief_clai
     return claim;
 }
 
+std::vector<std::pair<std::uint32_t, std::uint32_t>>
+ProgramImplCore::joint_device_pages(std::span<const std::uint32_t> droppable_indices) const {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> out(droppable_indices.size(), {0, 0});
+    if (!text_kv_pages || droppable_indices.empty()) { return out; }
+    const auto run_store = [&](const KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                               bool backend, bool use_text) {
+        // Pass1: how many droppable address spaces reference each physical descriptor.
+        std::vector<std::uint16_t> in_set(pages.capacity(), 0);
+        const auto for_each_page = [&](std::uint32_t slot, const auto& body) {
+            if (slot >= continuation_capacity) { return; }
+            const SequenceState& sequence = continuation_states[slot];
+            if (!sequence.kv) { return; }
+            const SequenceKVBundle& bundle = *sequence.kv;
+            const std::optional<KVAddressSpaceHandle> address =
+                use_text ? bundle.text : bundle.backend;
+            if (!address || !addresses.valid(*address)) { return; }
+            const std::uint32_t mapped = addresses.mapped_pages(*address);
+            for (std::uint32_t page = 0; page < mapped; ++page) {
+                body(addresses.logical_page(*address, page));
+            }
+        };
+        for (const std::uint32_t slot : droppable_indices) {
+            for_each_page(slot, [&](const LogicalKVPageHandle logical) {
+                const std::size_t desc = pages.descriptor_index(logical);
+                if (desc < in_set.size()) { ++in_set[desc]; }
+            });
+        }
+        // Pass2: per owner, its DEVICE pages whose every referent is inside the droppable set.
+        for (std::size_t position = 0; position < droppable_indices.size(); ++position) {
+            for_each_page(droppable_indices[position], [&](const LogicalKVPageHandle logical) {
+                if (!pages.device_resident(logical)) { return; }
+                const std::uint32_t refs = pages.address_references(logical);
+                if (refs <= 1) { return; } // exclusive estate belongs to evict_device_*, not joint
+                const std::size_t desc = pages.descriptor_index(logical);
+                if (desc >= in_set.size()) { return; }
+                if (in_set[desc] != refs) { return; } // a referent lives outside the set
+                (backend ? out[position].second : out[position].first) += 1;
+            });
+        }
+    };
+    run_store(*text_kv_addresses, *text_kv_pages, false, true);
+    if (backend_kv_addresses && backend_kv_pages) {
+        run_store(*backend_kv_addresses, *backend_kv_pages, true, false);
+    }
+    return out;
+}
+
 std::pair<std::uint32_t, std::uint32_t> ProgramImplCore::attribute_pressure_move_relief(
     const qwen3_6::detail::PressureDecision& decision, const SequenceKVBundle& kv,
     PressureReliefClaim& claim) const {

@@ -135,6 +135,62 @@ void case_backend_pool_closes_independently() {
     check(took_id1, "the Main gap still takes the Main-heavy victim first");
 }
 
+// The soak stall, as a unit test: a Device pool full of fork-shared pages whose owners are
+// PURE SHELLS (exclusive=0, no move option, no Host estate) - evicting any one of them frees
+// nothing, so the main loop alone says 'device-not-closable' (rig: cand=20 steps=0). The
+// shell pass must instead drop the WHOLE referent group: the joint pages return physically
+// when the last referent goes, counted once (the max single claim is a sound lower bound for
+// one group and never double-counts a page listed by both referents).
+void case_shell_group_release_closes_device_gap() {
+    std::printf("case_shell_group_release_closes_device_gap\n");
+    const std::vector<Datum> pool{
+        {.id = 1,
+         .device_kv       = 0,
+         .evict_device_kv = 0,
+         .joint_device_kv = 40,
+         .host_kv         = 0,
+         .importance      = 10},
+        {.id = 2,
+         .device_kv       = 0,
+         .evict_device_kv = 0,
+         .joint_device_kv = 40,
+         .host_kv         = 0,
+         .importance      = 90},
+        {.id = 3, .device_kv = 500, .host_kv = 800, .importance = 50},
+    };
+    TierOccupancy occ = occupancy(100, 100, 1000, 0); // device full, host roomy
+    const Plan outcome = decide(Demand{.device_kv = 40}, occ, pool);
+
+    check(!outcome.enqueue, "the joint pages of the shell group close the Device gap");
+    std::size_t drops = 0;
+    bool dropped_id3 = false;
+    for (const auto& step : outcome.steps) {
+        if (step.action != Action::DropFromHost) { continue; }
+        ++drops;
+        if (step.id == 3) { dropped_id3 = true; }
+    }
+    check(drops == 2, "BOTH referents of the shared pages are released (last one frees them)");
+    check(!dropped_id3, "the ordinary owner with estate is untouched - shells only");
+    check(action_count(outcome, Action::SpillToHost) == 0,
+          "shells have no move option - there is nothing to spill");
+}
+
+// Spill-first survives the shell pass: a joint-capable owner that ALSO has a move option is
+// spilled, not released (the shell predicate requires evict=0 AND move=0).
+void case_shell_pass_defers_to_move() {
+    std::printf("case_shell_pass_defers_to_move\n");
+    const std::vector<Datum> pool{
+        {.id = 1, .device_kv = 40, .joint_device_kv = 40, .host_kv = 0, .importance = 10},
+    };
+    TierOccupancy occ = occupancy(100, 100, 1000, 0);
+    const Plan outcome = decide(Demand{.device_kv = 40}, occ, pool);
+
+    check(!outcome.enqueue, "gap closes");
+    check(action_count(outcome, Action::SpillToHost) == 1,
+          "a shell WITH a move option is spilled first, never released");
+    check(action_count(outcome, Action::DropFromHost) == 0, "and not dropped");
+}
+
 void case_device_short_host_roomy() {
     std::printf("case device_short_host_roomy\n");
     const std::vector<Datum> pool{
@@ -484,6 +540,8 @@ void case_equal_importance_ranks_by_age_then_id() {
 
 int main() {
     case_backend_pool_closes_independently();
+    case_shell_group_release_closes_device_gap();
+    case_shell_pass_defers_to_move();
     case_device_short_host_roomy();
     case_host_room_reserved_for_spill();
     case_nothing_spillable_enqueues_without_dropping();
