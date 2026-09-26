@@ -7752,6 +7752,15 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool sh
             for (std::uint32_t page = begin; page < end; ++page) {
                 change.pages.push_back(addresses.logical_page(address, page));
             }
+            // prepare_pressure_work's Demote branch pairs pages against sources and throws
+            // 'source backing was not prepared' when the vector was never sized - the planner's
+            // bookkeeping resizes it for DemoteToHost (prepare_pressure_bookkeeping) and the
+            // ladder's own builder must do the same, or EVERY device-only page landing fails at
+            // execution (rig:930 declines; the GPU pools are Both-resident so they took the
+            // DropDeviceDuplicate branch and never hit the check).
+            if (kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
+                change.sources.resize(end - begin);
+            }
             moved_pages += end - begin;
             bookkeeping.push_back(std::move(change));
             begin = end;
@@ -7790,10 +7799,15 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool sh
         if (!work.option.backend_kv_changes.empty()) {
             prepare_pressure_work(work, runtime::ContextResourceClass::BackendKV);
         }
-    } catch (const std::exception&) {
+    } catch (const std::exception& error) {
         fund_pages = 0;
         fund_can   = false;
         fund_ok    = false;
+        // The reason is the whole diagnosis: with Host bytes free a throw can only be the
+        // landing allocation (extent fragmentation), a page-state mismatch, or a pin - and the
+        // three want three different fixes.
+        std::fprintf(stderr, "[ladder] spill prepare threw: %s\n", error.what());
+        std::fflush(stderr);
         // Most likely the Host arena refused the landing (host KV full). Self-fund it: this
         // owner disappears entirely moments later (the teardown that requested the spill), so
         // ITS OWN exclusive Host pages are room that comes back anyway - release them (R2,
