@@ -395,7 +395,8 @@ inline std::string describe(const Plan& outcome, const Demand& need,
         std::to_string(occupancy.device_state_free()) + " hkv=" +
         std::to_string(occupancy.host_kv_free()) + " hstate=" +
         std::to_string(occupancy.host_state_free()) + " rows=" +
-        std::to_string(occupancy.catalog_rows_vacant) + " | steps=" +
+        std::to_string(occupancy.catalog_rows_vacant) + " | cand=" +
+        std::to_string(pool.size()) + " steps=" +
         std::to_string(outcome.steps.size());
     if (outcome.enqueue) {
         line += " enqueue reason=";
