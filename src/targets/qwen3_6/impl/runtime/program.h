@@ -1152,10 +1152,30 @@ private:
     [[nodiscard]] detail::PhysicalResources
     guided_materialization_deficit(const ResourceCandidateState& candidate,
                                    const detail::PhysicalDelta& pressure) const;
+    // First-wins page claims for ONE cache-policy planning round. cachep::plan's simulation must
+    // promise the UNION of relief across victims, never the sum: shared-prefix physical pages
+    // appear in several victims' move decisions, and a summed plan stopped early with 2,634 pages
+    // promised against 1,610 delivered, which the feasibility gate refused and the engine latched
+    // fatal (2026-09-26, 缓存模块v2.md §十.11). Eviction (Host-side) effects need no claims:
+    // owner_exclusive_resources already skips pages with address_references > 1, and StateImages
+    // are settled once per joint projection.
+    struct PressureReliefClaim {
+        std::vector<std::uint8_t> main;
+        std::vector<std::uint8_t> backend;
+    };
+    [[nodiscard]] PressureReliefClaim begin_pressure_relief_claim() const;
+    // Device pages of `decision`'s KV move actions (DemoteToHost / DropDeviceDuplicate) that no
+    // earlier victim of this round has claimed, keyed by physical descriptor exactly like
+    // compose's claim_pressure_pages. Host-side actions (DropHostDuplicate) deliver no Device
+    // relief and are ignored here.
+    [[nodiscard]] std::uint32_t attribute_pressure_move_relief(
+        const qwen3_6::detail::PressureDecision& decision, const SequenceKVBundle& kv,
+        PressureReliefClaim& claim) const;
     // Device StateImage slots the capacity-release ladder can still free: Both-resident
     // checkpoints drop their Device replica for free; DeviceOnly ones demote, each needing one
     // Host slot from free Host capacity, `planned_host_state_release` slots this plan itself
-    // frees, or the slots the ladder's final step frees by retiring the oldest idle continuation.
+    // frees, or the slots the ladder's final step frees by degrading the least-important idle
+    // owner's HostOnly checkpoint (R2, 缓存模块v2.md §10.4).
     [[nodiscard]] std::uint32_t
     state_slot_relief(std::uint32_t planned_host_state_release) const noexcept;
     // The StateImage the in-flight reservation depends on (the plan's selected source). The release
@@ -1249,11 +1269,31 @@ private:
     [[nodiscard]] bool state_bound_by_live_sequence(StateImageHandle state) const;
     // Number of continuation catalog slots currently occupied (any non-Free role).
     [[nodiscard]] std::uint32_t occupied_catalog_slots() const noexcept;
-    // Last-resort release when the StateImage pools are exhausted and every remaining state is
-    // bound by a live continuation: retire the idle (catalogued) continuation whose state was
-    // touched longest ago, and with it the state object it owns. Returns false when no idle
-    // continuation can be retired.
-    [[nodiscard]] bool retire_oldest_idle_continuation();
+    // R2 for the Host state pool (缓存模块v2.md §10.4/§10.5): release ONE Host state slot by
+    // degrading the least-important idle owner - drop its shallowest non-protected HostOnly long
+    // anchor out of its inventory. The owner keeps its catalog row and stays restorable from its
+    // remaining checkpoints; an owner whose KV beyond the surviving frontier still holds Device
+    // residency is skipped, so this step never destroys Device data. Returns false when no idle
+    // owner can be degraded this way - the caller then fails the step and the request waits (R0),
+    // because the old fallback (retiring the owner, both tiers at once) violated invariant 1 in
+    // 280 of 557 production retirements (§10.4).
+    [[nodiscard]] bool degrade_idle_owner_host_state();
+    // R2 at whole-conversation granularity (缓存模块v2.md §2.1/§10.5): release the least-important
+    // idle owner that holds NOTHING on Device - its Host KV, Host state and catalog row disappear
+    // together, which is exactly the documented "整条对话从内存消失" (both sides zero -> catalog
+    // row released). This is the LEGAL half of the old retirement (277 of 557 production retires
+    // destroyed no Device data); owners that still hold Device data are skipped - destroying them
+    // would violate invariant 1, so the ladder spills what it can and otherwise fails to R0.
+    [[nodiscard]] bool release_idle_owner_host_side();
+    // #12 先搬后释 (spill-then-release): move one idle owner's Device KV to Host - the
+    // DemoteToHost runs (device-only pages) and DropDeviceDuplicate runs (redundant copies)
+    // prepared/published against a LOCAL PressureWork, never joined to a transaction - so the
+    // owner's Device footprint reaches zero and release_idle_owner_host_side may then delete it
+    // from Host (R1 followed by R2; Device data is moved, never destroyed in place). Pre-screens
+    // every page (writers/pins/active references) so prepare can never throw: a page that cannot
+    // move makes the whole spill decline, not latch the engine. Requires the owner's Device STATE
+    // to already be zero - state relocation is the demote step's job.
+    [[nodiscard]] bool spill_owner_device_kv_to_host(std::uint32_t index);
     // The owner that step would delete, without deleting it, and the Host state slots deleting it
     // would return. Split out so the capacity-relief credit prices what the ladder can actually
     // deliver instead of guessing (storage doc 4.2).
@@ -1274,12 +1314,13 @@ private:
     mutable std::uint32_t retirable_relief_protected_ = std::numeric_limits<std::uint32_t>::max();
     mutable std::uint32_t retirable_relief_slots_     = 0;
     std::unique_ptr<PreparedPromptData> failed_materialization_prompt_;
-    // One step of Device/Host StateImage capacity release, least destructive first: demote a
-    // retained state to Host, then retire the oldest idle continuation. Returns false when no
-    // further step can free anything.
-    // `allow_retire` permits the destructive last resort (retiring an idle session); `did_retire`
-    // reports whether that last resort ran, so a caller can bound how many sessions one request
-    // may destroy.
+    // One step of Device/Host StateImage capacity release, least destructive first: drop a
+    // redundant Device replica, demote to Host, evict a redundant Host replica, garbage-collect an
+    // unreferenced checkpoint, then - only when allowed - degrade the least-important idle
+    // owner's HostOnly checkpoint (R2). Returns false when no further step can free anything:
+    // the ladder NEVER destroys Device data; the caller rolls back and the request waits (§三 R0).
+    // `allow_retire` permits the cache-losing degrade step; `did_retire` reports whether it ran,
+    // so a caller can bound how much cache one request may sacrifice for an optional capture.
     [[nodiscard]] bool release_state_capacity_step(const char* site = "unknown",
                                                    bool allow_retire = true,
                                                    bool* did_retire = nullptr);
@@ -1293,10 +1334,13 @@ private:
     void release_continuation_slot_strict(std::uint32_t index) noexcept;
     void release_continuation_slot_best_effort(std::uint32_t index) noexcept;
     void retire_continuation_slot(std::uint32_t index) noexcept;
-    // Free one Device StateImage slot for an incoming reservation by demoting the least-valuable
-    // retained checkpoint to Host, or by dropping it when it is unreferenced and no Host slot is
-    // available. Returns false when no retained checkpoint can give up its Device slot.
-    [[nodiscard]] bool release_one_device_state_slot();
+    // Free one Device StateImage slot for an incoming reservation, least destructive first: a
+    // redundant Device replica, a demotion to Host, a redundant Host replica, an unreferenced
+    // checkpoint, and - only when `allow_degrade` - the R2 degrade of an idle owner's HostOnly
+    // checkpoint followed by the demotion it makes room for. Returns false when no retained
+    // checkpoint can give up its Device slot; Device data is never destroyed here. `did_degrade`
+    // reports whether the cache-losing step ran, even when the overall answer is false.
+    [[nodiscard]] bool release_one_device_state_slot(bool allow_degrade, bool* did_degrade = nullptr);
     void clear_execution_failure_lanes(std::span<const std::uint32_t> lanes) noexcept;
     [[nodiscard]] bool can_clear_lane_strict(const SequenceState& sequence) const;
     [[nodiscard]] bool clear_lane_strict(SequenceState& sequence, RequestControl& request) noexcept;

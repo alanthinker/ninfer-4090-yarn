@@ -6982,32 +6982,40 @@ std::uint32_t ProgramImplCore::host_slot_relief() const noexcept {
 bool ProgramImplCore::release_state_capacity_step(const char* site, bool allow_retire,
                                                   bool* did_retire) {
     if (did_retire != nullptr) { *did_retire = false; }
-    if (release_one_device_state_slot()) { return true; }
-    if (!allow_retire) {
-        std::fprintf(stderr, "[ladder] no non-destructive capacity site=%s\n", site);
+    // The old last resort here was `retire_oldest_idle_continuation` - an owner teardown that
+    // destroyed Device data (invariant 1) in 280 of 557 production retirements. There is no
+    // destructive fallback any more: the cache-losing step that remains is the R2 degrade of one
+    // idle owner's HostOnly checkpoint, gated by `allow_retire` inside
+    // release_one_device_state_slot, and when that too cannot help the honest answer is "nothing
+    // more can be freed" - the transaction rolls back and the request waits (缓存模块v2.md §三 R0).
+    const auto release_started = std::chrono::steady_clock::now();
+    const bool released        = release_one_device_state_slot(allow_retire, did_retire);
+    const double release_ms    = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - release_started)
+                                      .count();
+    if (!released) {
+        if (!allow_retire) {
+            std::fprintf(stderr, "[ladder] no non-destructive capacity site=%s\n", site);
+            return false;
+        }
+        std::fprintf(stderr, "[ladder] exhausted site=%s device=%u/%u host=%u free=%u"
+                             " elapsed=%.1fms\n",
+                     site, state_store ? state_store->device_occupied() : 0,
+                     state_store ? state_store->device_capacity() : 0,
+                     state_store ? state_store->host_occupied() : 0,
+                     state_store ? state_store->host_free() : 0, release_ms);
+        std::fflush(stderr);
         return false;
     }
-    // Last resort: destroying an idle session's cache. Log the entry point and the Device-slot
-    // occupancy so a retention collapse is attributable (2026-09-21: a veto regression made every
-    // demotion ineligible and this step ran on nearly every request, dropping retention from ~320
-    // retained states to ~29).
-    const auto retire_started = std::chrono::steady_clock::now();
-    const bool retired        = retire_oldest_idle_continuation();
-    if (did_retire != nullptr) { *did_retire = retired; }
-    const double retire_ms =
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - retire_started)
-            .count();
-    std::fprintf(stderr, "[ladder] retire site=%s ok=%d device=%u/%u elapsed=%.1fms\n", site,
-                 retired ? 1 : 0, state_store ? state_store->device_occupied() : 0,
-                 state_store ? state_store->device_capacity() : 0, retire_ms);
-    // Retiring an owner releases its checkpoints' KV pages and state images; at a saturated pool
-    // that is the engine's most expensive host-side operation and it lands in the requesting
-    // request's latency (2026-09-22: 6 s TTFT on a 99.7% hit whose anchors needed capacity).
-    if (retire_ms >= 100.0) {
-        std::fprintf(stderr, "[slow] retire site=%s elapsed=%.3fs\n", site, retire_ms / 1000.0);
+    // A release step at saturation can carry a Device-to-Host copy; keep the slow-step record
+    // (formerly `[slow] retire`) so a request's latency stays attributable (2026-09-22: 6 s TTFT
+    // on a 99.7% hit whose anchors needed capacity).
+    if (release_ms >= 100.0) {
+        std::fprintf(stderr, "[slow] ladder-release site=%s elapsed=%.3fs\n", site,
+                     release_ms / 1000.0);
         std::fflush(stderr);
     }
-    return retired;
+    return true;
 }
 
 bool ProgramImplCore::owner_holds_release_protected_state(std::uint32_t index) const {
@@ -7218,54 +7226,403 @@ std::uint32_t ProgramImplCore::retirable_host_state_slots() const noexcept {
     return slots;
 }
 
-bool ProgramImplCore::retire_oldest_idle_continuation() {
-    if (!state_store) { return false; }
-    // §6.3 / invariant 1: the ladder may only delete on the Host side. Device data has two
-    // legal fates - it is in use, or it moved to Host (R1) - so retiring an owner that still
-    // holds Device residency is a Device-side delete, which the rules forbid. Report the
-    // footprint before the release rather than asserting it: how often this happens is exactly
-    // what has to be measured before the rule can be enforced.
-    const auto report_device_delete = [&](const char* kind, std::uint32_t slot,
-                                          const detail::PhysicalResources& footprint) {
-        const std::uint32_t device_kv =
-            footprint.device.main_kv_pages + footprint.device.backend_kv_pages;
-        if (device_kv == 0 && footprint.device.state_slots == 0) { return; }
-        const char* diag = std::getenv("NINFER_REUSE_DIAG");
-        if (diag != nullptr && *diag == '0') { return; }
-        std::fprintf(stderr,
-                     "[invariant1] retire %s slot=%u deletes Device data: kv=%u pages "
-                     "state=%u slots (R1 says move it; R2 may only delete Host)\n",
-                     kind, slot, device_kv, footprint.device.state_slots);
-        std::fflush(stderr);
+bool ProgramImplCore::degrade_idle_owner_host_state() {
+    if (!state_store || !text_kv_addresses || !text_kv_pages) { return false; }
+    // Invariant 1 compliance lives in the candidate gates below: this step releases ONE Host
+    // state slot by shrinking one owner's checkpoint inventory - shallowest HostOnly anchor
+    // first, then the Host endpoint when another checkpoint survives (a dual-state owner: Host
+    // endpoint + Device anchor keeps its owner restorable through the anchor - a component
+    // eviction, §2.1). It never frees a Device page or a Device StateImage: when the drop's KV
+    // truncation would touch Device residency, the owner's Device KV moves to Host FIRST (#12
+    // spill-then-release) so the truncation only releases Host pages - and the drop is declined
+    // if even that cannot make the range Host-only.
+    std::uint32_t skip_nokv = 0, skip_nohoststate = 0, skip_invalid = 0, skip_protected = 0,
+                  skip_active = 0, skip_residency = 0, skip_refs = 0, skip_noplace = 0,
+                  skip_beyond = 0, skip_race = 0, skip_shared = 0;
+    const auto device_beyond = [&](const KVAddressSpaceStore& addresses,
+                                   const LogicalKVPageStore& pages,
+                                   const KVAddressSpaceHandle& address,
+                                   std::uint32_t from) -> bool {
+        if (!addresses.valid(address)) { return false; }
+        const std::uint32_t mapped = addresses.mapped_pages(address);
+        for (std::uint32_t page = from; page < mapped; ++page) {
+            if (pages.device_resident(addresses.logical_page(address, page))) { return true; }
+        }
+        return false;
     };
-    const RetireVictim victim = select_retire_victim();
-    if (victim.continuation) {
-        report_device_delete("continuation", *victim.continuation,
-                             owner_exclusive_resources(continuation_states[*victim.continuation]));
-        std::fprintf(stderr,
-                     "[exhaust] drop idle continuation slot=%u source=%s rank=%zu/%zu "
-                     "score=%.3fs\n",
-                     *victim.continuation, retire_pick_from_order_ ? "score" : "oldest",
-                     retire_pick_rank_, retire_preference_.size(),
-                     static_cast<double>(retire_pick_score_) / 1.0e9);
-        std::fflush(stderr);
-        release_continuation_slot_strict(*victim.continuation);
-        return true;
+    const auto degrade_owner = [&](std::uint32_t index) -> bool {
+        SequenceState& sequence = continuation_states[index];
+        if (!sequence.kv || sequence.state.fork_pending) { ++skip_nokv; return false; }
+        // Invariant 3: only an owner holding a Host state slot can repay this ladder step.
+        if (owner_exclusive_resources(sequence).host.state_slots == 0) {
+            ++skip_nohoststate;
+            return false;
+        }
+        bool spilled = false;
+        const auto try_drop = [&](StateImageHandle handle,
+                                  const runtime::CheckpointRef& ref) -> bool {
+            if (!state_store->valid(handle)) { ++skip_invalid; return false; }
+            if (release_protected_state && *release_protected_state == handle) {
+                ++skip_protected;
+                return false;
+            }
+            if (state_bound_by_active_sequence(handle)) { ++skip_active; return false; }
+            // Only the HostOnly hole exists for this step: a Both-resident checkpoint's Host slot
+            // is the EvictHostReplica step's (lossless) job, and a DeviceOnly one frees no Host
+            // slot. Exactly one owner may reference the image, or its release is a no-op.
+            if (state_store->residency(handle) != StateReplicaResidency::HostOnly) {
+                ++skip_residency;
+                return false;
+            }
+            if (state_store->checkpoint_references(handle) != 1) { ++skip_refs; return false; }
+            const std::optional<qwen3_6::TargetKVRequirement> retained =
+                retained_requirement_after_drop(continuation_summary(sequence), ref);
+            if (!retained) { ++skip_noplace; return false; } // nothing would survive this drop
+            const auto beyond_device = [&]() {
+                return device_beyond(*text_kv_addresses, *text_kv_pages, sequence.kv->text,
+                                     retained->main_frontier) ||
+                       (sequence.kv->backend && backend_kv_addresses && backend_kv_pages &&
+                        device_beyond(*backend_kv_addresses, *backend_kv_pages,
+                                      *sequence.kv->backend, retained->backend_frontier));
+            };
+            if (beyond_device()) {
+                // #12: move the Device KV first - then the drop's truncation only releases Host
+                // pages (R2-legal); without the spill it would destroy Device data (invariant 1).
+                if (!spilled && !spill_owner_device_kv_to_host(index)) {
+                    ++skip_beyond;
+                    return false;
+                }
+                spilled = true;
+                if (beyond_device()) { ++skip_beyond; return false; }
+            }
+            const std::uint32_t host_now = state_store->host_occupied();
+            try {
+                publish_checkpoint_drop(sequence, ref);
+            } catch (const std::exception&) {
+                ++skip_race; // inventory moved under the drop: next candidate
+                return false;
+            }
+            if (state_store->host_occupied() >= host_now) { ++skip_shared; return false; }
+            std::fprintf(stderr,
+                         "[ladder] degrade %s slot=%u frontier=%u host=%u free=%u (R2:"
+                         " least-important owner keeps its catalog row)\n",
+                         ref.kind == runtime::CheckpointKind::LongAnchor ? "anchor" : "endpoint",
+                         index, ref.frontier, state_store->host_occupied(),
+                         state_store->host_free());
+            std::fflush(stderr);
+            return true;
+        };
+        // Shallowest anchor first: a shallow anchor saves the least prefill (least rebuild
+        // value) and its drop truncates the smallest range.
+        std::vector<std::size_t> order;
+        order.reserve(sequence.long_anchors.size());
+        for (std::size_t position = 0; position < sequence.long_anchors.size(); ++position) {
+            order.push_back(position);
+        }
+        std::sort(order.begin(), order.end(), [&](std::size_t left, std::size_t right) {
+            return sequence.long_anchors[left].frontier < sequence.long_anchors[right].frontier;
+        });
+        for (const std::size_t position : order) {
+            const LongAnchorCheckpoint& anchor = sequence.long_anchors[position];
+            const runtime::CheckpointRef ref{
+                .kind     = runtime::CheckpointKind::LongAnchor,
+                .frontier = anchor.frontier,
+                .ordinal  = anchor.ordinal,
+            };
+            if (try_drop(anchor.state, ref)) { return true; }
+        }
+        // The endpoint last (largest truncation window): legal exactly when another checkpoint
+        // survives it - the primitive reports "no retained requirement" otherwise, so an
+        // endpoint-only owner is never reduced to nothing here.
+        const qwen3_6::ContinuationSummary summary = continuation_summary(sequence);
+        if (summary.endpoint && sequence.endpoint_valid) {
+            if (try_drop(sequence.state.read, summary.endpoint->ref)) { return true; }
+        }
+        return false;
+    };
+    // The one chain first (§2.2): the ladder's preference order IS the policy's value order.
+    for (const runtime::RetirePreferenceEntry& entry : retire_preference_) {
+        if (entry.shared_prefix) {
+            // Shared-prefix inventory has no drop primitive of its own; the step declines rather
+            // than retiring the shared owner wholesale - the request waits (R0).
+            continue;
+        }
+        if (entry.slot >= continuation_capacity) { continue; }
+        if (continuation_slots[entry.slot].role != ContinuationSlotRole::Catalogued) { continue; }
+        if (owner_holds_release_protected_state(entry.slot)) { ++skip_protected; continue; }
+        if (materialization_pins(entry.slot, continuation_slots[entry.slot].generation)) {
+            ++skip_protected;
+            continue;
+        }
+        if (degrade_owner(entry.slot)) { return true; }
     }
-    if (victim.shared) {
-        report_device_delete("shared", *victim.shared,
-                             owner_exclusive_resources(shared_prefix_states[*victim.shared]));
-        std::fprintf(stderr,
-                     "[exhaust] drop idle shared prefix slot=%u source=%s rank=%zu/%zu "
-                     "score=%.3fs\n",
-                     *victim.shared, retire_pick_from_order_ ? "score" : "oldest",
-                     retire_pick_rank_, retire_preference_.size(),
-                     static_cast<double>(retire_pick_score_) / 1.0e9);
-        std::fflush(stderr);
-        (void)release_shared_prefix_state_strict(*victim.shared, shared_prefix_slots[*victim.shared].role);
-        return true;
+    // ... then the chain's age term (oldest last-touched first), mirroring
+    // select_retire_victim's fallback so an unpriced pool still degrades the least recent owner.
+    struct AgeCandidate {
+        std::uint64_t age;
+        std::uint32_t slot;
+    };
+    std::vector<AgeCandidate> aged;
+    aged.reserve(continuation_capacity);
+    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
+        if (continuation_slots[index].role != ContinuationSlotRole::Catalogued) { continue; }
+        if (owner_holds_release_protected_state(index)) { ++skip_protected; continue; }
+        if (materialization_pins(index, continuation_slots[index].generation)) {
+            ++skip_protected;
+            continue;
+        }
+        const SequenceState& sequence = continuation_states[index];
+        if (!sequence.kv || sequence.long_anchors.empty()) { continue; }
+        aged.push_back(AgeCandidate{
+            .age  = state_store->last_touched(sequence.state.read),
+            .slot = index,
+        });
     }
+    std::sort(aged.begin(), aged.end(), [](const AgeCandidate& left, const AgeCandidate& right) {
+        return left.age < right.age;
+    });
+    for (const AgeCandidate& candidate : aged) {
+        if (degrade_owner(candidate.slot)) { return true; }
+    }
+    std::fprintf(stderr,
+                 "[ladder] degrade declined: nokv=%u nohoststate=%u invalid=%u protected=%u"
+                 " active=%u residency=%u refs=%u noplace=%u beyond=%u race=%u shared=%u\n",
+                 skip_nokv, skip_nohoststate, skip_invalid, skip_protected, skip_active,
+                 skip_residency, skip_refs, skip_noplace, skip_beyond, skip_race, skip_shared);
+    std::fflush(stderr);
     return false;
+}
+
+bool ProgramImplCore::release_idle_owner_host_side() {
+    if (!state_store) { return false; }
+    // Invariant 1 gate: an owner with ANY Device footprint is never released here - its data has
+    // to move (R1) or the ladder fails to R0. This is the LEGAL half of the old retirement (277
+    // of 557 production retires destroyed no Device data): both sides already zero on Device, so
+    // the strict release destroys Host cache only, the [invariant1] counter inside
+    // release_continuation_slot_strict stays silent by construction, and the catalog row goes
+    // with it - exactly §2.1's "整条对话从内存消失" (both sides zero -> row released).
+    const auto device_free = [](const detail::PhysicalResources& footprint) {
+        return footprint.device.active_lanes == 0 && footprint.device.state_slots == 0 &&
+               footprint.device.main_kv_pages == 0 && footprint.device.backend_kv_pages == 0;
+    };
+    // Why each candidate was skipped, tallied so one declined walk explains itself in one line
+    // (the silent-gate problem: three ladder steps looked dead in a diagnosis round).
+    std::uint32_t skip_nokv = 0, skip_nohoststate = 0, skip_devstate = 0, skip_nodevicekv = 0,
+                  skip_spill = 0, skip_postcheck = 0, skip_canrelease = 0, skip_protected = 0,
+                  skip_pins = 0;
+    const auto release_private = [&](std::uint32_t index) -> bool {
+        const SequenceState& sequence = continuation_states[index];
+        if (!sequence.kv) { ++skip_nokv; return false; }
+        detail::PhysicalResources footprint = owner_exclusive_resources(sequence);
+        // Invariant 3: only release an owner whose deletion actually frees a state slot - that is
+        // the goal this ladder step exists for; a Host-KV-only owner would be destroyed for
+        // nothing the ladder owes anyone.
+        if (footprint.host.state_slots == 0) { ++skip_nohoststate; return false; }
+        if (!device_free(footprint)) {
+            // #12 先搬后释 (spill-then-release): the owner's Device KV moves to Host first (R1,
+            // never destroyed in place) and only then may the owner disappear from Host (R2).
+            // The Device-STATE shape does not qualify here - relocating state is the demote
+            // step's job, one slot at a time.
+            const std::uint32_t device_pages =
+                footprint.device.main_kv_pages + footprint.device.backend_kv_pages;
+            if (footprint.device.state_slots != 0) { ++skip_devstate; return false; }
+            if (device_pages == 0) { ++skip_nodevicekv; return false; }
+            if (!spill_owner_device_kv_to_host(index)) { ++skip_spill; return false; }
+            footprint = owner_exclusive_resources(sequence);
+            if (!device_free(footprint)) { ++skip_postcheck; return false; }
+        }
+        if (!can_release_continuation_slot_strict(index)) { ++skip_canrelease; return false; }
+        std::fprintf(stderr,
+                     "[ladder] release host-only idle continuation slot=%u (R2: Device already"
+                     " zero; Host KV + Host state + catalog row go together)\n",
+                     index);
+        std::fflush(stderr);
+        release_continuation_slot_strict(index);
+        return true;
+    };
+    const auto release_shared = [&](std::uint32_t index) -> bool {
+        const SharedPrefixSlotRole role = shared_prefix_slots[index].role;
+        if (role == SharedPrefixSlotRole::Free || !shared_prefix_states[index].kv) {
+            return false;
+        }
+        if (!device_free(owner_exclusive_resources(shared_prefix_states[index]))) { return false; }
+        if (!can_release_shared_prefix_state(index, role)) { return false; }
+        std::fprintf(stderr,
+                     "[ladder] release host-only idle shared prefix slot=%u (R2: Device already"
+                     " zero)\n",
+                     index);
+        std::fflush(stderr);
+        (void)release_shared_prefix_state_strict(index, role);
+        return true;
+    };
+    // The one chain first (§2.2): the ladder's preference order IS the policy's value order.
+    for (const runtime::RetirePreferenceEntry& entry : retire_preference_) {
+        if (entry.shared_prefix) { continue; } // shared candidates come from the selector below
+        if (entry.slot >= continuation_capacity) { continue; }
+        if (continuation_slots[entry.slot].role != ContinuationSlotRole::Catalogued) { continue; }
+        if (owner_holds_release_protected_state(entry.slot)) { ++skip_protected; continue; }
+        if (materialization_pins(entry.slot, continuation_slots[entry.slot].generation)) {
+            ++skip_pins;
+            continue;
+        }
+        if (release_private(entry.slot)) { return true; }
+    }
+    // ... then the chain's age term (oldest last-touched first).
+    struct AgeCandidate {
+        std::uint64_t age;
+        std::uint32_t slot;
+    };
+    std::vector<AgeCandidate> aged;
+    aged.reserve(continuation_capacity);
+    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
+        if (continuation_slots[index].role != ContinuationSlotRole::Catalogued) { continue; }
+        if (owner_holds_release_protected_state(index)) { ++skip_protected; continue; }
+        if (materialization_pins(index, continuation_slots[index].generation)) { ++skip_pins; continue; }
+        const SequenceState& sequence = continuation_states[index];
+        if (!sequence.kv) { continue; }
+        aged.push_back(AgeCandidate{
+            .age  = state_store->last_touched(sequence.state.read),
+            .slot = index,
+        });
+    }
+    std::sort(aged.begin(), aged.end(), [](const AgeCandidate& left, const AgeCandidate& right) {
+        return left.age < right.age;
+    });
+    for (const AgeCandidate& candidate : aged) {
+        if (release_private(candidate.slot)) { return true; }
+    }
+    // Shared prefixes: one candidate from the chain's own selector - it already applies the
+    // transaction-pin and reference gates this walk would otherwise have to duplicate.
+    const RetireVictim victim = select_retire_victim();
+    if (victim.shared && release_shared(*victim.shared)) { return true; }
+    // One line per declined walk: which gate stopped every candidate (the silent-gate problem
+    // made three ladder steps look dead in the 2026-09-26 diagnosis round).
+    std::fprintf(stderr,
+                 "[ladder] release declined: nokv=%u nohoststate=%u devstate=%u"
+                 " nodevicekv=%u spill=%u postcheck=%u canrelease=%u protected=%u pins=%u\n",
+                 skip_nokv, skip_nohoststate, skip_devstate, skip_nodevicekv, skip_spill,
+                 skip_postcheck, skip_canrelease, skip_protected, skip_pins);
+    std::fflush(stderr);
+    return false;
+}
+
+bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index) {
+    if (index >= continuation_capacity || !host_kv_extents || !state_store) { return false; }
+    if (continuation_slots[index].role != ContinuationSlotRole::Catalogued) { return false; }
+    const SequenceState& sequence = continuation_states[index];
+    if (!sequence.kv || !text_kv_addresses || !text_kv_pages) { return false; }
+    // Pre-screen every Device page under exactly the conditions prepare_pressure_work re-checks,
+    // so its latching "replica changed" throw stays unreachable: one unmovable page (writer,
+    // source pin, active reference) declines the whole candidate instead of half-spilling it.
+    const auto spillable = [](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
+                              KVAddressSpaceHandle address) -> bool {
+        if (!addresses.valid(address)) { return false; }
+        const std::uint32_t mapped = addresses.mapped_pages(address);
+        for (std::uint32_t page = 0; page < mapped; ++page) {
+            const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+            if (!pages.device_resident(logical)) { continue; }
+            if (pages.writer_references(logical) != 0 || pages.source_pins(logical) != 0 ||
+                addresses.has_active_reference(logical)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!spillable(*text_kv_addresses, *text_kv_pages, sequence.kv->text) ||
+        (sequence.kv->backend != std::nullopt &&
+         (backend_kv_addresses == nullptr || backend_kv_pages == nullptr ||
+          !spillable(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend)))) {
+        std::fprintf(stderr, "[ladder] spill declined slot=%u stage=prescreen\n", index);
+        std::fflush(stderr);
+        return false;
+    }
+    // One run per maximal same-kind span: device-only pages need a copy (DemoteToHost), pages
+    // that already hold a Host replica only need their Device replica dropped
+    // (DropDeviceDuplicate). The work is LOCAL - prepared and published here, never joined to a
+    // transaction - so the ladder can run it at reserve time like the state demote does.
+    MaterializationTransaction::PressureWork work;
+    work.continuation_index      = index;
+    work.continuation_generation = continuation_slots[index].generation;
+    work.shared_owner            = false;
+    work.option.shared_owner     = false;
+    work.option.id               = 1;
+    std::uint32_t moved_pages    = 0;
+    const auto build_runs        = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                       KVAddressSpaceHandle address,
+                                       std::vector<qwen3_6::detail::PressureKVDecision>& changes,
+                                       std::vector<MaterializationTransaction::PressureWork::
+                                                       KVChangeWork>& bookkeeping) {
+        const auto kind_of = [&](std::uint32_t page) -> qwen3_6::detail::PressureKVDecisionKind {
+            const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+            if (!pages.device_resident(logical)) {
+                return qwen3_6::detail::PressureKVDecisionKind::None;
+            }
+            return pages.host_resident(logical)
+                       ? qwen3_6::detail::PressureKVDecisionKind::DropDeviceDuplicate
+                       : qwen3_6::detail::PressureKVDecisionKind::DemoteToHost;
+        };
+        const std::uint32_t mapped = addresses.mapped_pages(address);
+        std::uint32_t begin        = 0;
+        while (begin < mapped) {
+            const auto kind = kind_of(begin);
+            if (kind == qwen3_6::detail::PressureKVDecisionKind::None) { ++begin; continue; }
+            std::uint32_t end = begin + 1;
+            while (end < mapped && kind_of(end) == kind) { ++end; }
+            changes.push_back(qwen3_6::detail::PressureKVDecision{
+                .begin_page = begin,
+                .page_count = end - begin,
+                .kind       = kind,
+            });
+            MaterializationTransaction::PressureWork::KVChangeWork change;
+            change.pages.reserve(end - begin);
+            for (std::uint32_t page = begin; page < end; ++page) {
+                change.pages.push_back(addresses.logical_page(address, page));
+            }
+            moved_pages += end - begin;
+            bookkeeping.push_back(std::move(change));
+            begin = end;
+        }
+    };
+    build_runs(*text_kv_addresses, *text_kv_pages, sequence.kv->text, work.option.main_kv_changes,
+               work.main_kv_changes);
+    if (sequence.kv->backend != std::nullopt && backend_kv_addresses != nullptr &&
+        backend_kv_pages != nullptr) {
+        build_runs(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend,
+                   work.option.backend_kv_changes, work.backend_kv_changes);
+    }
+    if (work.option.main_kv_changes.empty() && work.option.backend_kv_changes.empty()) {
+        // Nothing Device-resident: the caller's footprint gate decides from here.
+        std::fprintf(stderr, "[ladder] spill declined slot=%u stage=noruns\n", index);
+        std::fflush(stderr);
+        return false;
+    }
+    try {
+        prepare_pressure_work(work, runtime::ContextResourceClass::MainKV);
+        if (!work.option.backend_kv_changes.empty()) {
+            prepare_pressure_work(work, runtime::ContextResourceClass::BackendKV);
+        }
+    } catch (const std::exception&) {
+        // A page flipped between the pre-screen and prepare, or the Host arena refused the
+        // landing: unwind whatever staged (copies first, then reservations) and decline - the
+        // candidate is skipped, the engine is never latched.
+        if (work.submitted && device.transfer_stream != nullptr) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
+        }
+        abort_pressure_work(work);
+        std::fprintf(stderr, "[ladder] spill declined slot=%u stage=prepare\n", index);
+        std::fflush(stderr);
+        return false;
+    }
+    if (device.transfer_stream != nullptr) {
+        (void)cudaStreamSynchronize(device.transfer_stream);
+    }
+    publish_pressure_work(work);
+    std::fprintf(stderr,
+                 "[ladder] spill continuation slot=%u kv pages=%u Device->Host (#12 先搬后释: "
+                 "moved first, the Host-side release may follow)\n",
+                 index, moved_pages);
+    std::fflush(stderr);
+    return true;
 }
 
 bool ProgramImplCore::can_release_continuation_slot_strict(std::uint32_t index) const {
@@ -7383,6 +7740,27 @@ void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index) noex
         std::terminate();
     }
     SequenceState& sequence = continuation_states[index];
+    // §四 invariant 1 / §七判据 #3 (behavioral, no source scan): every cache-path teardown
+    // through this primitive reports the Device footprint it destroys, so acceptance is "this
+    // counter is 0 across the battery", not "the call does not exist". The line is UNCONDITIONAL
+    // (no NINFER_REUSE_DIAG gate): an invariant probe that can be silenced reads 0 while the
+    // rule is being broken. After §10.4 the ladder never reaches here; the remaining hits are
+    // the transaction victims the policy still executes as full evictions (§10.4 #3/#4) - each
+    // one is exactly what has to go to zero.
+    try {
+        const detail::PhysicalResources footprint = owner_exclusive_resources(sequence);
+        const std::uint32_t device_kv =
+            footprint.device.main_kv_pages + footprint.device.backend_kv_pages;
+        if (device_kv != 0 || footprint.device.state_slots != 0) {
+            std::fprintf(stderr,
+                         "[invariant1] strict slot=%u destroys Device data: kv=%u pages "
+                         "state=%u slots (R1 says move it; R2 may only delete Host)\n",
+                         index, device_kv, footprint.device.state_slots);
+            std::fflush(stderr);
+        }
+    } catch (...) {
+        // Diagnostic only: never let the probe turn a release into a termination.
+    }
     // `session` is the same digest `/slots` publishes and a client sees, so a bare slot index here
     // can be joined against the request that owned the session and against `[evict-pick]`'s owner.
     const std::string session_digest = ledger_prefix_digest(sequence.ledger);
@@ -7641,7 +8019,8 @@ ProgramImplCore::owner_exclusive_resources(const SharedPrefixState& shared) cons
     return out;
 }
 
-bool ProgramImplCore::release_one_device_state_slot() {
+bool ProgramImplCore::release_one_device_state_slot(bool allow_degrade, bool* did_degrade) {
+    if (did_degrade != nullptr) { *did_degrade = false; }
     if (!state_store) { return false; }
     // The release ladder must never reclaim the state the in-flight reservation is restoring: the
     // plan priced it as Device-resident, so demoting it here is what made a commit fail with
@@ -7657,9 +8036,10 @@ bool ProgramImplCore::release_one_device_state_slot() {
     };
     // Reclaiming a replica of an IDLE (catalogued) owner's retained checkpoint is not a live
     // binding, but evicting its Host replica can destroy the very replica a planned Fork/restore
-    // depends on. The ladder's supported way to reclaim an idle owner is
-    // `retire_oldest_idle_continuation`, which retires the owner and its states together, so this
-    // step keeps the conservative predicate plus the in-flight reservation's protection.
+    // depends on. This step therefore keeps the conservative predicate plus the in-flight
+    // reservation's protection; when a Host slot has no redundant replica to give, the R2 degrade
+    // below releases it from the least-important idle owner instead (the old answer - retiring
+    // that owner whole - destroyed Device data and is gone, 缓存模块v2.md §10.4).
     const auto keep_active_states = [&](StateImageHandle handle) {
         return is_release_protected(handle) || state_bound_by_active_sequence(handle);
     };
@@ -7717,13 +8097,34 @@ bool ProgramImplCore::release_one_device_state_slot() {
         evicted && state_store->evict_host_replica(*evicted)) {
         if (demote_one()) { return true; }
     }
-    // No Host capacity could be created: drop the oldest checkpoint nobody references and no
-    // live sequence still binds. This step destroys data, so it keeps the conservative predicate:
-    // a Catalogued owner's summary still references its checkpoints, and only
-    // `retire_oldest_idle_continuation` retires an owner and its states together.
+    // Garbage collection, not cache: `Drop` only selects checkpoints with
+    // `checkpoint_references == 0` (select_slot_release_victim), i.e. images no owner can ever
+    // restore from - unreachable bytes, not a retention decision (§10.5). The conservative veto
+    // stays as belt and braces.
     if (const std::optional<StateImageHandle> victim = state_store->select_slot_release_victim(
             StateImageStore::SlotReleaseKind::Drop, keep_live_states)) {
         if (state_store->release(*victim)) { return true; }
+    }
+    // R2 degrade (缓存模块v2.md §10.4/§10.5): the steady-state Host wall is a full pool of
+    // HostOnly checkpoints, whose Host slot no other step can free. Release ONE such slot by
+    // dropping the least-important idle owner's shallowest HostOnly anchor out of its inventory;
+    // the owner keeps its catalog row and stays restorable from its remaining checkpoints. The
+    // freed slot then pays for the demotion this step owes (same pattern as the EvictHostReplica
+    // step above). Never runs when the caller forbids cache loss, never touches Device data, and
+    // when it cannot help either there is NO destructive fallback - the step reports failure and
+    // the request waits (R0).
+    if (allow_degrade && degrade_idle_owner_host_state()) {
+        if (did_degrade != nullptr) { *did_degrade = true; }
+        if (demote_one()) { return true; }
+    }
+    // R2 whole-conversation host release (§2.1): an idle owner whose Device side is already zero
+    // disappears from Host completely - catalog row included. Cheapest-first ordering puts it
+    // after the single-anchor degrade above; for a Host-goal caller the freed slots still count
+    // (its final reserve retry picks them up), and for the Device goal the demotion that follows
+    // spends them.
+    if (allow_degrade && release_idle_owner_host_side()) {
+        if (did_degrade != nullptr) { *did_degrade = true; }
+        if (demote_one()) { return true; }
     }
     // Every non-destructive step found no eligible victim. Record the per-step eligibility so the
     // retire that typically follows can be judged instead of guessed: Device full with
@@ -7804,21 +8205,15 @@ ProgramImplCore::state_slot_relief(std::uint32_t planned_host_state_release) con
                    ? std::numeric_limits<std::uint32_t>::max()
                    : a + b;
     };
-    // Retirement is deliberately NOT credited (see host_slot_relief and storage doc 4.2): a plan
-    // built on capacity only retirement can deliver is an over-promise, and the runtime then
-    // destroyed state a live reference still held. A private capture that needs capacity reclaims
-    // it at reservation time instead, so every assessment sees the pool the ladder produced.
-    // Retirement is deliberately NOT credited. Crediting the ladder's last step (retire the oldest
-    // idle continuation) made the planner plan around capacity only that step can deliver; the
-    // runtime then retired an idle session on nearly every request, and retention collapsed from
-    // ~320 retained states to ~29 during a 2026-09-21 fill (20 retirements in 12 requests). The
-    // non-destructive steps below are enough for the reuse the incident needed.
-    // Two levels, and the second level always has something to give while cache remains: what the
-    // Device pool cannot hold is demoted to Host, and what Host cannot hold is deleted, least
-    // valuable first. The cheap steps above cover the demotion; the deletion is one owner's worth
-    // and is credited only when the cheap steps have nothing - crediting it unconditionally once
-    // retired a session on nearly every request (2026-09-21: retention 320 -> 29). Startup
-    // parameters size the working set, so everything this deletion touches is cache.
+    // Retirement is deliberately NOT credited unconditionally (see host_slot_relief and storage
+    // doc 4.2): a plan built on capacity only the last step can deliver is an over-promise. The
+    // ladder's final step now degrades ONE HostOnly checkpoint of the least-important idle owner
+    // (R2, §10.4) instead of retiring that owner whole; crediting it unconditionally still made
+    // the planner plan around capacity only that step can deliver, the runtime then destroyed
+    // cache on nearly every request, and retention collapsed from ~320 retained states to ~29
+    // during a 2026-09-21 fill (20 retirements in 12 requests). The cheap steps above cover the
+    // demotion; the degrade credit below answers only when they have nothing. Startup parameters
+    // size the working set, so everything this step touches is cache.
     std::uint32_t host_budget =
         sat_u32(sat_u32(free_host, planned_host_state_release), counts.host_evictable);
     if (host_budget == 0 && counts.demote_candidates != 0) {
@@ -7877,6 +8272,55 @@ ProgramImplCore::guided_materialization_deficit(const ResourceCandidateState& ad
     return residual;
 }
 
+ProgramImplCore::PressureReliefClaim ProgramImplCore::begin_pressure_relief_claim() const {
+    PressureReliefClaim claim;
+    if (text_kv_pages) { claim.main.assign(text_kv_pages->capacity(), 0U); }
+    if (backend_kv_pages) { claim.backend.assign(backend_kv_pages->capacity(), 0U); }
+    return claim;
+}
+
+std::uint32_t ProgramImplCore::attribute_pressure_move_relief(
+    const qwen3_6::detail::PressureDecision& decision, const SequenceKVBundle& kv,
+    PressureReliefClaim& claim) const {
+    // Keyed by physical descriptor (the same identity compose's claim_pressure_pages strips
+    // duplicates by), so a page shared by several victims is promised by exactly the first of
+    // them: the policy's sum over any chosen subset can no longer exceed the union that is
+    // actually delivered (缓存模块v2.md §十.11).
+    std::uint32_t attributed = 0;
+    const auto walk          = [&](const KVAddressSpaceStore& addresses,
+                                   const LogicalKVPageStore& pages, const KVAddressSpaceHandle& address,
+                                   std::vector<std::uint8_t>& claimed,
+                                   const std::vector<qwen3_6::detail::PressureKVDecision>& changes) {
+        if (changes.empty() || !addresses.valid(address)) { return; }
+        const std::uint32_t mapped = addresses.mapped_pages(address);
+        for (const qwen3_6::detail::PressureKVDecision& action : changes) {
+            if (action.kind == qwen3_6::detail::PressureKVDecisionKind::DropHostDuplicate) {
+                continue; // Host-side action: no Device page is freed.
+            }
+            if (action.page_count == 0 || action.begin_page > mapped ||
+                action.page_count > mapped - action.begin_page) {
+                continue;
+            }
+            for (std::uint32_t offset = 0; offset < action.page_count; ++offset) {
+                const LogicalKVPageHandle logical =
+                    addresses.logical_page(address, action.begin_page + offset);
+                const std::size_t index = pages.descriptor_index(logical);
+                if (index >= claimed.size() || claimed[index] != 0) { continue; }
+                claimed[index] = 1U;
+                ++attributed;
+            }
+        }
+    };
+    if (!text_kv_addresses || !text_kv_pages) { return 0; }
+    walk(*text_kv_addresses, *text_kv_pages, kv.text, claim.main, decision.main_kv_changes);
+    if (!decision.backend_kv_changes.empty() && kv.backend && backend_kv_addresses &&
+        backend_kv_pages) {
+        walk(*backend_kv_addresses, *backend_kv_pages, *kv.backend, claim.backend,
+             decision.backend_kv_changes);
+    }
+    return attributed;
+}
+
 bool ProgramImplCore::physical_peak_fits(detail::PhysicalResources peak) const noexcept {
     const detail::PhysicalResources occupied = physical_occupancy();
     const detail::PhysicalResources limits   = admission_capacity();
@@ -7888,7 +8332,9 @@ bool ProgramImplCore::physical_peak_fits(detail::PhysicalResources peak) const n
     };
     // Device state slots the release ladder can free count against `used`, not against a lower
     // capacity: the runtime ladder (release_one_device_state_slot) backs this credit, and its
-    // final step (retire the oldest idle session) makes the reservation succeed regardless.
+    // final step (degrade the least-important idle owner's HostOnly checkpoint, R2) makes the
+    // reservation succeed regardless - unless nothing can be degraded either, in which case the
+    // reservation fails and the request waits (缓存模块v2.md §三 R0).
     const std::uint32_t state_relief = state_slot_relief(0);
     const std::uint32_t state_used   = state_relief > occupied.device.state_slots
                                            ? 0
