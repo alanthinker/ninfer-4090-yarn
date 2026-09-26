@@ -741,7 +741,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
                      importance_by_victim.size(), owner_values.size());
     }
     // §2.2's tie-break: two equal scores still rank by recency (oldest first), exactly like
-    // retire_preference's cache_owner_rank_less — Datum carries the same age_key (§十.10).
+    // retire_preference's cache_owner_rank_less — Datum carries the same age_key (§2.2).
     std::vector<std::int64_t> age_by_victim(options.victims.size(), 0);
     for (std::size_t victim_index = 0; victim_index < options.victims.size(); ++victim_index) {
         const CandidateVictimOptions& victim = options.victims[victim_index];
@@ -824,7 +824,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         }
     }
 
-    // 缓存模块v2.md §十.11: the simulation must promise the UNION of relief across victims,
+    // 缓存模块v2.md §八: the simulation must promise the UNION of relief across victims,
     // never the sum. Shared-prefix physical pages appear in several victims' move decisions; a
     // summed plan stopped early with 2,634 promised against 1,610 delivered, and the engine
     // latched fatal on the refused target. attribute_pressure_move_relief claims each physical

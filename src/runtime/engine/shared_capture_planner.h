@@ -54,7 +54,7 @@ public:
         std::span<const PlanningOwnerId> shared_owner_ids;
         std::span<const OwnerPolicy> owner_policies;
         std::span<const CheckpointPolicy> checkpoint_policies;
-        // 缓存模块v2.md §10.7: the ONE importance for every owner in this capture's victim
+        // 缓存模块v2.md §六.4: the ONE importance for every owner in this capture's victim
         // domain (value = K + age when protected), computed by the common layer. Publish value
         // decides WHETHER; equal-value targets rank by the importance they evict.
         std::span<const runtime::OwnerImportance> owner_values;
@@ -258,7 +258,7 @@ private:
         std::uint32_t dropped_checkpoints = 0;
         std::vector<PressureOwnerOutcome> owner_outcomes;
         std::vector<PressureCheckpointOutcome> checkpoint_outcomes;
-        // Saturating sum of the importance this target evicts (§10.7): the tie-break after
+        // Saturating sum of the importance this target evicts (§六.4): the tie-break after
         // publish value - less important evictions win.
         std::uint64_t evicted_importance = 0;
     };
@@ -414,7 +414,7 @@ private:
     }
 
     // Publish value decides WHETHER; on equal value the importance the target evicts decides
-    // WHOM (缓存模块v2.md §10.7): less important evictions win, so a target that takes protected
+    // WHOM (缓存模块v2.md §六.4): less important evictions win, so a target that takes protected
     // cache (K + age, the largest values) loses to any equal-value alternative - protection as a
     // magnitude, never an exclusion from the domain.
     [[nodiscard]] static bool better(const TransitionValue& value,

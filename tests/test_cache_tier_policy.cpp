@@ -14,7 +14,7 @@
 //   - the four pools stay separate: a request blocked ONLY on state slots must be visible here,
 //     even when every KV axis reports room
 //   - a drop may fund the spill it used to "eat": releasing a conversation's Host copy and
-//     moving its Device copy into that room is ONE net action (§十.9), never a Device destroy
+//     moving its Device copy into that room is ONE net action (§2.1), never a Device destroy
 
 #include "runtime/cache/cache_tier_policy.h"
 
@@ -230,7 +230,7 @@ void case_active_data_is_never_a_candidate() {
     }
 }
 
-// §10.9: a drop may fund the very spill it used to "eat". The single candidate holds BOTH the
+// §2.1: a drop may fund the very spill it used to "eat". The single candidate holds BOTH the
 // Host room to free and the Device room to give back. Releasing its Host copy opens the room its
 // own Device copy then lands in — one net action, nothing on Device destroyed — so the plan is
 // real instead of a wait.
@@ -269,7 +269,7 @@ void case_two_conversations_close_both_gaps() {
     check(outcome.steps.size() == 2, "one drop, one move - no extra conversation");
     if (outcome.steps.size() == 2) {
         check(outcome.steps[0].id == 1, "the least important conversation is the one dropped");
-        check(outcome.steps[1].id == 1, "and its own Device copy is what moves (§10.9)");
+        check(outcome.steps[1].id == 1, "and its own Device copy is what moves (§2.1)");
     }
     for (const auto& step : outcome.steps) {
         check(step.id != 2, "the second conversation survives untouched");
@@ -380,7 +380,7 @@ void case_deletions_stop_at_the_gap() {
     }
 }
 
-// §10.9: drop and spill may land on the SAME conversation — releasing its Host copy and moving
+// §2.1: drop and spill may land on the SAME conversation — releasing its Host copy and moving
 // its Device copy into that room is one net action. What stays structural is different from what
 // this case used to assert: no plan step ever destroys Device data (there is no such Action), and
 // a second conversation is never touched when the first one closes the gap. The runtime side of
@@ -411,7 +411,7 @@ void case_drop_and_spill_are_one_net_action() {
 // §2.2's one chain (`value → age → id`): two equal scores still rank by recency — the oldest
 // last-touched goes first — and only then by id. Without the age segment the policy tie-broke on
 // catalog id while retire_preference tie-broke on age, so the same snapshot could pick two
-// different victims (§十.10).
+// different victims (§2.2).
 void case_equal_importance_ranks_by_age_then_id() {
     std::printf("case_equal_importance_ranks_by_age_then_id\n");
     const std::vector<Datum> pool{

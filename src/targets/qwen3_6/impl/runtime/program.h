@@ -1156,7 +1156,7 @@ private:
     // promise the UNION of relief across victims, never the sum: shared-prefix physical pages
     // appear in several victims' move decisions, and a summed plan stopped early with 2,634 pages
     // promised against 1,610 delivered, which the feasibility gate refused and the engine latched
-    // fatal (2026-09-26, 缓存模块v2.md §十.11). Eviction (Host-side) effects need no claims:
+    // fatal (2026-09-26, 缓存模块v2.md §八). Eviction (Host-side) effects need no claims:
     // owner_exclusive_resources already skips pages with address_references > 1, and StateImages
     // are settled once per joint projection.
     struct PressureReliefClaim {
@@ -1175,7 +1175,7 @@ private:
     // checkpoints drop their Device replica for free; DeviceOnly ones demote, each needing one
     // Host slot from free Host capacity, `planned_host_state_release` slots this plan itself
     // frees, or the slots the ladder's final step frees by degrading the least-important idle
-    // owner's HostOnly checkpoint (R2, 缓存模块v2.md §10.4).
+    // owner's HostOnly checkpoint (R2, 缓存模块v2.md §三 R2).
     [[nodiscard]] std::uint32_t
     state_slot_relief(std::uint32_t planned_host_state_release) const noexcept;
     // The StateImage the in-flight reservation depends on (the plan's selected source). The release
@@ -1269,21 +1269,22 @@ private:
     [[nodiscard]] bool state_bound_by_live_sequence(StateImageHandle state) const;
     // Number of continuation catalog slots currently occupied (any non-Free role).
     [[nodiscard]] std::uint32_t occupied_catalog_slots() const noexcept;
-    // R2 for the Host state pool (缓存模块v2.md §10.4/§10.5): release ONE Host state slot by
+    // R2 for the Host state pool (缓存模块v2.md §三 R0/§2.1): release ONE Host state slot by
     // degrading the least-important idle owner - drop its shallowest non-protected HostOnly long
     // anchor out of its inventory. The owner keeps its catalog row and stays restorable from its
     // remaining checkpoints; an owner whose KV beyond the surviving frontier still holds Device
     // residency is skipped, so this step never destroys Device data. Returns false when no idle
     // owner can be degraded this way - the caller then fails the step and the request waits (R0),
     // because the old fallback (retiring the owner, both tiers at once) violated invariant 1 in
-    // 280 of 557 production retirements (§10.4).
+    // 280 of 557 production retirements (§七判据 #3).
     [[nodiscard]] bool degrade_idle_owner_host_state();
-    // R2 at whole-conversation granularity (缓存模块v2.md §2.1/§10.5): release the least-important
+    // R2 at whole-conversation granularity (缓存模块v2.md §2.1): release the least-important
     // idle owner that holds NOTHING on Device - its Host KV, Host state and catalog row disappear
     // together, which is exactly the documented "整条对话从内存消失" (both sides zero -> catalog
     // row released). This is the LEGAL half of the old retirement (277 of 557 production retires
     // destroyed no Device data); owners that still hold Device data are skipped - destroying them
-    // would violate invariant 1, so the ladder spills what it can and otherwise fails to R0.
+    // would violate invariant 1, so the ladder spills what it can and otherwise fails to R0
+    // (§三 R0; the 280-of-557 baseline is acceptance 7#3).
     [[nodiscard]] bool release_idle_owner_host_side();
     // #12 先搬后释 (spill-then-release): move one idle owner's Device KV to Host - the
     // DemoteToHost runs (device-only pages) and DropDeviceDuplicate runs (redundant copies)

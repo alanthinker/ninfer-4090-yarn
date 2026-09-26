@@ -449,13 +449,13 @@ struct PlanningOwnerId {
 //
 // A protected owner's value is `kProtectedStep (1<<62) + age` (cache_owner_importance): above
 // every unprotected score and, inside the protected group, ordered by age — oldest first.
-// `UINT64_MAX` is NOT the protected marker; it only means "unpriced", taken last (§十.10).
+// `UINT64_MAX` is NOT the protected marker; it only means "unpriced", taken last (§2.2).
 struct OwnerImportance {
     PlanningOwnerId owner;
     std::uint64_t value = 0;
     // Last-active age key (ASCENDING: larger == more recent), the same key the ladder's
     // retire_preference ranks with — carried so cachep::plan can tie-break equal scores by age
-    // instead of by catalog id (§十.10).
+    // instead of by catalog id (§2.2).
     std::int64_t age_key = 0;
 };
 

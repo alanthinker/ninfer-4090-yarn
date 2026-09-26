@@ -7744,8 +7744,9 @@ void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index) noex
     // through this primitive reports the Device footprint it destroys, so acceptance is "this
     // counter is 0 across the battery", not "the call does not exist". The line is UNCONDITIONAL
     // (no NINFER_REUSE_DIAG gate): an invariant probe that can be silenced reads 0 while the
-    // rule is being broken. After §10.4 the ladder never reaches here; the remaining hits are
-    // the transaction victims the policy still executes as full evictions (§10.4 #3/#4) - each
+    // rule is being broken. After the §三 R0 ruling the ladder never reaches here; the remaining
+    // hits are the transaction victims the policy still executes as full evictions
+    // (§六.1 #3/#4) - each
     // one is exactly what has to go to zero.
     try {
         const detail::PhysicalResources footprint = owner_exclusive_resources(sequence);
@@ -8039,7 +8040,7 @@ bool ProgramImplCore::release_one_device_state_slot(bool allow_degrade, bool* di
     // depends on. This step therefore keeps the conservative predicate plus the in-flight
     // reservation's protection; when a Host slot has no redundant replica to give, the R2 degrade
     // below releases it from the least-important idle owner instead (the old answer - retiring
-    // that owner whole - destroyed Device data and is gone, 缓存模块v2.md §10.4).
+    // that owner whole - destroyed Device data and is gone, 缓存模块v2.md §三 R0).
     const auto keep_active_states = [&](StateImageHandle handle) {
         return is_release_protected(handle) || state_bound_by_active_sequence(handle);
     };
@@ -8099,13 +8100,13 @@ bool ProgramImplCore::release_one_device_state_slot(bool allow_degrade, bool* di
     }
     // Garbage collection, not cache: `Drop` only selects checkpoints with
     // `checkpoint_references == 0` (select_slot_release_victim), i.e. images no owner can ever
-    // restore from - unreachable bytes, not a retention decision (§10.5). The conservative veto
+    // restore from - unreachable bytes, not a retention decision (§2.1). The conservative veto
     // stays as belt and braces.
     if (const std::optional<StateImageHandle> victim = state_store->select_slot_release_victim(
             StateImageStore::SlotReleaseKind::Drop, keep_live_states)) {
         if (state_store->release(*victim)) { return true; }
     }
-    // R2 degrade (缓存模块v2.md §10.4/§10.5): the steady-state Host wall is a full pool of
+    // R2 degrade (缓存模块v2.md §三 R0/§2.1): the steady-state Host wall is a full pool of
     // HostOnly checkpoints, whose Host slot no other step can free. Release ONE such slot by
     // dropping the least-important idle owner's shallowest HostOnly anchor out of its inventory;
     // the owner keeps its catalog row and stays restorable from its remaining checkpoints. The
@@ -8208,7 +8209,7 @@ ProgramImplCore::state_slot_relief(std::uint32_t planned_host_state_release) con
     // Retirement is deliberately NOT credited unconditionally (see host_slot_relief and storage
     // doc 4.2): a plan built on capacity only the last step can deliver is an over-promise. The
     // ladder's final step now degrades ONE HostOnly checkpoint of the least-important idle owner
-    // (R2, §10.4) instead of retiring that owner whole; crediting it unconditionally still made
+    // (R2, §三 R2) instead of retiring that owner whole; crediting it unconditionally still made
     // the planner plan around capacity only that step can deliver, the runtime then destroyed
     // cache on nearly every request, and retention collapsed from ~320 retained states to ~29
     // during a 2026-09-21 fill (20 retirements in 12 requests). The cheap steps above cover the
@@ -8285,7 +8286,7 @@ std::uint32_t ProgramImplCore::attribute_pressure_move_relief(
     // Keyed by physical descriptor (the same identity compose's claim_pressure_pages strips
     // duplicates by), so a page shared by several victims is promised by exactly the first of
     // them: the policy's sum over any chosen subset can no longer exceed the union that is
-    // actually delivered (缓存模块v2.md §十.11).
+    // actually delivered (缓存模块v2.md §八).
     std::uint32_t attributed = 0;
     const auto walk          = [&](const KVAddressSpaceStore& addresses,
                                    const LogicalKVPageStore& pages, const KVAddressSpaceHandle& address,

@@ -2206,7 +2206,7 @@ private:
             if (active.size == 0) {
                 // 缓存模块v2.md §三 R0: a TemporarilyBlocked head in an idle Engine is not an
                 // invariant violation — the pool still holds cache the rules can move or drop, or
-                // one plan under-delivered (§十.11), and the memoized verdict is re-inspected the
+                // one plan under-delivered (§八), and the memoized verdict is re-inspected the
                 // moment a pool counter moves. Park until the queue deadline instead of failing
                 // the Engine: fail_all_locked here wiped every session and latched 503s until a
                 // restart (2026-09-26: five blocked-head events in one run — four while a request

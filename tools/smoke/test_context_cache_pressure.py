@@ -116,7 +116,7 @@ def summarize_log(path: str, mark: int):
         print(f"  (log not readable: {error})")
         return
     evictions = [line for line in lines if "[evict] slot=" in line]
-    # `[exhaust]` was the ladder's destructive retire; since 缓存模块v2.md §10.4 the cache-
+    # `[exhaust]` was the ladder's destructive retire; since 缓存模块v2.md §三 R0 the cache-
     # losing ladder step logs `[ladder] degrade` (one HostOnly checkpoint, owner retained).
     exhaust = [line for line in lines if line.startswith("[ladder] degrade")]
     errors = [line for line in lines if "HTTP 500" in line or "HTTP 503" in line]

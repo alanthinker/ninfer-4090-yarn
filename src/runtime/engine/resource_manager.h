@@ -822,7 +822,7 @@ public:
             owner_policies.reserve(catalog_count_ + shared_catalog_count_);
             checkpoint_policies.reserve(prefix_index_.size());
             capture_owner_records.reserve(catalog_count_ + shared_catalog_count_);
-            // 缓存模块v2.md §10.7: fair-share protection is a VALUE (K + age inside
+            // 缓存模块v2.md §六.4: fair-share protection is a VALUE (K + age inside
             // cache_owner_importance), never an exclusion - the protected set now ENTERS the
             // capture victim domain, exactly like materialization's domain since §2.2. These
             // mirrors carry the same evidence materialization's policies carry, so the score is
@@ -972,7 +972,7 @@ public:
                 });
             }
 
-            // One formula, one evidence set (§2.2/§10.7): score every capture-domain owner the
+            // One formula, one evidence set (§2.2/§六.4): score every capture-domain owner the
             // way materialization scores its victims, fold fair-share/recency protection in as
             // the K + age magnitude, and hand the values to the planner. It ranks targets by
             // publish value first and, on equal value, by the importance they evict (least
@@ -1010,7 +1010,7 @@ public:
                 std::vector<PlanningOwnerId> shared_owner_ids;
                 // Owners outside the planning domain (retired, actively referenced, or with no
                 // priced checkpoint) are simply not victims. Fair-share protection is NOT one of
-                // those exclusions any more (§10.7): it enters through importance as K + age.
+                // those exclusions any more (§六.4): it enters through importance as K + age.
                 // Callers skip them or the scenario that needs them: a capture is optional, so an
                 // owner view that lags the Program must never fail the request.
                 const auto owner_id_for = [&](LogicalOwnerKind kind,
@@ -2563,7 +2563,7 @@ private:
 
         std::vector<ProjectedSharedCandidate> shared_candidates;
         shared_candidates.reserve(base.context_cache().opportunities.size());
-        // 缓存模块v2.md §10.7: fair-share protection is a VALUE, not an exclusion. Protected
+        // 缓存模块v2.md §六.4: fair-share protection is a VALUE, not an exclusion. Protected
         // private owners now enter this fold like everyone else - their displacement is priced by
         // their retention weight, so a shared capture that would destroy protected cache has to
         // out-value that loss instead of having it silently unpriced.
