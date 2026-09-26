@@ -71,7 +71,7 @@ SHARED_PREFIXES="${AGENT_SHARED_PREFIXES:-4}"   # small shared catalog fills fas
 AUTO_ANCHORS="${AGENT_AUTO_ANCHORS:-5}"     # production value: last-N user transitions
 FAIR_BUCKETS="${AGENT_FAIR_BUCKETS:-4}"     # protected-vs-evictable boundary visible in small runs
 MAX_PENDING="${AGENT_MAX_PENDING:-16}"      # production value: bounded FIFO ingress
-PENDING_TIMEOUT_MS="${AGENT_PENDING_TIMEOUT_MS:-600000}"  # production value; lower per-test for
+PENDING_TIMEOUT_MS="${AGENT_PENDING_TIMEOUT_MS:-60000}"  # tests fail fast: an R0-parked request waits60s, not the production
                                                           # the queue-timeout boundary
 # Diagnostics ON by default: a TEST rig must emit the evidence its suites assert on
 # (fair_share_sim greps `reuse-diag: ... fair=N ... CANDIDATE`, gated by NINFER_REUSE_DIAG).

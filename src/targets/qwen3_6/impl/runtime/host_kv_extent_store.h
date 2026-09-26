@@ -337,20 +337,64 @@ public:
             });
             return true;
         };
-        for (const HostKVPageReplicaRelease& release : releases) {
-            if (release.pages == nullptr || !mark_release(*release.pages, release.page, false) ||
-                !append(release)) {
+        const auto explain = [](const char* list, std::size_t at,
+                                const HostKVPageReplicaRelease& release, bool marked, bool added) {
+            const bool facts = release.pages != nullptr;
+            std::fprintf(stderr,
+                         "[host-alloc] release check FAILED list=%s i=%zu desc=%u"
+                         " pages=%p marked=%d added=%d pins=%u refs=%u host=%d\n",
+                         list, at,
+                         facts ? release.pages->descriptor_index(release.page) : 0U,
+                         static_cast<const void*>(release.pages), marked ? 1 : 0, added ? 1 : 0,
+                         facts ? release.pages->source_pins(release.page) : 999U,
+                         facts ? release.pages->address_references(release.page) : 999U,
+                         facts && release.pages->host_resident(release.page) ? 1 : 0);
+            if (facts && !marked && release.pages->host_resident(release.page) &&
+                release.pages->source_pins(release.page) == 0 &&
+                release.pages->address_references(release.page) == 1) {
+                // All the printed facts were green, so the refusal is one of: descriptor no
+                // longer valid (generation recycled), membership consistency, or a DUPLICATE
+                // mark - name them.
+                std::fprintf(stderr,
+                             "[host-alloc]   ... valid=%d (generation recycle = stale entry,"
+                             " otherwise membership mismatch or duplicate mark)\n",
+                             release.pages->valid(release.page) ? 1 : 0);
+                std::fflush(stderr);
+            }
+            std::fflush(stderr);
+        };
+        for (std::size_t at = 0; at < releases.size(); ++at) {
+            const HostKVPageReplicaRelease& release = releases[at];
+            const bool marked =
+                release.pages != nullptr && mark_release(*release.pages, release.page, false);
+            const bool added = marked && append(release);
+            if (!added) {
+                explain("release", at, release, marked, added);
                 return false;
             }
         }
-        for (const HostKVPageReplicaRelease& release : last_reference_releases) {
-            if (release.pages == nullptr || !mark_release(*release.pages, release.page, true) ||
-                !append(release)) {
-                return false;
-            }
+        // Last-reference entries are CREDITS, not committed actions: an entry the store cannot
+        // verify (stale membership, duplicate mark, recycled generation) is skipped, never fatal.
+        // Under-crediting only makes this pre-check stricter; failing the whole allocation on one
+        // unverifiable credit starves a plan whose pages genuinely fit (rig fill: one page out of
+        // 255 refused the mark and the request parked to its deadline while Host had GiB free).
+        for (std::size_t at = 0; at < last_reference_releases.size(); ++at) {
+            const HostKVPageReplicaRelease& release = last_reference_releases[at];
+            const bool marked =
+                release.pages != nullptr && mark_release(*release.pages, release.page, true);
+            const bool added = marked && append(release);
+            if (!added) { explain("lastref-skipped", at, release, marked, added); }
         }
-        return arena_->can_allocate_after_suballocation_releases(suballocation_scratch_,
-                                                                 allocations);
+        if (!arena_->can_allocate_after_suballocation_releases(suballocation_scratch_,
+                                                               allocations)) {
+            std::fprintf(stderr,
+                         "[host-alloc] arena refused: suballoc entries=%zu allocations=%zu"
+                         " (fragmentation)\n",
+                         suballocation_scratch_.size(), allocations.size());
+            std::fflush(stderr);
+            return false;
+        }
+        return true;
     }
 
     [[nodiscard]] bool release_page_replicas(std::span<const HostKVPageReplicaRelease> releases) {

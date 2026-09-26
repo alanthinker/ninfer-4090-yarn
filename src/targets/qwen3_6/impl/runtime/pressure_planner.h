@@ -780,7 +780,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
     // The demand carries its own Host reservation: whatever moves off Device lands on Host, so the
     // policy needs no conversion of its own. KV meets its Host landing unit here - one logical page
     // is one Host page, so the stride is exact - and state is one slot on either side.
-    const cachep::Demand demand{
+    cachep::Demand demand{
         .device_kv         = residual.device.main_kv_pages,
         .device_backend_kv = residual.device.backend_kv_pages,
         .device_state      = device_state(residual),
@@ -929,7 +929,26 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         });
     }
 
-    const cachep::Plan plan = cachep::plan(demand, tiers, pool);
+    cachep::Plan plan = cachep::plan(demand, tiers, pool);
+    // The R1 loop picks whole conversations, so its landing can overshoot the budgeted device
+    // gap (rig fill[3]: gap239 pages budgeted,251 pages chosen -48 MiB of landing nobody made
+    // room for, and the allocator's pre-check then blocked the target while Host genuinely had
+    // no room for the OVERSHOOT). Re-run with the landing the CHOSEN spills actually need: the
+    // release loop then returns more Host room (every drop's pages are credited to the
+    // allocator now), which is exactly what the physical check will count.
+    for (int adjust = 0; adjust < 2 && !plan.enqueue; ++adjust) {
+        std::uint64_t landing_pages = 0;
+        for (const cachep::Step& step : plan.steps) {
+            if (step.action != cachep::Action::SpillToHost) { continue; }
+            if (step.id >= pool.size()) { continue; }
+            landing_pages += pool[step.id].device_kv + pool[step.id].device_backend_kv;
+        }
+        const std::uint64_t want =
+            host_kv(residual) + landing_pages * page_bytes;
+        if (want <= demand.host_kv) { break; }
+        demand.host_kv = want;
+        plan           = cachep::plan(demand, tiers, pool);
+    }
     if (const char* diag = std::getenv("NINFER_REUSE_DIAG"); diag == nullptr || *diag != '0') {
         std::fprintf(stderr, "%s\n", cachep::describe(plan, demand, tiers).c_str());
         std::fflush(stderr);

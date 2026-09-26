@@ -3925,6 +3925,37 @@ bool ProgramImplCore::compose_pressure_candidate(
             });
         }
     };
+    // An eviction (drop) releases its owner's Host KV pages when the transaction removes the
+    // owner's address-space memberships - those replicas become unreferenced exactly like a
+    // last-reference drop, so the allocation pre-check must count them too. Without this the
+    // check saw only free + DropHostDuplicate releases and starved the very landing the plan
+    // had just freed room for (rig fill[3]: drops returned60 MiB, blocked_host still said
+    // short ~20-80 MiB, request parked to its queue deadline).
+    const auto append_owner_host_releases = [&](const SequenceKVBundle* kv) {
+        if (kv == nullptr || host_kv_extents == nullptr) { return; }
+        const auto walk = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                              const KVAddressSpaceHandle& address) {
+            if (!addresses.valid(address)) { return; }
+            const std::uint32_t mapped = addresses.mapped_pages(address);
+            for (std::uint32_t page = 0; page < mapped; ++page) {
+                const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+                if (!pages.host_resident(logical)) { continue; }
+                // A page shared with a surviving owner keeps its replica: not this eviction's
+                // release; a pinned page is not released by this transaction either (both are
+                // exactly the gates mark_release(last_reference=true) enforces - a single bad
+                // entry fails the WHOLE allocation pre-check).
+                if (pages.address_references(logical) > 1) { continue; }
+                if (pages.source_pins(logical) != 0) { continue; }
+                host_last_reference_releases.push_back(
+                    HostKVPageReplicaRelease{.pages = &pages, .page = logical});
+            }
+        };
+        walk(*text_kv_addresses, *text_kv_pages, kv->text);
+        if (kv->backend != std::nullopt && backend_kv_addresses != nullptr &&
+            backend_kv_pages != nullptr) {
+            walk(*backend_kv_addresses, *backend_kv_pages, *kv->backend);
+        }
+    };
     const auto append_kv_actions = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
                                        KVAddressSpaceHandle address,
                                        std::span<const qwen3_6::detail::PressureKVDecision> changes,
@@ -3960,6 +3991,8 @@ bool ProgramImplCore::compose_pressure_candidate(
         qwen3_6::detail::PressureDecision expected;
         if (proposed.evicts_continuation) {
             expected = inspect_eviction_option(continuation_states[index]);
+            const SequenceState& evicted = continuation_states[index];
+            append_owner_host_releases(evicted.kv ? &*evicted.kv : nullptr);
         } else {
             if (!pressure_decision_valid(continuation_states[index], proposed, &*protection)) {
                 reject_reason("compose-early");

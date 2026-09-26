@@ -336,7 +336,7 @@ start)
     --model-id myai \
     --max-context "$MAX_CTX" --kv-capacity auto \
     --max-concurrency "$CONCURRENCY" --max-pending-requests 16 \
-    --pending-timeout-ms 600000 \
+    --pending-timeout-ms "${PENDING_TIMEOUT_MS:-600000}" \
     --prefill-chunk 1024 --kv-dtype "$KV_DTYPE" \
     --default-max-tokens 32768 \
     --spec mtp --draft-tokens 3 --lm-head-draft \
