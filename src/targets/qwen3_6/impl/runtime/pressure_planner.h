@@ -740,6 +740,18 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         std::fprintf(stderr, "[cache] importance unpriced %zu/%zu owner_values=%zu\n", unpriced,
                      importance_by_victim.size(), owner_values.size());
     }
+    // §2.2's tie-break: two equal scores still rank by recency (oldest first), exactly like
+    // retire_preference's cache_owner_rank_less — Datum carries the same age_key (§十.10).
+    std::vector<std::int64_t> age_by_victim(options.victims.size(), 0);
+    for (std::size_t victim_index = 0; victim_index < options.victims.size(); ++victim_index) {
+        const CandidateVictimOptions& victim = options.victims[victim_index];
+        if (victim.owner_index >= owners.size()) { continue; }
+        const runtime::PlanningOwnerId id = owners[victim.owner_index].id;
+        const auto found = std::find_if(
+            owner_values.begin(), owner_values.end(),
+            [&](const runtime::OwnerImportance& entry) { return entry.owner == id; });
+        if (found != owner_values.end()) { age_by_victim[victim_index] = found->age_key; }
+    }
 
     const detail::PhysicalResources occupancy  = program->physical_occupancy();
     const detail::PhysicalResources capacity   = program->admission_capacity();
@@ -812,6 +824,15 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         }
     }
 
+    // 缓存模块v2.md §十.11: the simulation must promise the UNION of relief across victims,
+    // never the sum. Shared-prefix physical pages appear in several victims' move decisions; a
+    // summed plan stopped early with 2,634 promised against 1,610 delivered, and the engine
+    // latched fatal on the refused target. attribute_pressure_move_relief claims each physical
+    // page first-wins in victim order — independent of what the policy picks below — so any
+    // chosen subset's summed relief is <= the union compose actually delivers.
+    auto relief_claim = program->begin_pressure_relief_claim();
+    using PlanningContractAccess =
+        qwen3_6::detail::RuntimeContractAccess<NINFER_QWEN36_VARIANT>;
     std::vector<cachep::Datum> pool;
     pool.reserve(options.victims.size());
     for (std::size_t victim_index = 0; victim_index < options.victims.size(); ++victim_index) {
@@ -829,13 +850,44 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
             droppable_state == 0) {
             continue;
         }
+        // Device relief of the move the apply step will run (move.choice), counted once per
+        // physical page across this round. Host/state effects need no claims: eviction effects
+        // come from owner_exclusive_resources (skips address_references > 1) and StateImages are
+        // settled once.
+        std::uint64_t attributed_device_kv = 0;
+        if (move.choice != 0 && move.choice <= victim.decisions.size()) {
+            const PressureDecision& chosen = victim.decisions[move.choice - 1U];
+            if (!chosen.evicts_continuation) {
+                const Owner& owner_entry = owners[victim.owner_index];
+                const NINFER_QWEN36_RUNTIME_NS::SequenceKVBundle* kv =
+                    owner_entry.shared
+                        ? [&]() -> const NINFER_QWEN36_RUNTIME_NS::SequenceKVBundle* {
+                              const NINFER_QWEN36_RUNTIME_NS::SharedPrefixState& shared =
+                                  program->shared_prefix_states[PlanningContractAccess::index(
+                                      *owner_entry.shared_handle)];
+                              return shared.kv ? &*shared.kv : nullptr;
+                          }()
+                        : [&]() -> const NINFER_QWEN36_RUNTIME_NS::SequenceKVBundle* {
+                              const NINFER_QWEN36_RUNTIME_NS::SequenceState& sequence =
+                                  program->continuation_states[PlanningContractAccess::index(
+                                      *owner_entry.private_handle)];
+                              return sequence.kv ? &*sequence.kv : nullptr;
+                          }();
+                if (kv != nullptr) {
+                    attributed_device_kv = program->attribute_pressure_move_relief(
+                        chosen, *kv, relief_claim);
+                }
+            }
+        }
         pool.push_back(cachep::Datum{
             .id           = victim_index,
-            .device_kv    = move.device_kv,     // what R1 can take off Device, in pages
+            .device_kv    = attributed_device_kv, // what R1 can take off Device, in pages:
+                                                  // union-honest, first-wins across victims
             .device_state = move.device_state,  // ... and the Device state slots it hands back
             .host_kv      = droppable_kv,       // what R2 would free on Host, in bytes
             .host_state   = droppable_state,    // ... and the Host state slots it hands back
             .importance   = importance_by_victim[victim_index],
+            .age_key      = age_by_victim[victim_index],
             .active       = false,
         });
     }

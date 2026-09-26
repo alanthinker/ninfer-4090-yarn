@@ -444,14 +444,19 @@ struct PlanningOwnerId {
 //
 // The planner computes this and reports it; it does not hand over an ordering, so it no longer
 // names which conversation disappears first (docs/maintainer/缓存模块v2.md §6.2). Ranking happens
-// once, in the two-tier policy, on `value` alone.
+// once, in the two-tier policy, on the one chain `value → age → id` (§2.2) — `age_key` is
+// evidence for the tie-break, not a rank.
 //
-// `value == UINT64_MAX` means protected: take this one last, while anything else remains.
-// Protection is a magnitude, not a separate rule (§2.2), so a protected owner needs no branch of
-// its own anywhere downstream.
+// A protected owner's value is `kProtectedStep (1<<62) + age` (cache_owner_importance): above
+// every unprotected score and, inside the protected group, ordered by age — oldest first.
+// `UINT64_MAX` is NOT the protected marker; it only means "unpriced", taken last (§十.10).
 struct OwnerImportance {
     PlanningOwnerId owner;
     std::uint64_t value = 0;
+    // Last-active age key (ASCENDING: larger == more recent), the same key the ladder's
+    // retire_preference ranks with — carried so cachep::plan can tie-break equal scores by age
+    // instead of by catalog id (§十.10).
+    std::int64_t age_key = 0;
 };
 
 struct PlanningCandidateId {

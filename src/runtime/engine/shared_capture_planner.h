@@ -54,6 +54,10 @@ public:
         std::span<const PlanningOwnerId> shared_owner_ids;
         std::span<const OwnerPolicy> owner_policies;
         std::span<const CheckpointPolicy> checkpoint_policies;
+        // 缓存模块v2.md §10.7: the ONE importance for every owner in this capture's victim
+        // domain (value = K + age when protected), computed by the common layer. Publish value
+        // decides WHETHER; equal-value targets rank by the importance they evict.
+        std::span<const runtime::OwnerImportance> owner_values;
         std::optional<PlanningOwnerId> direct_shared_victim;
         std::uint32_t candidate_demand_mask         = 0;
         std::uint64_t candidate_rebuild_ns          = 0;
@@ -161,6 +165,8 @@ public:
                                 }
                                 return outcomes;
                             }(),
+                        .evicted_importance = evicted_importance(assessment.owner_outcomes,
+                                                                 input.owner_values),
                     };
                 }
             }
@@ -252,7 +258,32 @@ private:
         std::uint32_t dropped_checkpoints = 0;
         std::vector<PressureOwnerOutcome> owner_outcomes;
         std::vector<PressureCheckpointOutcome> checkpoint_outcomes;
+        // Saturating sum of the importance this target evicts (§10.7): the tie-break after
+        // publish value - less important evictions win.
+        std::uint64_t evicted_importance = 0;
     };
+
+    // Saturating sum over the Evicted outcomes. An owner the value list does not price counts as
+    // UINT64_MAX (the tier policy's unpriced convention), so one unpriced eviction poisons the
+    // whole target instead of wrapping the sum.
+    [[nodiscard]] static std::uint64_t
+    evicted_importance(std::span<const PressureOwnerOutcome> outcomes,
+                       std::span<const runtime::OwnerImportance> owner_values) noexcept {
+        std::uint64_t total = 0;
+        constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+        for (const PressureOwnerOutcome& outcome : outcomes) {
+            if (outcome.disposition != runtime::VictimDisposition::Evicted) { continue; }
+            std::uint64_t value      = kMax;
+            const auto found          = std::find_if(
+                owner_values.begin(), owner_values.end(), [&](const runtime::OwnerImportance& entry) {
+                    return entry.owner == outcome.owner;
+                });
+            if (found != owner_values.end()) { value = found->value; }
+            if (value == kMax || total > kMax - value) { return kMax; }
+            total += value;
+        }
+        return total;
+    }
 
     static void validate(const Input& input) {
         if (input.capture == nullptr || !input.capture->publishes_shared ||
@@ -382,20 +413,28 @@ private:
         return PlanningOwnerId{.value = value};
     }
 
+    // Publish value decides WHETHER; on equal value the importance the target evicts decides
+    // WHOM (缓存模块v2.md §10.7): less important evictions win, so a target that takes protected
+    // cache (K + age, the largest values) loses to any equal-value alternative - protection as a
+    // magnitude, never an exclusion from the domain.
     [[nodiscard]] static bool better(const TransitionValue& value,
                                      const PressureTargetAssessment& assessment, const Input& input,
                                      const Incumbent& incumbent) noexcept {
         return std::tuple{
                    value.gain,
+                   std::numeric_limits<std::uint64_t>::max() -
+                       evicted_importance(assessment.owner_outcomes, input.owner_values),
                    std::numeric_limits<std::uint32_t>::max() - assessment.degradation_units,
                    std::numeric_limits<std::uint32_t>::max() - assessment.dropped_checkpoints,
                    std::numeric_limits<std::uint32_t>::max() - input.stable_scenario_ordinal,
                    std::numeric_limits<std::uint32_t>::max() - assessment.stable_target_ordinal} >
-               std::tuple{incumbent.value.gain,
-                          std::numeric_limits<std::uint32_t>::max() - incumbent.degradation_units,
-                          std::numeric_limits<std::uint32_t>::max() - incumbent.dropped_checkpoints,
-                          std::numeric_limits<std::uint32_t>::max() - input.stable_scenario_ordinal,
-                          std::numeric_limits<std::uint32_t>::max() - incumbent.stable_target};
+               std::tuple{
+                   incumbent.value.gain,
+                   std::numeric_limits<std::uint64_t>::max() - incumbent.evicted_importance,
+                   std::numeric_limits<std::uint32_t>::max() - incumbent.degradation_units,
+                   std::numeric_limits<std::uint32_t>::max() - incumbent.dropped_checkpoints,
+                   std::numeric_limits<std::uint32_t>::max() - input.stable_scenario_ordinal,
+                   std::numeric_limits<std::uint32_t>::max() - incumbent.stable_target};
     }
 
     ContextPortfolioValue portfolio_value_;

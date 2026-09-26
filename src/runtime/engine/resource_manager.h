@@ -822,10 +822,16 @@ public:
             owner_policies.reserve(catalog_count_ + shared_catalog_count_);
             checkpoint_policies.reserve(prefix_index_.size());
             capture_owner_records.reserve(catalog_count_ + shared_catalog_count_);
-            // Fair-share buckets are structurally unevictable: shared capture may demote or
-            // evict shared-pool owners but never a protected session, so the protected set is
-            // absent from the capture victim domain and the portfolio entirely.
+            // 缓存模块v2.md §10.7: fair-share protection is a VALUE (K + age inside
+            // cache_owner_importance), never an exclusion - the protected set now ENTERS the
+            // capture victim domain, exactly like materialization's domain since §2.2. These
+            // mirrors carry the same evidence materialization's policies carry, so the score is
+            // the same formula on the same inputs.
             const std::vector<std::uint32_t> protected_slots = fair_share_protected_slots();
+            std::vector<MaterializationOwnerPolicy> value_owner_policies;
+            std::vector<MaterializationCheckpointPolicy> value_checkpoint_policies;
+            const std::chrono::steady_clock::time_point observation_now =
+                std::chrono::steady_clock::now();
             const auto append_private_checkpoint = [&](PlanningOwnerId owner, std::uint32_t slot,
                                                        const auto& checkpoint) {
                 const CatalogEntry& entry = catalog_[slot];
@@ -839,12 +845,18 @@ public:
                     .rebuild_ns           = cost_model_.prefill_ns(checkpoint.rebuild_work),
                     .baseline_recovery_ns = *baseline,
                 });
+                value_checkpoint_policies.push_back(MaterializationCheckpointPolicy{
+                    .owner                = owner,
+                    .checkpoint           = checkpoint.ref,
+                    .demand_mask          = committed_demand_mask_for(checkpoint.shortlist_key),
+                    .rebuild_ns           = cost_model_.prefill_ns(checkpoint.rebuild_work),
+                    .baseline_recovery_ns = *baseline,
+                });
             };
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
                 CatalogEntry& entry = catalog_[slot];
                 if (entry.state != CatalogState::Catalogued || !entry.handle ||
-                    private_has_active_edge(slot) ||
-                    is_fair_share_protected(protected_slots, slot)) {
+                    private_has_active_edge(slot)) {
                     continue;
                 }
                 // An owner the Program retired while reclaiming capacity for an earlier capture in
@@ -875,6 +887,17 @@ public:
                 owner_policies.push_back(typename CapturePlanner::OwnerPolicy{
                     .owner                    = owner,
                     .private_retention_weight = private_retention_weight(entry.retention),
+                });
+                value_owner_policies.push_back(MaterializationOwnerPolicy{
+                    .owner                    = owner,
+                    .retention_class          = entry.retention,
+                    .selected_hit_count       = entry.lifetime_selected_hits,
+                    .last_hit_epoch           = newest_hit_epoch(entry),
+                    .private_retention_weight = private_retention_weight(entry.retention),
+                    .fair_share_protected     = is_fair_share_protected(protected_slots, slot),
+                    .within_recency_horizon   = within_recency_horizon(slot),
+                    .reuse_evidence_q16       = reuse_evidence_q16(
+                        entry.lifetime_selected_hits, entry.last_selected_at, observation_now),
                 });
                 if (entry.summary.endpoint) {
                     append_private_checkpoint(owner, slot, *entry.summary.endpoint);
@@ -920,6 +943,17 @@ public:
                     .private_retention_weight = 0,
                     .explicit_shared_credit   = entry.explicit_credit,
                 });
+                value_owner_policies.push_back(MaterializationOwnerPolicy{
+                    .owner                    = owner,
+                    .retention_class          = RetentionClass::SharedStable,
+                    .selected_hit_count       = entry.observation.selected_hit_count,
+                    .last_hit_epoch           = entry.observation.last_hit_epoch,
+                    .private_retention_weight = 0,
+                    .explicit_shared_credit   = entry.explicit_credit,
+                    .reuse_evidence_q16       = reuse_evidence_q16(
+                        entry.observation.selected_hit_count, entry.last_selected_at,
+                        observation_now),
+                });
                 checkpoint_policies.push_back(typename CapturePlanner::CheckpointPolicy{
                     .owner                = owner,
                     .checkpoint           = entry.summary.checkpoint.ref,
@@ -927,6 +961,35 @@ public:
                         committed_demand_mask_for(entry.summary.checkpoint.shortlist_key),
                     .rebuild_ns           = cost_model_.prefill_ns(entry.summary.checkpoint.rebuild_work),
                     .baseline_recovery_ns = *baseline,
+                });
+                value_checkpoint_policies.push_back(MaterializationCheckpointPolicy{
+                    .owner                = owner,
+                    .checkpoint           = entry.summary.checkpoint.ref,
+                    .demand_mask =
+                        committed_demand_mask_for(entry.summary.checkpoint.shortlist_key),
+                    .rebuild_ns           = cost_model_.prefill_ns(entry.summary.checkpoint.rebuild_work),
+                    .baseline_recovery_ns = *baseline,
+                });
+            }
+
+            // One formula, one evidence set (§2.2/§10.7): score every capture-domain owner the
+            // way materialization scores its victims, fold fair-share/recency protection in as
+            // the K + age magnitude, and hand the values to the planner. It ranks targets by
+            // publish value first and, on equal value, by the importance they evict (least
+            // important first) - so a protected owner is only ever taken when nothing cheaper
+            // remains.
+            std::vector<runtime::OwnerImportance> capture_owner_values;
+            capture_owner_values.reserve(value_owner_policies.size());
+            for (const MaterializationOwnerPolicy& value_policy : value_owner_policies) {
+                capture_owner_values.push_back(runtime::OwnerImportance{
+                    .owner = value_policy.owner,
+                    .value = cache_owner_importance(
+                        materialization_victim_score(value_owner_policies, value_checkpoint_policies,
+                                                     value_policy.owner),
+                        cache_owner_protected(value_policy.fair_share_protected,
+                                              value_policy.within_recency_horizon),
+                        static_cast<std::int64_t>(value_policy.last_hit_epoch)),
+                    .age_key = static_cast<std::int64_t>(value_policy.last_hit_epoch),
                 });
             }
 
@@ -945,10 +1008,11 @@ public:
                 std::vector<PlanningOwnerId> private_owner_ids;
                 std::vector<const SharedPrefixHandle*> shared_owners;
                 std::vector<PlanningOwnerId> shared_owner_ids;
-                // Owners outside the planning domain (retired, actively referenced, fair-share
-                // protected, or with no priced checkpoint) are simply not victims. Callers skip
-                // them or the scenario that needs them: a capture is optional, so an owner view
-                // that lags the Program must never fail the request.
+                // Owners outside the planning domain (retired, actively referenced, or with no
+                // priced checkpoint) are simply not victims. Fair-share protection is NOT one of
+                // those exclusions any more (§10.7): it enters through importance as K + age.
+                // Callers skip them or the scenario that needs them: a capture is optional, so an
+                // owner view that lags the Program must never fail the request.
                 const auto owner_id_for = [&](LogicalOwnerKind kind,
                                               std::uint32_t slot) -> std::optional<PlanningOwnerId> {
                     const auto found =
@@ -968,8 +1032,7 @@ public:
                     for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
                         const CatalogEntry& entry = catalog_[slot];
                         if (entry.state != CatalogState::Catalogued || !entry.handle ||
-                            private_has_active_edge(slot) ||
-                            is_fair_share_protected(protected_slots, slot)) {
+                            private_has_active_edge(slot)) {
                             continue;
                         }
                         const std::optional<PlanningOwnerId> owner =
@@ -1014,6 +1077,7 @@ public:
                     .shared_owner_ids    = shared_owner_ids,
                     .owner_policies      = owner_policies,
                     .checkpoint_policies = checkpoint_policies,
+                    .owner_values        = capture_owner_values,
                     .direct_shared_victim = direct_shared_victim,
                     .candidate_demand_mask =
                         committed_demand_mask_for(scenario.assessment.shortlist_key),
@@ -2499,8 +2563,10 @@ private:
 
         std::vector<ProjectedSharedCandidate> shared_candidates;
         shared_candidates.reserve(base.context_cache().opportunities.size());
-        // Fair-share buckets are structurally unevictable, so their portfolio value cannot
-        // move between the capture baseline and any target: they stay out of the fold.
+        // 缓存模块v2.md §10.7: fair-share protection is a VALUE, not an exclusion. Protected
+        // private owners now enter this fold like everyone else - their displacement is priced by
+        // their retention weight, so a shared capture that would destroy protected cache has to
+        // out-value that loss instead of having it silently unpriced.
         const std::vector<std::uint32_t> protected_slots = fair_share_protected_slots();
         const std::uint32_t vacant_shared_slots = static_cast<std::uint32_t>(
             std::count_if(shared_catalog_.begin(), shared_catalog_.end(), [](const auto& entry) {
@@ -2577,7 +2643,7 @@ private:
         for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
             const CatalogEntry& entry = catalog_[slot];
             if (entry.state != CatalogState::Catalogued || !entry.handle ||
-                private_has_active_edge(slot) || is_fair_share_protected(protected_slots, slot) ||
+                private_has_active_edge(slot) ||
                 (selected_candidate.private_source &&
                  slot == selected_candidate.private_source->slot)) {
                 continue;

@@ -513,6 +513,7 @@ public:
                     cache_owner_protected(policy.fair_share_protected,
                                           policy.within_recency_horizon),
                     static_cast<std::int64_t>(policy.last_hit_epoch)),
+                .age_key = static_cast<std::int64_t>(policy.last_hit_epoch),
             });
         }
 
