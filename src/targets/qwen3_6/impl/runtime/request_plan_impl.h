@@ -513,8 +513,19 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             if (selected.ordinal != 0) {
                 throw std::logic_error("private endpoint checkpoint ordinal is invalid");
             }
-            if (selected.frontier == 0 || selected.frontier != source->execution_frontier) {
-                throw std::logic_error("catalog endpoint summary disagrees with Program state");
+            if (selected.frontier == 0) {
+                throw std::logic_error("catalog endpoint checkpoint frontier is zero");
+            }
+            if (selected.frontier != source->execution_frontier) {
+                // The ref came from a catalog/shortlist copy that the ladder out-paced (the
+                // owner's state moved or was degraded since the copy was taken). The Program is
+                // the source of truth: skip this candidate like any other no-reuse outcome
+                // instead of dying (the same contract try_price_checkpoint_recovery documents).
+                std::fprintf(stderr,
+                             "[reuse] stale catalog checkpoint skipped: kind=endpoint"
+                             " frontier=%u program_frontier=%u\n",
+                             selected.frontier, source->execution_frontier);
+                return std::nullopt;
             }
             if (!qwen3_6::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,
                                                  selected.frontier)) {
@@ -529,8 +540,15 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                                  return candidate.frontier == selected.frontier &&
                                         candidate.ordinal == selected.ordinal;
                              });
-            if (anchor == source->long_anchors.end() || selected.frontier == 0) {
-                throw std::logic_error("catalog long-anchor summary disagrees with Program state");
+            if (selected.frontier == 0) {
+                throw std::logic_error("catalog long-anchor checkpoint frontier is zero");
+            }
+            if (anchor == source->long_anchors.end()) {
+                std::fprintf(stderr,
+                             "[reuse] stale catalog checkpoint skipped: kind=anchor"
+                             " frontier=%u ordinal=%u (degraded since the catalog copy)\n",
+                             selected.frontier, static_cast<std::uint32_t>(selected.ordinal));
+                return std::nullopt;
             }
             if (!qwen3_6::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,
                                                  selected.frontier)) {
@@ -543,11 +561,19 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             if (selected.ordinal != 0) {
                 throw std::logic_error("private rewrite checkpoint ordinal is invalid");
             }
+            if (selected.frontier == 0) {
+                throw std::logic_error("catalog rewrite checkpoint frontier is zero");
+            }
             if (!source->rewrite_checkpoint.valid ||
                 selected.kind != checkpoint_kind(source->rewrite_checkpoint.kind) ||
-                selected.frontier == 0 ||
                 selected.frontier != source->rewrite_checkpoint.frontier) {
-                throw std::logic_error("catalog rewrite summary disagrees with Program state");
+                std::fprintf(stderr,
+                             "[reuse] stale catalog checkpoint skipped: kind=rewrite"
+                             " frontier=%u program_frontier=%u valid=%d\n",
+                             selected.frontier,
+                             source->rewrite_checkpoint.frontier,
+                             source->rewrite_checkpoint.valid ? 1 : 0);
+                return std::nullopt;
             }
             if (!qwen3_6::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,
                                                  selected.frontier)) {
