@@ -5878,14 +5878,14 @@ void ProgramImplCore::prepare_pressure_bookkeeping(MaterializationTransaction::P
             std::span<const qwen3_6::detail::PressureKVDecision> actions,
             std::vector<MaterializationTransaction::PressureWork::KVChangeWork>& changes) {
             changes.reserve(actions.size());
-            constexpr std::uint32_t kMaxLandingPages = 64;
+            constexpr std::uint32_t kMaxLandingPages = 16;
             for (std::size_t action_i = 0; action_i < actions.size(); ++action_i) {
                 const qwen3_6::detail::PressureKVDecision& action = actions[action_i];
                 // One change = ONE prepare = ONE contiguous Host extent: a458-page run asked the
                 // arena for a single1.83 GiB contiguous block while2.65 GiB sat free in pieces,
                 // and the refusal surfaced as blocked_host -> assessment reject -> R0 park
                 // (forensics: arena refused, suballoc entries=0). Chunk the landing: each
-                // <=64-page change needs its own modest extent, and the work's change vector
+                // <=16-page change needs its own modest extent, and the work's change vector
                 // already supports N of them (same pages, same order, same effect - only the
                 // physical layout of the copy changes).
                 const std::uint32_t chunk_count =
@@ -6210,6 +6210,16 @@ void ProgramImplCore::prepare_pressure_work(MaterializationTransaction::Pressure
         if (!host_kv_extents) { throw std::logic_error("Host KV extent store is unavailable"); }
         std::optional<HostKVExtentReservation> reserved =
             host_kv_extents->prepare(pages, change.pages);
+        if (!reserved) {
+            // External fragmentation after churn: free bytes exist but no extent fits this run.
+            // The arena's own reclaim (partition dead runs, free them, coalesce) is exactly the
+            // remedy and is legal here - execution, not planning. One retry; if that still
+            // cannot place the run the BAD_ALLOC follows as before.
+            (void)host_kv_extents->release_unreferenced();
+            std::optional<HostKVExtentReservation> retry =
+                host_kv_extents->prepare(pages, change.pages);
+            if (retry) { reserved.emplace(std::move(*retry)); }
+        }
         if (!reserved) { NINFER_SITE_BAD_ALLOC("pressure: Host KV extent prepare (publish)"); }
         if (change.sources.size() != change.pages.size()) {
             throw std::logic_error("pressure KV source backing was not prepared");
@@ -7779,7 +7789,7 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool sh
         // Chunk cap shared with prepare_pressure_bookkeeping: one change = one prepare = ONE
         // contiguous Host extent, and a458-page run asks for a single1.83 GiB block that a
         // fragmented arena cannot produce even with2.65 GiB free.
-        constexpr std::uint32_t kMaxLandingPages = 64;
+        constexpr std::uint32_t kMaxLandingPages = 16;
         while (begin < mapped) {
             const auto kind = kind_of(begin);
             if (kind == qwen3_6::detail::PressureKVDecisionKind::None) { ++begin; continue; }
