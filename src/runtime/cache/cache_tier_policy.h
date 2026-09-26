@@ -91,6 +91,9 @@ struct Datum {
     std::uint64_t host_kv      = 0;  // its Host KV, in bytes
     std::uint64_t host_state   = 0;  // its Host state images, in Host state slots
     std::uint64_t importance   = 0;  // larger == more worth keeping. The ONLY ordering.
+    // Last-active age key (ASCENDING: larger == more recent) — the tie-break of §2.2's one chain
+    // `value → age → id`, the same key the ladder's retire_preference ranks with (§十.10).
+    std::int64_t age_key = 0;
     bool          active       = false;
 };
 
@@ -127,13 +130,16 @@ struct Plan {
 
 namespace detail {
 
-// Ascending by importance: the least worth keeping goes first. Ties break on id so the plan is
-// reproducible for a given snapshot.
+// §2.2's one chain: `value → age → id`. Ascending importance (least worth keeping first), then
+// ascending age (oldest last-touched first), then id so the plan is reproducible for a snapshot —
+// the exact chain the ladder's retire_preference ranks with (`cache_owner_rank_less`), so the two
+// consumers of `importance` cannot pick different victims on a tie (§十.10).
 inline void rank_least_important(std::vector<const Datum*>& pool) {
     std::sort(pool.begin(), pool.end(), [](const Datum* left, const Datum* right) {
         if (left->importance != right->importance) {
             return left->importance < right->importance;
         }
+        if (left->age_key != right->age_key) { return left->age_key < right->age_key; }
         return left->id < right->id;
     });
 }
@@ -143,9 +149,9 @@ inline void rank_least_important(std::vector<const Datum*>& pool) {
 // Decide how to make room for `need` given `occupancy` and the current cache pool.
 //
 // The order is fixed by the rules, not by cost: R2 before R1, because Host has to have somewhere
-// to receive what Device is about to hand over. A conversation gets exactly ONE action - one
-// dropped for Host room cannot also be the one spilled for Device room - so the Device budget is
-// whatever the survivors still carry.
+// to receive what Device is about to hand over. A conversation may receive BOTH actions — its
+// Host copy is released first and its Device copy lands in the room that release just opened —
+// which is one net action (§十.9), not two: Device data is never destroyed here.
 //
 // Sufficiency is decided by SIMULATION rather than a pre-check: the plan is built into scratch
 // first and committed only when every gap it set out to close is actually closed. Judging
@@ -202,16 +208,16 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
         host_state_freed += datum->host_state;
     }
 
-    // R1: move whole conversations to Host, least important first, until BOTH Device pools have
-    // their room. The same rule applies: only a conversation that answers an open Device gap is
-    // moved. Dropped conversations are already gone from both tiers, so they cannot answer it.
+    // R1: move Device-resident conversations to Host, least important first, until BOTH Device
+    // pools have their room. Only a conversation that answers an open Device gap is moved. A
+    // conversation this plan already dropped on the Host side stays eligible: its Device copy
+    // lands in the room its own drop just freed (§十.9), and nothing on Device is destroyed.
     std::vector<Step> spills;
     spills.reserve(candidates.size());
     std::uint64_t device_kv_moved    = 0;
     std::uint64_t device_state_moved = 0;
     for (const Datum* datum : candidates) {
         if (device_kv_moved >= device_kv_gap && device_state_moved >= device_state_gap) { break; }
-        if (std::find(dropped.begin(), dropped.end(), datum->id) != dropped.end()) { continue; }
         const bool helps_kv =
             device_kv_moved < device_kv_gap && datum->device_kv > 0;
         const bool helps_state =
