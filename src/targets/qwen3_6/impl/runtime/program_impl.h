@@ -10114,9 +10114,39 @@ void ProgramImplCore::enqueue_active_capture_transfers(ActiveCaptureTransaction&
         std::optional<StateImageTransfer> snapshot =
             state_store->begin_device_to_host(transaction.source_state, device.transfer_stream);
         if (!snapshot) {
+            std::fprintf(stderr,
+                         "[capture-snapshot] begin1 failed: host_free=%u host_occupied=%u"
+                         " retrying=%d\n",
+                         state_store->host_free(), state_store->host_occupied(),
+                         state_store->host_free() == 0 ? 1 : 0);
+            std::fflush(stderr);
+        }
+        if (!snapshot && state_store->host_free() == 0) {
+            // The Host state slot the reservation saw can be gone by enqueue time - a ladder
+            // demote (or another capture) takes it in between - and the snapshot needs a slot
+            // the object itself does not hold (source was fully clean: no pending, xfer=0).
+            // Free one the same way every other state site does, then retry; only when nothing
+            // can be freed is this fatal (rig battery, 2026-09-26: capture reserved, then
+            // [ladder] D2H took the last slot, and enqueue threw 'no prepared State target').
+            // The primitive must free a HOST slot specifically: release_state_capacity_step
+            // frees DEVICE state capacity (a silent drop_device_replica succeeds there while
+            // the Host pool stays pinned - that is what this retry tripped over). Degrade one
+            // idle owner's HostOnly checkpoint (R2), or release a whole device-free idle
+            // conversation if nothing degrades - never destroy Device data (§三 R1/R2).
+            const bool freed_host_slot =
+                degrade_idle_owner_host_state() || release_idle_owner_host_side();
+            if (freed_host_slot) {
+                std::optional<StateImageTransfer> retry =
+                    state_store->begin_device_to_host(transaction.source_state,
+                                                      device.transfer_stream);
+                if (retry) { snapshot.emplace(std::move(*retry)); }
+            }
+        }
+        if (!snapshot) {
             // Which replica state the source is left in, and by whose hand, is the whole
             // diagnosis: a capture transaction's source must survive every ladder run between
             // reserve and this enqueue.
+            state_store->dump_object_debug(transaction.source_state);
             const StateReplicaResidency res = state_store->residency(transaction.source_state);
             std::fprintf(stderr,
                          "[FATAL] capture HostSnapshot source handle=%u residency=%d role=%d"

@@ -331,6 +331,25 @@ public:
         return require(handle).source_pins;
     }
 
+    // Public diagnosis hook: the three states `begin_*` refuses on (pending replicas and the
+    // transfer id), which nothing else exposes - 'no prepared State target' is undiagnosable
+    // without them.
+    void dump_object_debug(StateImageHandle handle) const noexcept {
+        const Object& object = require(handle);
+        std::fprintf(stderr,
+                     "[state-store] debug handle=%u role=%d dev=%d host=%d pend_dev=%d"
+                     " pend_host=%d xfer=%llu pins=%u dst_pinned=%d refs=%u\n",
+                     handle.index_, static_cast<int>(object.role),
+                     object.device_slot ? *object.device_slot : -1,
+                     object.host_slot ? static_cast<int>(object.host_slot->index) : -1,
+                     object.pending_device_slot ? *object.pending_device_slot : -1,
+                     object.pending_host_slot ? static_cast<int>(object.pending_host_slot->index)
+                                              : -1,
+                     static_cast<unsigned long long>(object.transfer_id), object.source_pins,
+                     object.destination_pinned ? 1 : 0, object.checkpoint_references);
+        std::fflush(stderr);
+    }
+
     [[nodiscard]] bool destination_pinned(StateImageHandle handle) const {
         return valid(handle) && require(handle).destination_pinned;
     }
