@@ -5878,7 +5878,18 @@ void ProgramImplCore::prepare_pressure_bookkeeping(MaterializationTransaction::P
             std::span<const qwen3_6::detail::PressureKVDecision> actions,
             std::vector<MaterializationTransaction::PressureWork::KVChangeWork>& changes) {
             changes.reserve(actions.size());
+            constexpr std::uint32_t kMaxLandingPages = 64;
             for (const qwen3_6::detail::PressureKVDecision& action : actions) {
+                // One change = ONE prepare = ONE contiguous Host extent: a458-page run asked the
+                // arena for a single1.83 GiB contiguous block while2.65 GiB sat free in pieces,
+                // and the refusal surfaced as blocked_host -> assessment reject -> R0 park
+                // (forensics: arena refused, suballoc entries=0). Chunk the landing: each
+                // <=64-page change needs its own modest extent, and the work's change vector
+                // already supports N of them (same pages, same order, same effect - only the
+                // physical layout of the copy changes).
+                const std::uint32_t chunk_count =
+                    (action.page_count + kMaxLandingPages - 1U) / kMaxLandingPages;
+                for (std::uint32_t chunk = 0; chunk < chunk_count; ++chunk) {
                 changes.emplace_back();
                 MaterializationTransaction::PressureWork::KVChangeWork& change = changes.back();
                 if (action.kind == qwen3_6::detail::PressureKVDecisionKind::None) {
@@ -5892,13 +5903,16 @@ void ProgramImplCore::prepare_pressure_bookkeeping(MaterializationTransaction::P
                     action.page_count > mapped - action.begin_page) {
                     throw std::logic_error("pressure KV action range is invalid");
                 }
-                change.pages.reserve(action.page_count);
-                for (std::uint32_t offset = 0; offset < action.page_count; ++offset) {
-                    change.pages.push_back(
-                        addresses->logical_page(*address, action.begin_page + offset));
+                const std::uint32_t run_begin =
+                    action.begin_page + chunk * kMaxLandingPages;
+                const std::uint32_t run_count =
+                    std::min(kMaxLandingPages, action.page_count - chunk * kMaxLandingPages);
+                change.pages.reserve(run_count);
+                for (std::uint32_t offset = 0; offset < run_count; ++offset) {
+                    change.pages.push_back(addresses->logical_page(*address, run_begin + offset));
                 }
                 if (action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
-                    change.sources.resize(action.page_count);
+                    change.sources.resize(run_count);
                 }
                 // Baseline for the prepare-time verdict below: this runs when the committed plan
                 // is bound to its owner, so the five conditions read here are what the plan was
@@ -5921,10 +5935,10 @@ void ProgramImplCore::prepare_pressure_bookkeeping(MaterializationTransaction::P
                                  " host_on=%u writers=%u pins=%u active=%u\n",
                                  static_cast<int>(action.kind),
                                  addresses == backend_kv_addresses.get() ? "bk" : "main",
-                                 action.begin_page, action.page_count, dev_off, host_on, writers,
-                                 pins, active);
+                                 run_begin, run_count, dev_off, host_on, writers, pins, active);
                     std::fflush(stderr);
                 }
+                } // kMaxLandingPages chunks
             }
         };
     prepare(text_kv_addresses.get(), text_kv_pages.get(), kv->text, work.option.main_kv_changes,
@@ -7745,32 +7759,41 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool sh
         };
         const std::uint32_t mapped = addresses.mapped_pages(address);
         std::uint32_t begin        = 0;
+        // Chunk cap shared with prepare_pressure_bookkeeping: one change = one prepare = ONE
+        // contiguous Host extent, and a458-page run asks for a single1.83 GiB block that a
+        // fragmented arena cannot produce even with2.65 GiB free.
+        constexpr std::uint32_t kMaxLandingPages = 64;
         while (begin < mapped) {
             const auto kind = kind_of(begin);
             if (kind == qwen3_6::detail::PressureKVDecisionKind::None) { ++begin; continue; }
             std::uint32_t end = begin + 1;
             while (end < mapped && kind_of(end) == kind) { ++end; }
-            changes.push_back(qwen3_6::detail::PressureKVDecision{
-                .begin_page = begin,
-                .page_count = end - begin,
-                .kind       = kind,
-            });
-            MaterializationTransaction::PressureWork::KVChangeWork change;
-            change.pages.reserve(end - begin);
-            for (std::uint32_t page = begin; page < end; ++page) {
-                change.pages.push_back(addresses.logical_page(address, page));
+            std::uint32_t piece = begin;
+            while (piece < end) {
+                const std::uint32_t count =
+                    std::min<std::uint32_t>(kMaxLandingPages, end - piece);
+                changes.push_back(qwen3_6::detail::PressureKVDecision{
+                    .begin_page = piece,
+                    .page_count = count,
+                    .kind       = kind,
+                });
+                MaterializationTransaction::PressureWork::KVChangeWork change;
+                change.pages.reserve(count);
+                for (std::uint32_t page = piece; page < piece + count; ++page) {
+                    change.pages.push_back(addresses.logical_page(address, page));
+                }
+                // prepare_pressure_work's Demote branch pairs pages against sources and throws
+                // 'source backing was not prepared' when the vector was never sized - the
+                // planner's bookkeeping resizes it for DemoteToHost and the ladder's own
+                // builder must do the same, or EVERY device-only page landing fails at
+                // execution (rig:930 declines).
+                if (kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
+                    change.sources.resize(count);
+                }
+                moved_pages += count;
+                bookkeeping.push_back(std::move(change));
+                piece += count;
             }
-            // prepare_pressure_work's Demote branch pairs pages against sources and throws
-            // 'source backing was not prepared' when the vector was never sized - the planner's
-            // bookkeeping resizes it for DemoteToHost (prepare_pressure_bookkeeping) and the
-            // ladder's own builder must do the same, or EVERY device-only page landing fails at
-            // execution (rig:930 declines; the GPU pools are Both-resident so they took the
-            // DropDeviceDuplicate branch and never hit the check).
-            if (kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
-                change.sources.resize(end - begin);
-            }
-            moved_pages += end - begin;
-            bookkeeping.push_back(std::move(change));
             begin = end;
         }
     };
