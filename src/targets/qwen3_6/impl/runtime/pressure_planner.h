@@ -936,41 +936,67 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
     // no room for the OVERSHOOT). Re-run with the landing the CHOSEN spills actually need: the
     // release loop then returns more Host room (every drop's pages are credited to the
     // allocator now), which is exactly what the physical check will count.
-    for (int adjust = 0; adjust < 2 && !plan.enqueue; ++adjust) {
-        std::uint64_t landing_pages = 0;
-        for (const cachep::Step& step : plan.steps) {
-            if (step.action != cachep::Action::SpillToHost) { continue; }
-            if (step.id >= pool.size()) { continue; }
-            landing_pages += pool[step.id].device_kv + pool[step.id].device_backend_kv;
+    // Plan -> apply -> measure the landing the APPLIED actions really take -> if the Host
+    // demand falls short, re-plan with the honest number. Whole-conversation picks overshoot
+    // the budgeted device gap, and first-wins attribution under-counts a chosen variant, so a
+    // plan built from either number can starve the physical pre-check by tens of MiB while
+    // Host genuinely has the room (rig eviction_fix:5 allocation runs refused at free1400 MiB
+    // vs real1460 MiB - the request parked to its deadline instead of being served).
+    const auto applied_landing_pages = [&]() -> std::uint64_t {
+        std::uint64_t landing = 0;
+        for (std::size_t victim_index = 0; victim_index < choice_scratch.size(); ++victim_index) {
+            const std::uint16_t choice = choice_scratch[victim_index];
+            if (choice == 0 || choice > options.victims[victim_index].decisions.size()) {
+                continue;
+            }
+            const qwen3_6::detail::PressureDecision& applied =
+                options.victims[victim_index].decisions[choice - 1U];
+            if (applied.evicts_continuation) { continue; } // evictions land nothing
+            for (const qwen3_6::detail::PressureKVDecision& action : applied.main_kv_changes) {
+                if (action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
+                    landing += action.page_count;
+                }
+            }
+            for (const qwen3_6::detail::PressureKVDecision& action : applied.backend_kv_changes) {
+                if (action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
+                    landing += action.page_count;
+                }
+            }
         }
-        const std::uint64_t want =
-            host_kv(residual) + landing_pages * page_bytes;
+        return landing;
+    };
+    const auto apply_plan = [&]() {
+        choice_scratch.assign(choice_scratch.size(), 0);
+        for (const cachep::Step& step : plan.steps) {
+            if (step.id >= options.victims.size()) { continue; }
+            if (step.action == cachep::Action::DropFromHost) {
+                const CandidateVictimOptions& victim = options.victims[step.id];
+                if (victim.eviction_choice == 0 ||
+                    victim.eviction_choice > victim.decisions.size()) {
+                    continue;
+                }
+                choice_scratch[step.id] = victim.eviction_choice;
+                continue;
+            }
+            const std::uint16_t choice = move_options[step.id].choice;
+            if (choice != 0 && choice <= options.victims[step.id].decisions.size()) {
+                choice_scratch[step.id] = choice;
+            }
+        }
+    };
+    for (int round = 0; round < 3 && !plan.enqueue; ++round) {
+        apply_plan();
+        const std::uint64_t want = host_kv(residual) + applied_landing_pages() * page_bytes;
         if (want <= demand.host_kv) { break; }
         demand.host_kv = want;
         plan           = cachep::plan(demand, tiers, pool);
     }
+    if (plan.enqueue) { apply_plan(); } // keep the diagnostic views consistent
     if (const char* diag = std::getenv("NINFER_REUSE_DIAG"); diag == nullptr || *diag != '0') {
         std::fprintf(stderr, "%s\n", cachep::describe(plan, demand, tiers).c_str());
         std::fflush(stderr);
     }
     if (plan.enqueue) { return std::nullopt; }  // R0: the caller enqueues.
-
-    for (const cachep::Step& step : plan.steps) {
-        if (step.id >= options.victims.size()) { continue; }
-        if (step.action == cachep::Action::DropFromHost) {
-            const CandidateVictimOptions& victim = options.victims[step.id];
-            if (victim.eviction_choice == 0 ||
-                victim.eviction_choice > victim.decisions.size()) {
-                continue;
-            }
-            choice_scratch[step.id] = victim.eviction_choice;
-            continue;
-        }
-        const std::uint16_t choice = move_options[step.id].choice;
-        if (choice != 0 && choice <= options.victims[step.id].decisions.size()) {
-            choice_scratch[step.id] = choice;
-        }
-    }
 
     const bool any = std::any_of(choice_scratch.begin(), choice_scratch.end(),
                                  [](std::uint16_t choice) { return choice != 0; });
