@@ -2370,6 +2370,32 @@ private:
                 verdict = "REJECT frontier-beyond-prompt";
             } else if (*incoming != index.key) {
                 verdict = "REJECT digest-mismatch";
+                // Which side diverged decides the fix (stale index entry vs tag vs content):
+                // dump BOTH keys the first time a mismatch rejects an ENDPOINT candidate -
+                // endpoints are the expensive ones (a rejected endpoint is a root re-prefill
+                // of the whole conversation).
+                if (std::string(kind) == "endpoint") {
+                    // The key type is per-package (production carries digests[2]+identity_tag,
+                    // the test fake carries a single digest) - dump what the type actually has.
+                    const auto dump = [&](const char* side, const auto& key) {
+                        if constexpr (requires { key.digests[0]; key.identity_tag; }) {
+                            std::fprintf(stderr, " %s{d0=%016llx d1=%016llx tag=%u}", side,
+                                         static_cast<unsigned long long>(key.digests[0]),
+                                         static_cast<unsigned long long>(key.digests[1]),
+                                         static_cast<unsigned>(key.identity_tag));
+                        } else if constexpr (requires { key.digest; }) {
+                            std::fprintf(stderr, " %s{d=%016llx}", side,
+                                         static_cast<unsigned long long>(key.digest));
+                        }
+                    };
+                    std::fprintf(stderr,
+                                 "[shortlist] endpoint key mismatch frontier=%u slot=%u",
+                                 index.key.frontier, index.slot);
+                    dump("incoming", *incoming);
+                    dump("index", index.key);
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
+                }
             } else {
                 verdict = "CANDIDATE";
                 ++accepted;
