@@ -448,7 +448,8 @@ struct PlanningOwnerId {
 // evidence for the tie-break, not a rank.
 //
 // A protected owner's value is `kProtectedStep (1<<62) + age` (cache_owner_importance): above
-// every unprotected score and, inside the protected group, ordered by age — oldest first.
+// every unprotected score and, inside the protected group, ordered by age - oldest first. Value
+// orders the groups, not the inside of one; see the measurement note on cache_owner_importance.
 // `UINT64_MAX` is NOT the protected marker; it only means "unpriced", taken last (§2.2).
 struct OwnerImportance {
     PlanningOwnerId owner;

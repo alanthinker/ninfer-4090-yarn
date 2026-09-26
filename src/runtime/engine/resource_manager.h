@@ -367,11 +367,12 @@ public:
     void reconcile_catalog(Program& program) {
         for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
             CatalogEntry& entry = catalog_[slot];
-            if (entry.state != CatalogState::Catalogued || !entry.handle ||
-                private_has_active_edge(slot)) {
-                continue;
-            }
+            if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
             if (!program.continuation_is_live(*entry.handle)) {
+                // An owner the Program retired while reclaiming capacity is gone even though this
+                // catalog still lists it. A row a RUNNING request holds as its reuse source is not
+                // cleared: that request is still reading it.
+                if (private_has_active_edge(slot)) { continue; }
                 std::fprintf(stderr, "catalog: clear retired private owner slot=%u\n", slot);
                 clear_catalog_entry(entry);
                 continue;
@@ -383,16 +384,38 @@ public:
             // observed=7/8 after the fill's degrade dropped its anchor at frontier5561 - and
             // reuse matching kept offering the already-dropped anchor, which only cost a
             // StalePlanningReference skip).
+            //
+            // The refresh covers EVERY live owner, active edge included: the edge marks the row a
+            // running request uses as its reuse source, and that is exactly the row whose stale
+            // summary hides the checkpoints the NEXT request of the same conversation must match.
+            // Skipping it left `reuse-diag: candidates=0 rejected=72` for a 20 179-token
+            // conversation that held 9 live checkpoints: the catalog still described it by its
+            // endpoint alone, the endpoint's key covers the trailing assistant header and was
+            // rejected on content, the 8 live anchors were invisible, and the follow-up recomputed
+            // from root (important_session rig 2026-09-26: 0 % of a 20 189-token prompt).
             if constexpr (requires { program.continuation_summary(*entry.handle); }) {
-                // The real Program exposes the live summary; test fakes without the API keep
-                // their entry as published (their owners never degrade in place). Copy through
-                // assign_continuation_summary: a plain `entry.summary = <prvalue>` would MOVE
-                // the Program's freshly built (unreserved) vector into the entry and REPLACE
-                // its reserve(max_long_anchors) buffer - the next capture adoption then hit
-                // assign's noexcept capacity guard (2026-09-26 rig crash: source anchors=3,
-                // destination capacity=2).
-                const ContinuationSummary live = program.continuation_summary(*entry.handle);
-                assign_continuation_summary(entry.summary, live);
+                try {
+                    const ContinuationSummary live = program.continuation_summary(*entry.handle);
+                    if (live.long_anchors.size() != entry.summary.long_anchors.size()) {
+                        // A cell that was stale is worth naming: the count difference is what makes
+                        // a live owner invisible to reuse matching.
+                        std::fprintf(stderr,
+                                     "catalog: refresh slot=%u anchors %zu -> %zu"
+                                     " (endpoint=%d rewrite=%d)\n",
+                                     slot, entry.summary.long_anchors.size(),
+                                     live.long_anchors.size(), live.endpoint ? 1 : 0,
+                                     live.rewrite ? 1 : 0);
+                        std::fflush(stderr);
+                    }
+                    assign_continuation_summary(entry.summary, live);
+                } catch (const std::exception& error) {
+                    // The Program refuses to describe a live owner it cannot validate; leaving the
+                    // cell at its published shape is what keeps the request serviceable, but the
+                    // reason must be readable instead of a silently stale cell.
+                    std::fprintf(stderr, "catalog: refresh failed slot=%u anchors=%zu: %s\n", slot,
+                                 entry.summary.long_anchors.size(), error.what());
+                    std::fflush(stderr);
+                }
             }
         }
         for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
@@ -851,7 +874,7 @@ public:
             owner_policies.reserve(catalog_count_ + shared_catalog_count_);
             checkpoint_policies.reserve(prefix_index_.size());
             capture_owner_records.reserve(catalog_count_ + shared_catalog_count_);
-            // 缓存模块v2.md §六.4: fair-share protection is a VALUE (K + age inside
+            // 缓存模块v2.md §六.4: fair-share protection is a VALUE (K + score inside
             // cache_owner_importance), never an exclusion - the protected set now ENTERS the
             // capture victim domain, exactly like materialization's domain since §2.2. These
             // mirrors carry the same evidence materialization's policies carry, so the score is
@@ -1003,7 +1026,7 @@ public:
 
             // One formula, one evidence set (§2.2/§六.4): score every capture-domain owner the
             // way materialization scores its victims, fold fair-share/recency protection in as
-            // the K + age magnitude, and hand the values to the planner. It ranks targets by
+            // the K + score magnitude, and hand the values to the planner. It ranks targets by
             // publish value first and, on equal value, by the importance they evict (least
             // important first) - so a protected owner is only ever taken when nothing cheaper
             // remains.
@@ -1039,7 +1062,7 @@ public:
                 std::vector<PlanningOwnerId> shared_owner_ids;
                 // Owners outside the planning domain (retired, actively referenced, or with no
                 // priced checkpoint) are simply not victims. Fair-share protection is NOT one of
-                // those exclusions any more (§六.4): it enters through importance as K + age.
+                // those exclusions any more (§六.4): it enters through importance as K + score.
                 // Callers skip them or the scenario that needs them: a capture is optional, so an
                 // owner view that lags the Program must never fail the request.
                 const auto owner_id_for = [&](LogicalOwnerKind kind,

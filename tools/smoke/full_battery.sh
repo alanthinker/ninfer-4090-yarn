@@ -70,6 +70,9 @@ if [ "$MODE" = "--rig" ]; then
     SWITCH_ARGS=(--random-words 150 --active-rounds 6 --conversations 4)
     MIXED_ARGS=(--max-rounds 4 --scale 2.0)
     FORK_ARGS=()
+    # important_session stops at the FIRST record proving the flood retires owners, so its budget
+    # only has to exceed the pool: 40 x ~3 checkpoints saturates 48 slots well before the cap.
+    IMPORTANT_FLOOD="${NINFER_IMPORTANT_FLOOD:-40}"
 else
     TOTAL=320
     FILL_CAP=80
@@ -86,6 +89,12 @@ else
     SWITCH_ARGS=(--conversations 8)
     MIXED_ARGS=()
     FORK_ARGS=()
+    # 320 host slots absorb 40 disposable sessions by degrading the flood's OWN anchors (the
+    # cheapest thing in the pool), so no owner is ever retired and the step reports INCONCLUSIVE
+    # ("the flood caused no retirement, so nothing was tested") - its precondition, not its
+    # assertion. 120 sessions x ~3 checkpoints exceed the pool and force real retirements
+    # (production 2026-09-26: PASS with 99.9 % reuse of a 20 183-token follow-up).
+    IMPORTANT_FLOOD="${NINFER_IMPORTANT_FLOOD:-120}"
 fi
 export NINFER_REQDUMP_DIR="${NINFER_REQDUMP_DIR:-$(dirname "$NINFER_SERVICE_LOG")/reqdump}"
 S="$NINFER_SERVICE_LOG"
@@ -344,8 +353,8 @@ step fork_hit         300 python3 tools/smoke/test_long_anchor_fork_hit.py \
 # turn), flood the saturated pool until the ladder retires owners, and require that the valuable
 # one is never named by an eviction and still reuses >80% afterwards. This is the property the
 # scoring fix exists for (a 237k conversation died while fresh test sessions stayed, 2026-09-23).
-step important_session 600 python3 tools/smoke/test_important_session_survival.py --port "$PORT" \
-    --turns 8 --turn-tokens 2500 --flood 40
+step important_session 900 python3 tools/smoke/test_important_session_survival.py --port "$PORT" \
+    --turns 8 --turn-tokens 2500 --flood "$IMPORTANT_FLOOD"
 # fair_share_sim retired from the battery (09-23): the branch it wants to
 # observe (fair-share bucket release) is covered at the decision level by
 #   ./build/tests/ninfer_resource_manager_test

@@ -188,19 +188,8 @@ struct MaterializationVictimCost {
 // One value, one chain (§2.2 / §6.4).
 //
 // Protection is a magnitude, not a second rule: a protected owner sorts behind every unprotected
-// one. But the magnitude for a protected owner must be its RECENCY, not its score - that is the
-// whole point of protection, and it is what the bucket escalation means by "release the oldest
-// first". A flat maximum (or a protected group ordered by score) collapses the group: a
-// conversation that has never been re-read scores the same floor however recently it was built,
-// so value alone cannot tell a session created two seconds ago from one created two hours ago,
-// and a saturation run evicts the sessions it just published. Observed exactly that: Host KV
-// stopped accumulating at 0 MiB instead of reaching 395 MiB, and `state_index` / `prefix_switch`
-// lost their switch-back hits. Re-measured 2026-09-26 by ordering the protected group by score
-// again: the same three suites failed in the same way with `host_kv=0.0MB` in the fill, so the
-// age magnitude is load-bearing and the value ordering lives OUTSIDE the group.
-//
-// `age_key` is "when this owner was last active", ASCENDING, so a larger key means more recent.
-// It is signed so a caller may hand over a raw steady_clock tick count.
+// one, and inside the group it is RECENCY that decides (oldest first) - the bucket escalation the
+// ladder documents. Value decides between the groups, not inside one.
 [[nodiscard]] inline bool cache_owner_protected(bool fair_share_protected,
                                                 bool within_recency_horizon) noexcept {
     return fair_share_protected || within_recency_horizon;
@@ -213,9 +202,15 @@ struct MaterializationVictimCost {
     if (!protected_owner) {
         return score > kProtectedStep - 1U ? kProtectedStep - 1U : score;
     }
+    // Above every unprotected score, and INSIDE the group ordered by age - the oldest gives way
+    // first. That magnitude is load-bearing and was measured twice: ordering the protected group by
+    // score instead let the pool evict the conversations a saturation run had just published
+    // (`prefix_switch` / `state_index` / `prefix_mixed` went red on the churned rig pool, 2026-09-26
+    // - both when the closure/gate changes were present and when they were not). The cost is real
+    // and is booked in §十.5: an idle high-value conversation can lose anchors to a flood of fresh
+    // disposables when the Host pool is small; production's 320 slots measured green.
     const std::uint64_t age =
         age_key < 0 ? std::uint64_t{0} : static_cast<std::uint64_t>(age_key);
-    // Above every unprotected score, and within the group ordered by age - oldest first.
     const std::uint64_t bounded = age > kProtectedStep - 1U ? kProtectedStep - 1U : age;
     return kProtectedStep + bounded;
 }
@@ -287,6 +282,25 @@ public:
             best = std::max(best, input.candidate->summary().reusable_prompt_tokens);
         }
         return best;
+    }
+
+    // The candidate that would serve the deepest resident source, or `fallback` when the request
+    // offers no reuse at all. It is the candidate the controller pass must ask the policy about
+    // first: a source that is resident and only capacity-blocked is served by R1/R2 relief, and the
+    // root plan is what the rules forbid while that source exists (`缓存模块v2.md` §三 R0/R3).
+    [[nodiscard]] static std::uint32_t
+    best_reuse_candidate(std::span<const CandidateInput> candidates,
+                         std::uint32_t fallback) noexcept {
+        const std::uint32_t best = best_offered_reuse(candidates);
+        if (best == 0) { return fallback; }
+        for (std::uint32_t index = 0; index < candidates.size(); ++index) {
+            const CandidateInput& input = candidates[index];
+            if (input.candidate != nullptr &&
+                input.candidate->summary().reusable_prompt_tokens == best) {
+                return index;
+            }
+        }
+        return fallback;
     }
 
     struct LogicalGoal {
@@ -952,45 +966,57 @@ public:
                          "[cache] search produced no incumbent stop=%d targets=%zu budget=%d\n",
                          static_cast<int>(stop_reason), targets_evaluated,
                          budget_exhausted ? 1 : 0);
-            if (const std::optional<PressureTargetHandle> tier_target = session.tier_policy_target(
-                    candidates[root_candidate_index].id, owner_values)) {
-                AssessedPressureTarget assessed          = session.assess(*tier_target);
+            // The REUSE candidate goes first. Its identity plan is exactly the one the search
+            // could not place (a full pool), and R1/R2 relief is what places it - relief the root
+            // plan was already getting. Asking the policy about root first served the request by
+            // recomputing 7 060 tokens while a 6 319-token resident source sat unread
+            // (`reuse offered 6319 but planned from root`, rig + production battery 2026-09-26:
+            // fork_hit, state_index, eviction_fix, cache_pressure all failed on exactly this).
+            const std::uint32_t reuse_candidate =
+                best_reuse_candidate(candidates, root_candidate_index);
+            const std::uint32_t picks[2] = {reuse_candidate, root_candidate_index};
+            for (std::size_t pick_index = 0; pick_index < 2 && !incumbent.has_incumbent;
+                 ++pick_index) {
+                const std::uint32_t pick = picks[pick_index];
+                if (pick_index != 0 && pick == picks[0]) { continue; }  // same candidate twice
+                const std::optional<PressureTargetHandle> tier_target =
+                    session.tier_policy_target(candidates[pick].id, owner_values);
+                if (!tier_target) { continue; }
+                AssessedPressureTarget assessed            = session.assess(*tier_target);
                 const PressureTargetAssessment& assessment = assessed.assessment();
-                if (assessment.candidate != candidates[root_candidate_index].id ||
+                if (assessment.candidate != candidates[pick].id ||
                     assessment.physical_status != MaterializationPhysicalStatus::Feasible) {
                     // The policy's plan is the last one left, so declining it here is the whole
                     // difference between "no plan" and a served request.
                     std::fprintf(stderr,
                                  "[cache] policy target rejected reason=assessment"
-                                 " same_candidate=%d physical_status=%d\n",
-                                 assessment.candidate == candidates[root_candidate_index].id ? 1
-                                                                                             : 0,
+                                 " candidate=%s same_candidate=%d physical_status=%d\n",
+                                 pick == reuse_candidate ? "reuse" : "root",
+                                 assessment.candidate == candidates[pick].id ? 1 : 0,
                                  static_cast<int>(assessment.physical_status));
+                    continue;
+                }
+                ++targets_evaluated;
+                planning_saturating_add(projection_work, assessment.projection_work);
+                mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
+                if (const std::optional<LogicalGoal> goal = logical_goal(
+                        assessment.candidate, assessment.source_mode, assessment.owner_outcomes)) {
+                    const FoldedCost cost =
+                        fold_assessment(candidates[pick], assessment, pressure.owner_policy,
+                                        pressure.checkpoint_policy, machine_cost);
+                    incumbent = make_incumbent(*tier_target, pick, assessment,
+                                               std::move(assessed), cost, *goal);
+                    std::fprintf(stderr,
+                                 "[cache] controller accepted target candidate=%s"
+                                 " owner_evictions=%u checkpoint_drops=%u outcomes=%zu\n",
+                                 pick == reuse_candidate ? "reuse" : "root", cost.owner_evictions,
+                                 cost.checkpoint_drops, assessment.owner_outcomes.size());
                 } else {
-                    ++targets_evaluated;
-                    planning_saturating_add(projection_work, assessment.projection_work);
-                    mark_target(assessment.stable_target_ordinal,
-                                kTargetDiscovered | kTargetAssessed);
-                    if (const std::optional<LogicalGoal> goal =
-                            logical_goal(assessment.candidate, assessment.source_mode,
-                                         assessment.owner_outcomes)) {
-                        const FoldedCost cost =
-                            fold_assessment(candidates[root_candidate_index], assessment,
-                                            pressure.owner_policy, pressure.checkpoint_policy,
-                                            machine_cost);
-                        incumbent = make_incumbent(*tier_target, root_candidate_index, assessment,
-                                                   std::move(assessed), cost, *goal);
-                        std::fprintf(stderr,
-                                     "[cache] controller accepted target owner_evictions=%u"
-                                     " checkpoint_drops=%u outcomes=%zu\n",
-                                     cost.owner_evictions, cost.checkpoint_drops,
-                                     assessment.owner_outcomes.size());
-                    } else {
-                        std::fprintf(stderr,
-                                     "[cache] policy target rejected reason=logical_goal"
-                                     " outcomes=%zu\n",
-                                     assessment.owner_outcomes.size());
-                    }
+                    std::fprintf(stderr,
+                                 "[cache] policy target rejected reason=logical_goal"
+                                 " candidate=%s outcomes=%zu\n",
+                                 pick == reuse_candidate ? "reuse" : "root",
+                                 assessment.owner_outcomes.size());
                 }
             }
         }
