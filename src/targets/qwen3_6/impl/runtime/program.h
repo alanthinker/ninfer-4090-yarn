@@ -1311,7 +1311,13 @@ private:
     // every page (writers/pins/active references) so prepare can never throw: a page that cannot
     // move makes the whole spill decline, not latch the engine. Requires the owner's Device STATE
     // to already be zero - state relocation is the demote step's job.
-    [[nodiscard]] bool spill_owner_device_kv_to_host(std::uint32_t index, bool shared = false);
+    // exclude_shared (victim preludes): skip pages with address_references > 1 - a shared
+    // page is not this owner's to relocate, another referent's in-transaction pressure option
+    // may be about to move it, and moving it first turns that plan stale (fatal
+    // 'pressure KV replica changed before transfer'). The teardown only drops the reference;
+    // the physical page survives with its other referents, so nothing is destroyed either.
+    [[nodiscard]] bool spill_owner_device_kv_to_host(std::uint32_t index, bool shared = false,
+                                                     bool exclude_shared = false);
     // The owner that step would delete, without deleting it, and the Host state slots deleting it
     // would return. Split out so the capacity-relief credit prices what the ladder can actually
     // deliver instead of guessing (storage doc 4.2).

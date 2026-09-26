@@ -7663,7 +7663,8 @@ bool ProgramImplCore::release_idle_owner_host_side() {
     return false;
 }
 
-bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool shared) {
+bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool shared,
+                                                    bool exclude_shared) {
     if (!host_kv_extents || !state_store) { return false; }
     if (shared) {
         if (index >= shared_prefix_capacity ||
@@ -7729,6 +7730,13 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool sh
         const auto kind_of = [&](std::uint32_t page) -> qwen3_6::detail::PressureKVDecisionKind {
             const LogicalKVPageHandle logical = addresses.logical_page(address, page);
             if (!pages.device_resident(logical)) {
+                return qwen3_6::detail::PressureKVDecisionKind::None;
+            }
+            // Victim preludes move EXCLUSIVE pages only: a shared page belongs jointly, and
+            // another referent's in-transaction option may be about to move it - moving it
+            // first makes that plan stale and the prepare guard latches the engine (fatal
+            // 'pressure KV replica changed before transfer', kind=2, device=0 after our move).
+            if (exclude_shared && pages.address_references(logical) > 1) {
                 return qwen3_6::detail::PressureKVDecisionKind::None;
             }
             return pages.host_resident(logical)
@@ -7900,7 +7908,7 @@ void ProgramImplCore::prepare_victim_teardown(std::uint32_t index) {
     // pre-screened (declines instead of latching); state images only lose a redundant Device
     // replica for free or demote when a Host slot allows - anything left is what the
     // [invariant1] probe inside the strict release records as residue.
-    (void)spill_owner_device_kv_to_host(index);
+    (void)spill_owner_device_kv_to_host(index, /*shared=*/false, /*exclude_shared=*/true);
     const auto move_state = [&](StateImageHandle handle) {
         if (!handle.valid() || !state_store->valid(handle)) { return; }
         if (release_protected_state && *release_protected_state == handle) { return; }
@@ -7940,7 +7948,7 @@ void ProgramImplCore::prepare_victim_teardown(std::uint32_t index) {
 void ProgramImplCore::prepare_shared_victim_teardown(std::uint32_t index) {
     if (index >= shared_prefix_capacity || !state_store) { return; }
     const SharedPrefixState& shared = shared_prefix_states[index];
-    (void)spill_owner_device_kv_to_host(index, /*shared=*/true);
+    (void)spill_owner_device_kv_to_host(index, /*shared=*/true, /*exclude_shared=*/true);
     const StateImageHandle handle = shared.state;
     if (!state_store->valid(handle)) { return; }
     if (release_protected_state && *release_protected_state == handle) { return; }
