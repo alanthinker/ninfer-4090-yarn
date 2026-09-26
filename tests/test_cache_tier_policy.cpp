@@ -13,8 +13,10 @@
 //     ladder's retire_preference uses)
 //   - the four pools stay separate: a request blocked ONLY on state slots must be visible here,
 //     even when every KV axis reports room
-//   - a drop may fund the spill it used to "eat": releasing a conversation's Host copy and
-//     moving its Device copy into that room is ONE net action (§2.1), never a Device destroy
+//   - one action per conversation: a release answers EVERY axis it holds (catalog row, Host
+//     KV/state, Device relief through the move-first teardown) in that single step, so the R1
+//     loop never emits a second step for it - HostReleases runs before CopyPreparation, and a
+//     released address space would fail any later prepare
 
 #include "runtime/cache/cache_tier_policy.h"
 
@@ -128,24 +130,28 @@ void case_device_short_host_roomy() {
     }
 }
 
-// R2 then R1: Device is full and Host is nearly full, so Host room has to exist BEFORE the
-// spill lands. Host room is reserved for the incoming spill, then the drop closes exactly that.
+// R2 accounting: Device is full and Host is nearly full, so Host room must exist BEFORE
+// anything lands. One release closes the Host gap and its Device relief counts in the same
+// step - one action, no second step for it.
 void case_host_room_reserved_for_spill() {
     std::printf("case_host_room_reserved_for_spill\n");
     const std::vector<Datum> pool{
         {.id = 1, .device_kv = 60, .host_kv = 100, .importance = 1},
         {.id = 2, .device_kv = 60, .host_kv = 0, .importance = 9},
     };
-    // device gap 50 -> the spill will need 50 of Host; Host free is 10 -> drop 40.
+    // host gap 40 -> one release; its Device relief (60) also covers the Device gap (50).
     const Plan outcome =
-        decide(Demand{.device_kv = 50, .host_kv = 50}, occupancy(100, 100, 100, 90), pool);
+        decide(Demand{.device_kv = 50, .host_kv = 50}, occupancy(100, 100, 100, 95), pool);
 
-    // Whole conversation: it holds 100 host bytes, so dropping it overshoots the 40 needed.
-    check(action_kv(outcome, Action::DropFromHost) >= 40, "drop must cover the host gap");
-    check(outcome.steps.size() == 2, "one drop (whole conversation) then one spill");
-    check(!outcome.steps.empty() && outcome.steps.front().action == Action::DropFromHost,
-          "Host must be cleared before the spill lands");
-    check(!outcome.enqueue, "both gaps close, no waiting");
+    check(!outcome.enqueue, "both gaps close in the release loop");
+    check(outcome.steps.size() == 1, "one release answers both gaps - no second action");
+    if (!outcome.steps.empty()) {
+        check(outcome.steps.front().id == 1 &&
+                  outcome.steps.front().action == Action::DropFromHost,
+              "the least important conversation is the one released");
+    }
+    check(action_count(outcome, Action::SpillToHost) == 0,
+          "a released conversation never receives a spill step");
 }
 
 // R0 dead zone: Device is full but every Device datum is active (nothing movable), while Host
@@ -230,30 +236,44 @@ void case_active_data_is_never_a_candidate() {
     }
 }
 
-// §2.1: a drop may fund the very spill it used to "eat". The single candidate holds BOTH the
-// Host room to free and the Device room to give back. Releasing its Host copy opens the room its
-// own Device copy then lands in — one net action, nothing on Device destroyed — so the plan is
-// real instead of a wait.
-void case_drop_funds_the_spills_own_landing() {
-    std::printf("case_drop_funds_the_spills_own_landing\n");
-    const std::vector<Datum> pool{{.id = 1, .device_kv = 30, .host_kv = 40, .importance = 1}};
-    const Plan outcome =
-        decide(Demand{.device_kv = 30, .host_kv = 30}, occupancy(100, 100, 100, 95), pool);
+// The fifth pool (catalog rows) + Device relief in one action: with no vacant row the plan
+// must release a conversation, and that single release also answers the Device gap because
+// its relief is counted in the same step (invariant 3: one action, its full footprint).
+void case_release_answers_row_and_device_gaps() {
+    std::printf("case_release_answers_row_and_device_gaps\n");
+    const std::vector<Datum> pool{
+        {.id = 1, .device_kv = 30, .host_kv = 40, .catalog_row = 1, .importance = 10},
+        {.id = 2, .device_kv = 30, .host_kv = 40, .catalog_row = 1, .importance = 90},
+    };
+    TierOccupancy occ = occupancy(100, 100, 1000, 0);
+    occ.catalog_rows_vacant = 0;
+    const Plan outcome = decide(Demand{.device_kv = 30, .catalog_rows = 1}, occ, pool);
 
-    check(!outcome.enqueue, "drop + spill on one conversation closes both gaps");
-    check(action_count(outcome, Action::DropFromHost) == 1, "the Host copy is released");
-    check(action_kv(outcome, Action::SpillToHost) >= 30, "the Device gap must actually close");
-    check(outcome.steps.size() == 2, "exactly two steps: release, then move");
-    if (outcome.steps.size() == 2) {
-        check(outcome.steps[0].id == 1 && outcome.steps[0].action == Action::DropFromHost,
-              "the drop runs first - it opens the room");
-        check(outcome.steps[1].id == 1 && outcome.steps[1].action == Action::SpillToHost,
-              "the same conversation's Device copy lands in that room");
+    check(!outcome.enqueue, "row + Device gaps close in one release");
+    check(action_count(outcome, Action::DropFromHost) == 1, "one row gap, one release");
+    check(action_count(outcome, Action::SpillToHost) == 0,
+          "the release's Device relief closes the Device gap - no second step");
+    if (!outcome.steps.empty()) {
+        check(outcome.steps.front().id == 1, "the least important conversation releases first");
     }
 }
 
-// The same shape with a second conversation available: the first one alone closes both gaps, so
-// the plan must NOT touch the second — the gap, not the pool, decides how much is touched.
+// A full catalog with nothing releasable: R0 with the reason that names the pool.
+void case_catalog_full_without_candidates_enqueues() {
+    std::printf("case_catalog_full_without_candidates_enqueues\n");
+    const std::vector<Datum> pool; // empty: nothing exists to release
+    TierOccupancy occ = occupancy(100, 0, 1000, 0);
+    occ.catalog_rows_vacant = 0;
+    const Plan outcome = decide(Demand{.catalog_rows = 1}, occ, pool);
+
+    check(outcome.enqueue, "a full catalog with no candidate waits (R0)");
+    check(outcome.reason == EnqueueReason::CatalogNotClosable,
+          "the log must name WHICH pool could not serve");
+    check(outcome.steps.empty(), "nothing exists to release - no half-plan");
+}
+
+// One release per gap-set: the least important conversation carries both the Host room the
+// plan needs and the Device relief it promises, so the second conversation is never touched.
 void case_two_conversations_close_both_gaps() {
     std::printf("case_two_conversations_close_both_gaps\n");
     const std::vector<Datum> pool{
@@ -263,13 +283,11 @@ void case_two_conversations_close_both_gaps() {
     const Plan outcome =
         decide(Demand{.device_kv = 30, .host_kv = 30}, occupancy(100, 100, 100, 95), pool);
 
-    check(!outcome.enqueue, "the drop frees Host room and the Device gap closes too");
+    check(!outcome.enqueue, "the release frees Host room and its Device relief counts too");
     check(action_count(outcome, Action::DropFromHost) == 1, "exactly the conversation needed");
-    check(action_kv(outcome, Action::SpillToHost) >= 30, "the Device gap must actually close");
-    check(outcome.steps.size() == 2, "one drop, one move - no extra conversation");
-    if (outcome.steps.size() == 2) {
-        check(outcome.steps[0].id == 1, "the least important conversation is the one dropped");
-        check(outcome.steps[1].id == 1, "and its own Device copy is what moves (§2.1)");
+    check(action_count(outcome, Action::SpillToHost) == 0, "no second step for it");
+    if (!outcome.steps.empty()) {
+        check(outcome.steps.front().id == 1, "the least important conversation is released");
     }
     for (const auto& step : outcome.steps) {
         check(step.id != 2, "the second conversation survives untouched");
@@ -279,7 +297,9 @@ void case_two_conversations_close_both_gaps() {
 // The four pools stay separate (§R2: each reports its own fullness, one ranking picks). A
 // request blocked ONLY on state slots must reach the policy: every KV axis here reports a zero
 // gap, and a two-pool implementation printed `gap dev=0 host=0` while Device state was 8/8 and
-// Host state 48/48 - the policy went blind exactly when it had to act.
+// Host state 48/48 - the policy went blind exactly when it had to act. One release closes both
+// state gaps: the Host slots it frees and the Device state its teardown returns (invariant 3:
+// one action, its full footprint).
 void case_state_pressure_is_visible_without_a_kv_gap() {
     std::printf("case_state_pressure_is_visible_without_a_kv_gap\n");
     const std::vector<Datum> pool{
@@ -291,12 +311,10 @@ void case_state_pressure_is_visible_without_a_kv_gap() {
 
     check(!outcome.enqueue, "state pressure must be answerable, not reported as nothing to do");
     check(action_count(outcome, Action::DropFromHost) == 1,
-          "the full Host state pool frees room by dropping one conversation");
-    check(action_count(outcome, Action::SpillToHost) == 1,
-          "the full Device state pool frees room by moving one conversation");
-    check(action_kv(outcome, Action::SpillToHost) == 0,
-          "no KV moved at all - this plan is driven purely by state slots");
-    check(action_state(outcome, Action::SpillToHost) >= 1, "the Device state gap must close");
+          "the full Host state pool frees room by releasing one conversation");
+    check(action_count(outcome, Action::SpillToHost) == 0,
+          "its Device state relief counts in the same step - no second action");
+    check(action_kv(outcome, Action::SpillToHost) == 0, "no KV moves at all");
     check(action_state(outcome, Action::DropFromHost) >= 1, "the Host state gap must close");
 }
 
@@ -380,36 +398,33 @@ void case_deletions_stop_at_the_gap() {
     }
 }
 
-// §2.1: drop and spill may land on the SAME conversation — releasing its Host copy and moving
-// its Device copy into that room is one net action. What stays structural is different from what
-// this case used to assert: no plan step ever destroys Device data (there is no such Action), and
-// a second conversation is never touched when the first one closes the gap. The runtime side of
-// §7 acceptance #3 ("Device deletion count == 0") is a behavior counter, not a unit test.
-void case_drop_and_spill_are_one_net_action() {
-    std::printf("case_drop_and_spill_are_one_net_action\n");
+// Plan and execution must agree on ONE action per conversation: HostReleases runs before
+// CopyPreparation, so a released conversation's address space is gone by the time any spill
+// step would prepare - a second step would fail prepare and latch the engine. The release
+// loop's Device accounting is what makes the second step unnecessary.
+void case_release_never_gets_a_second_step() {
+    std::printf("case_release_never_gets_a_second_step\n");
     const std::vector<Datum> pool{
         {.id = 1, .device_kv = 50, .host_kv = 50, .importance = 1},
         {.id = 2, .device_kv = 50, .host_kv = 50, .importance = 9},
     };
-    // Device gap 50, Host gap 50: conversation 1 answers both.
     const Plan outcome =
         decide(Demand{.device_kv = 50, .host_kv = 100}, occupancy(100, 100, 100, 50), pool);
 
     check(!outcome.enqueue, "both gaps are answerable");
-    check(outcome.steps.size() == 2, "one drop and one move, nothing more");
-    if (outcome.steps.size() == 2) {
-        check(outcome.steps[0].id == 1 && outcome.steps[0].action == Action::DropFromHost,
-              "the least important conversation's Host copy is released first");
-        check(outcome.steps[1].id == 1 && outcome.steps[1].action == Action::SpillToHost,
-              "and its own Device copy moves into the room that opened - one net action");
+    check(outcome.steps.size() == 1, "the release alone answers both gaps");
+    if (!outcome.steps.empty()) {
+        check(outcome.steps.front().id == 1 &&
+                  outcome.steps.front().action == Action::DropFromHost,
+              "released first, in importance order");
     }
     for (const auto& step : outcome.steps) {
         check(step.id != 2, "the second conversation is never touched for this gap");
     }
 }
 
-// §2.2's one chain (`value → age → id`): two equal scores still rank by recency — the oldest
-// last-touched goes first — and only then by id. Without the age segment the policy tie-broke on
+// §2.2's one chain (`value → age → id`): two equal scores still rank by recency - the oldest
+// last-touched goes first - and only then by id. Without the age segment the policy tie-broke on
 // catalog id while retire_preference tie-broke on age, so the same snapshot could pick two
 // different victims (§2.2).
 void case_equal_importance_ranks_by_age_then_id() {
@@ -445,13 +460,14 @@ int main() {
     case_no_gap_is_no_action();
     case_least_important_first_on_both_sides();
     case_active_data_is_never_a_candidate();
-    case_drop_funds_the_spills_own_landing();
+    case_release_answers_row_and_device_gaps();
+    case_catalog_full_without_candidates_enqueues();
     case_two_conversations_close_both_gaps();
     case_state_pressure_is_visible_without_a_kv_gap();
     case_state_pressure_with_no_state_to_move_enqueues();
     case_nothing_is_dropped_for_a_gap_it_cannot_close();
     case_deletions_stop_at_the_gap();
-    case_drop_and_spill_are_one_net_action();
+    case_release_never_gets_a_second_step();
     case_equal_importance_ranks_by_age_then_id();
     if (g_failures != 0) {
         std::printf("cache tier policy FAILED: %d check(s)\n", g_failures);

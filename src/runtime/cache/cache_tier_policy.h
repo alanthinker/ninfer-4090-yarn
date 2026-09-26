@@ -45,6 +45,10 @@ struct TierOccupancy {
     std::uint64_t host_kv_capacity     = 0;
     std::uint64_t host_state_used      = 0;
     std::uint64_t host_state_capacity  = 0;
+    // The fifth pool: catalog rows a NEW conversation may publish into. A row is an index, not
+    // cache data - but it is a real admission resource: with none vacant the only way to serve a
+    // fresh conversation is to release an existing one (its row comes with it).
+    std::uint64_t catalog_rows_vacant  = 0;
 
     [[nodiscard]] std::uint64_t device_kv_free() const noexcept {
         return device_kv_capacity > device_kv_used ? device_kv_capacity - device_kv_used : 0;
@@ -72,6 +76,9 @@ struct Demand {
     std::uint64_t device_state = 0;
     std::uint64_t host_kv      = 0;
     std::uint64_t host_state   = 0;
+    // 1 when the incoming conversation has nowhere to publish itself (no vacant row and no
+    // source row it may consume), else 0.
+    std::uint64_t catalog_rows  = 0;
 };
 
 // One cached CONVERSATION - the unit of retention. `id` is its catalog row.
@@ -90,6 +97,9 @@ struct Datum {
     std::uint64_t device_state = 0;  // its Device state images, in Device state slots
     std::uint64_t host_kv      = 0;  // its Host KV, in bytes
     std::uint64_t host_state   = 0;  // its Host state images, in Host state slots
+    // The catalog row this conversation occupies (1 for every pooled owner - the pool IS the
+    // catalog). Releasing the conversation frees the row with it.
+    std::uint64_t catalog_row   = 1;
     std::uint64_t importance   = 0;  // larger == more worth keeping. The ONLY ordering.
     // Last-active age key (ASCENDING: larger == more recent) — the tie-break of §2.2's one chain
     // `value → age → id`, the same key the ladder's retire_preference ranks with (§2.2).
@@ -109,6 +119,7 @@ enum class EnqueueReason : std::uint8_t {
     None,               // the plan is actionable
     DeviceNotClosable,  // Device could not give up enough (what is left is all active)
     HostNotClosable,    // Host could not take the spill or give up enough to receive it
+    CatalogNotClosable, // no vacant row and no pool owner could be released to make one
 };
 
 // One whole-conversation action, reported per pool rather than in one number: `kv` is the
@@ -171,9 +182,10 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
         shortfall(need.device_state, occupancy.device_state_free());
     const std::uint64_t host_kv_gap    = shortfall(need.host_kv, occupancy.host_kv_free());
     const std::uint64_t host_state_gap = shortfall(need.host_state, occupancy.host_state_free());
+    const std::uint64_t rows_gap = shortfall(need.catalog_rows, occupancy.catalog_rows_vacant);
 
     if (device_kv_gap == 0 && device_state_gap == 0 && host_kv_gap == 0 &&
-        host_state_gap == 0) {
+        host_state_gap == 0 && rows_gap == 0) {
         return out;  // R3: everything the request needs is already placeable.
     }
 
@@ -186,42 +198,64 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
     }
     detail::rank_least_important(candidates);
 
-    // R2: delete whole conversations on the Host side, least important first, until BOTH Host
-    // pools have their room. A conversation is only taken when it answers a gap that is still
-    // open: with `host_kv` already satisfied, deleting a conversation that carries KV but no
-    // state frees nothing this plan needs and destroys it for nothing - deletion count must
-    // equal gap count (§ invariant 3), not "everything with any footprint". The last one may
+    // R2 + the catalog-row gap: release whole conversations, least important first, until BOTH
+    // Host pools have their room AND the row demand is met. One released conversation answers
+    // every axis at once: its row, its Host KV/state - and, at execution, its Device data too
+    // (the victim prelude moves Device pages to Host before the teardown, §三 R1/R2). Its
+    // Device relief is counted HERE so the R1 loop below never needs a second step for the
+    // same conversation: HostReleases runs before CopyPreparation, so a spilled address space
+    // that was already released would fail prepare and latch the engine. A conversation is
+    // only taken when it answers a gap that is still open (§ invariant 3); the last one may
     // still free more than the gap, because a conversation cannot be dropped halfway.
     std::vector<std::uint64_t> dropped;
     dropped.reserve(candidates.size());
-    std::uint64_t host_kv_freed    = 0;
-    std::uint64_t host_state_freed = 0;
+    std::uint64_t host_kv_freed        = 0;
+    std::uint64_t host_state_freed     = 0;
+    std::uint64_t rows_freed           = 0;
+    std::uint64_t released_device_kv    = 0;
+    std::uint64_t released_device_state = 0;
     for (const Datum* datum : candidates) {
-        if (host_kv_freed >= host_kv_gap && host_state_freed >= host_state_gap) { break; }
+        if (host_kv_freed >= host_kv_gap && host_state_freed >= host_state_gap &&
+            rows_freed >= rows_gap) {
+            break;
+        }
         const bool helps_kv =
             host_kv_freed < host_kv_gap && datum->host_kv > 0;
         const bool helps_state =
             host_state_freed < host_state_gap && datum->host_state > 0;
-        if (!helps_kv && !helps_state) { continue; }
+        const bool helps_rows = rows_freed < rows_gap && datum->catalog_row > 0;
+        if (!helps_kv && !helps_state && !helps_rows) { continue; }
         dropped.push_back(datum->id);
         host_kv_freed += datum->host_kv;
         host_state_freed += datum->host_state;
+        rows_freed += datum->catalog_row;
+        released_device_kv += datum->device_kv;
+        released_device_state += datum->device_state;
     }
 
-    // R1: move Device-resident conversations to Host, least important first, until BOTH Device
-    // pools have their room. Only a conversation that answers an open Device gap is moved. A
-    // conversation this plan already dropped on the Host side stays eligible: its Device copy
-    // lands in the room its own drop just freed (§2.1), and nothing on Device is destroyed.
+    // R1: move Device-resident SURVIVORS to Host, least important first, until the Device gaps
+    // are closed - after subtracting the Device relief the release loop above already
+    // delivers. A released conversation never receives a second step: its address space is
+    // gone by the time the spill phase would run, so a spill step for it would fail prepare
+    // and latch the engine (plan and execution must agree on one action per conversation).
+    const std::uint64_t device_kv_needed =
+        device_kv_gap > released_device_kv ? device_kv_gap - released_device_kv : 0;
+    const std::uint64_t device_state_needed =
+        device_state_gap > released_device_state ? device_state_gap - released_device_state : 0;
     std::vector<Step> spills;
     spills.reserve(candidates.size());
     std::uint64_t device_kv_moved    = 0;
     std::uint64_t device_state_moved = 0;
     for (const Datum* datum : candidates) {
-        if (device_kv_moved >= device_kv_gap && device_state_moved >= device_state_gap) { break; }
+        if (std::find(dropped.begin(), dropped.end(), datum->id) != dropped.end()) { continue; }
+        if (device_kv_moved >= device_kv_needed &&
+            device_state_moved >= device_state_needed) {
+            break;
+        }
         const bool helps_kv =
-            device_kv_moved < device_kv_gap && datum->device_kv > 0;
+            device_kv_moved < device_kv_needed && datum->device_kv > 0;
         const bool helps_state =
-            device_state_moved < device_state_gap && datum->device_state > 0;
+            device_state_moved < device_state_needed && datum->device_state > 0;
         if (!helps_kv && !helps_state) { continue; }
         spills.push_back(Step{datum->id, Action::SpillToHost, datum->device_kv,
                               datum->device_state, datum->importance});
@@ -234,11 +268,13 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
     const bool host_short =
         host_kv_freed < host_kv_gap || host_state_freed < host_state_gap;
     const bool device_short =
-        device_kv_moved < device_kv_gap || device_state_moved < device_state_gap;
-    if (device_short || host_short) {
+        device_kv_moved < device_kv_needed || device_state_moved < device_state_needed;
+    const bool rows_short = rows_freed < rows_gap;
+    if (device_short || host_short || rows_short) {
         out.enqueue = true;
-        out.reason  = device_short ? EnqueueReason::DeviceNotClosable
-                                   : EnqueueReason::HostNotClosable;
+        out.reason  = device_short   ? EnqueueReason::DeviceNotClosable
+                     : host_short    ? EnqueueReason::HostNotClosable
+                                     : EnqueueReason::CatalogNotClosable;
         return out;
     }
 
@@ -266,6 +302,7 @@ inline std::string describe(const Plan& outcome, const Demand& need,
             case EnqueueReason::None: return "-";
             case EnqueueReason::DeviceNotClosable: return "device-not-closable";
             case EnqueueReason::HostNotClosable: return "host-not-closable";
+            case EnqueueReason::CatalogNotClosable: return "catalog-not-closable";
         }
         return "?";
     };
