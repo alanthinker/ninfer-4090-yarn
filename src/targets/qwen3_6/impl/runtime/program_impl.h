@@ -5879,7 +5879,8 @@ void ProgramImplCore::prepare_pressure_bookkeeping(MaterializationTransaction::P
             std::vector<MaterializationTransaction::PressureWork::KVChangeWork>& changes) {
             changes.reserve(actions.size());
             constexpr std::uint32_t kMaxLandingPages = 64;
-            for (const qwen3_6::detail::PressureKVDecision& action : actions) {
+            for (std::size_t action_i = 0; action_i < actions.size(); ++action_i) {
+                const qwen3_6::detail::PressureKVDecision& action = actions[action_i];
                 // One change = ONE prepare = ONE contiguous Host extent: a458-page run asked the
                 // arena for a single1.83 GiB contiguous block while2.65 GiB sat free in pieces,
                 // and the refusal surfaced as blocked_host -> assessment reject -> R0 park
@@ -5907,6 +5908,8 @@ void ProgramImplCore::prepare_pressure_bookkeeping(MaterializationTransaction::P
                     action.begin_page + chunk * kMaxLandingPages;
                 const std::uint32_t run_count =
                     std::min(kMaxLandingPages, action.page_count - chunk * kMaxLandingPages);
+                change.action_index  = static_cast<std::uint32_t>(action_i);
+                change.action_offset = chunk * kMaxLandingPages;
                 change.pages.reserve(run_count);
                 for (std::uint32_t offset = 0; offset < run_count; ++offset) {
                     change.pages.push_back(addresses->logical_page(*address, run_begin + offset));
@@ -6049,21 +6052,27 @@ void ProgramImplCore::publish_pressure_host_releases(
         change.host_released    = true;
         work.mutation_published = true;
     };
-    if (work.main_kv_changes.size() != work.option.main_kv_changes.size() ||
-        work.backend_kv_changes.size() != work.option.backend_kv_changes.size()) {
+    const auto aligned = [](const auto& option_list, const auto& change_list) {
+        for (const auto& change : change_list) {
+            if (change.action_index >= option_list.size()) { return false; }
+        }
+        return true;
+    };
+    if (!aligned(work.option.main_kv_changes, work.main_kv_changes) ||
+        !aligned(work.option.backend_kv_changes, work.backend_kv_changes)) {
         throw std::logic_error("pressure KV bookkeeping is not action aligned");
     }
-    for (std::size_t index = 0; index < work.option.main_kv_changes.size(); ++index) {
-        release_kv(*text_kv_addresses, *text_kv_pages, kv->text, work.option.main_kv_changes[index],
-                   work.main_kv_changes[index]);
+    for (auto& change : work.main_kv_changes) {
+        release_kv(*text_kv_addresses, *text_kv_pages, kv->text,
+                   work.option.main_kv_changes[change.action_index], change);
     }
     if (!work.option.backend_kv_changes.empty()) {
         if (!kv->backend || !backend_kv_addresses || !backend_kv_pages) {
             throw std::logic_error("pressure Host Backend KV release has no typed store");
         }
-        for (std::size_t index = 0; index < work.option.backend_kv_changes.size(); ++index) {
+        for (auto& change : work.backend_kv_changes) {
             release_kv(*backend_kv_addresses, *backend_kv_pages, *kv->backend,
-                       work.option.backend_kv_changes[index], work.backend_kv_changes[index]);
+                       work.option.backend_kv_changes[change.action_index], change);
         }
     }
     work.committed_delta.removed =
@@ -6148,12 +6157,16 @@ void ProgramImplCore::prepare_pressure_work(MaterializationTransaction::Pressure
         }
         const std::uint32_t mapped = addresses.mapped_pages(address);
         if (action.begin_page > mapped || action.page_count > mapped - action.begin_page ||
-            change.pages.size() != action.page_count) {
+            change.action_offset > action.page_count ||
+            change.pages.size() > action.page_count - change.action_offset) {
             throw std::logic_error("pressure KV region changed before transfer");
         }
-        for (std::uint32_t offset = 0; offset < action.page_count; ++offset) {
-            const LogicalKVPageHandle logical =
-                addresses.logical_page(address, action.begin_page + offset);
+        for (std::uint32_t i = 0; i < change.pages.size(); ++i) {
+            const LogicalKVPageHandle logical = addresses.logical_page(
+                address, action.begin_page + change.action_offset + i);
+            if (logical != change.pages[i]) {
+                throw std::logic_error("pressure KV membership changed before transfer");
+            }
             const bool host_resident = pages.host_resident(logical);
             const bool valid_residency =
                 action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost
@@ -6174,7 +6187,7 @@ void ProgramImplCore::prepare_pressure_work(MaterializationTransaction::Pressure
                 throw std::logic_error(
                     "pressure KV replica changed before transfer: kind=" +
                     std::to_string(static_cast<int>(action.kind)) + " page=" +
-                    std::to_string(action.begin_page + offset) + "/" +
+                    std::to_string(action.begin_page + change.action_offset + i) + "/" +
                     std::to_string(action.page_count) + " device=" +
                     std::to_string(device_resident ? 1 : 0) + " host=" +
                     std::to_string(host_resident ? 1 : 0) + " residency=" +
@@ -6182,7 +6195,7 @@ void ProgramImplCore::prepare_pressure_work(MaterializationTransaction::Pressure
                     std::to_string(writers) + " pins=" + std::to_string(pins) + " active=" +
                     std::to_string(active_reference ? 1 : 0));
             }
-            if (change.pages[offset] != logical) {
+            if (change.pages[i] != logical) {
                 throw std::logic_error("pressure KV membership changed before transfer");
             }
         }
@@ -6210,12 +6223,12 @@ void ProgramImplCore::prepare_pressure_work(MaterializationTransaction::Pressure
                                                      : (shared->kv ? &*shared->kv : nullptr);
     if (kv == nullptr) { throw std::logic_error("pressure owner has no KV address space"); }
     if (resource == runtime::ContextResourceClass::MainKV) {
-        if (work.main_kv_changes.size() != work.option.main_kv_changes.size()) {
-            throw std::logic_error("pressure Main KV bookkeeping is not action aligned");
-        }
-        for (std::size_t index = 0; index < work.option.main_kv_changes.size(); ++index) {
+        for (auto& change : work.main_kv_changes) {
+            if (change.action_index >= work.option.main_kv_changes.size()) {
+                throw std::logic_error("pressure Main KV bookkeeping is not action aligned");
+            }
             prepare_kv(*text_kv_addresses, *text_kv_pages, kv->text,
-                       work.option.main_kv_changes[index], work.main_kv_changes[index]);
+                       work.option.main_kv_changes[change.action_index], change);
         }
     }
     if (resource == runtime::ContextResourceClass::BackendKV &&
@@ -6223,12 +6236,12 @@ void ProgramImplCore::prepare_pressure_work(MaterializationTransaction::Pressure
         if (!kv->backend || !backend_kv_addresses || !backend_kv_pages) {
             throw std::logic_error("pressure owner has no Backend KV address space");
         }
-        if (work.backend_kv_changes.size() != work.option.backend_kv_changes.size()) {
-            throw std::logic_error("pressure Backend KV bookkeeping is not action aligned");
-        }
-        for (std::size_t index = 0; index < work.option.backend_kv_changes.size(); ++index) {
+        for (auto& change : work.backend_kv_changes) {
+            if (change.action_index >= work.option.backend_kv_changes.size()) {
+                throw std::logic_error("pressure Backend KV bookkeeping is not action aligned");
+            }
             prepare_kv(*backend_kv_addresses, *backend_kv_pages, *kv->backend,
-                       work.option.backend_kv_changes[index], work.backend_kv_changes[index]);
+                       work.option.backend_kv_changes[change.action_index], change);
         }
     }
     work.submitted = std::any_of(work.state_changes.begin(), work.state_changes.end(),
@@ -6290,26 +6303,30 @@ void ProgramImplCore::publish_pressure_work(
                 }
                 work.mutation_published = true;
             };
-        if (work.main_kv_changes.size() != work.option.main_kv_changes.size() ||
-            work.backend_kv_changes.size() != work.option.backend_kv_changes.size()) {
+        const auto publish_aligned = [](const auto& option_list, const auto& change_list) {
+            for (const auto& change : change_list) {
+                if (change.action_index >= option_list.size()) { return false; }
+            }
+            return true;
+        };
+        if (!publish_aligned(work.option.main_kv_changes, work.main_kv_changes) ||
+            !publish_aligned(work.option.backend_kv_changes, work.backend_kv_changes)) {
             std::terminate();
         }
-        for (std::size_t index = 0; index < work.option.main_kv_changes.size(); ++index) {
-            publish_kv(*text_kv_pages, work.option.main_kv_changes[index],
-                       work.main_kv_changes[index]);
-            if (work.option.main_kv_changes[index].kind ==
-                qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
-                work.spill_pages += work.main_kv_changes[index].pages.size();
+        for (auto& change : work.main_kv_changes) {
+            const auto& action = work.option.main_kv_changes[change.action_index];
+            publish_kv(*text_kv_pages, action, change);
+            if (action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
+                work.spill_pages += change.pages.size();
             }
         }
         if (!work.option.backend_kv_changes.empty()) {
             if (!backend_kv_pages) { std::terminate(); }
-            for (std::size_t index = 0; index < work.option.backend_kv_changes.size(); ++index) {
-                publish_kv(*backend_kv_pages, work.option.backend_kv_changes[index],
-                           work.backend_kv_changes[index]);
-                if (work.option.backend_kv_changes[index].kind ==
-                    qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
-                    work.spill_pages += work.backend_kv_changes[index].pages.size();
+            for (auto& change : work.backend_kv_changes) {
+                const auto& action = work.option.backend_kv_changes[change.action_index];
+                publish_kv(*backend_kv_pages, action, change);
+                if (action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
+                    work.spill_pages += change.pages.size();
                 }
             }
         }
@@ -7778,6 +7795,7 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool sh
                     .kind       = kind,
                 });
                 MaterializationTransaction::PressureWork::KVChangeWork change;
+                change.action_index = static_cast<std::uint32_t>(bookkeeping.size());
                 change.pages.reserve(count);
                 for (std::uint32_t page = piece; page < piece + count; ++page) {
                     change.pages.push_back(addresses.logical_page(address, page));

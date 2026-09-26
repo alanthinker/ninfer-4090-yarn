@@ -883,6 +883,12 @@ private:
                 std::vector<DeviceKVPageHandle> sources;
                 std::optional<HostKVExtentReservation> backup;
                 bool host_released = false;
+                // Chunked landings: one option action may own SEVERAL changes (each <=64 pages,
+                // one contiguous Host extent apiece). action_index/offset pair every change back
+                // to its option action and its position inside it, so prepare/publish/release
+                // keep validating the exact page range without requiring sizes to match.
+                std::uint32_t action_index  = 0;
+                std::uint32_t action_offset = 0;
             };
 
             qwen3_6::detail::PressureDecision option;
