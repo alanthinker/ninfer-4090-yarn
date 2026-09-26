@@ -27,7 +27,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=tools/smoke/harness_env.sh
 source "$SCRIPT_DIR/harness_env.sh"
 harness_require
-BIN="$NINFER_BIN"
+# Resolve to an ABSOLUTE path NOW: start() cds into the harness directory before spawning, so
+# a relative NINFER_BIN used to exec-fail silently there (empty log, "failed to become ready"
+# with no reason - 2026-09-26). A missing or unresolvable binary must stop the launcher with
+# the reason, not stall the health probe.
+BIN="$(realpath -e "$NINFER_BIN" 2>/dev/null)" || {
+    echo "engine binary not found (cwd=$(pwd), NINFER_BIN=$NINFER_BIN): build it with: cmake --build build -j" >&2
+    exit 1
+}
 MODEL="$NINFER_WEIGHTS"
 PORT="${AGENT_PORT:-30000}"                 # one GPU, one service: every harness uses :30000
 LOG="$NINFER_HARNESS_DIR/ninfer_serve_agent.log"

@@ -40,7 +40,14 @@ export AGENT_PORT="${AGENT_PORT:-30000}"   # one GPU, one service: :30000 only
 export AGENT_CONCURRENCY="${AGENT_CONCURRENCY:-4}"
 export AGENT_DEV_SLOTS="${AGENT_DEV_SLOTS:-4}"
 export AGENT_HOST_SLOTS="${AGENT_HOST_SLOTS:-48}"
-export AGENT_HOST_KV_MIB="${AGENT_HOST_KV_MIB:-512}"
+# Host KV must absorb the SPILL LANDING of a device-full pool: under spill-first (never
+# destroy device data, 缓存模块v2.md §三 R1) freeing a254-page device overage copies those pages
+# to Host before anything is released - 254 x ~4 MiB = ~1 GiB of landing. With the old512 MiB
+# default (calibrated for the destroy-to-fit engine) that landing could never fit, the composed
+# target came back blocked_host=1065353216 against an EMPTY Host pool, and every fill request
+# parked in R0 until its queue deadline (rig battery, 2026-09-26). Production runs host ~80% of
+# device (8192 vs10284 pages); the rig needs the same ratio to exercise the same paths.
+export AGENT_HOST_KV_MIB="${AGENT_HOST_KV_MIB:-4096}"
 export AGENT_MAX_CTX="${AGENT_MAX_CTX:-32768}" AGENT_KV_CAPACITY="${AGENT_KV_CAPACITY:-65536}"
 # Catalog: production is 512 over 320 host state slots (1.6x) and never binds - observed peak
 # 66/512 - so a catalog that fills is a limit production does not run. The rig's host ceiling is

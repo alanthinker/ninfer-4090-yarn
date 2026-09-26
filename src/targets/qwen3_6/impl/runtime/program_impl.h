@@ -783,6 +783,48 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         }
     }
 
+    // Startup geometry validation: under spill-first (never destroy Device data,
+    // 缓存模块v2.md §三 R1) a Device page only leaves the GPU by landing on Host first, so a
+    // Host tier that cannot hold what Device can shed is not a slow configuration - it can
+    // never serve a saturated pool: every request queues until its deadline. Fail at startup
+    // instead (2026-09-26 rig: host KV512 MiB against a1024-page Device pool at4 MiB/page; a
+    // 254-page gap needed a1016 MiB landing, the fill parked in R0 forever, and nothing named
+    // the impossible configuration). The Host tier must be able to absorb the ENTIRE Device
+    // tier, KV bytes and state slots alike; the message states both sides and the knob.
+    if (continuation_capacity != 0) {
+        const std::uint64_t main_pages     = decoder->text_kv.page_pool().capacity_pages();
+        const std::uint64_t main_stride    = text_host_kv_page_stride;
+        const std::uint64_t backend_stride = backend_host_kv_page_stride;
+        const std::uint64_t backend_pages =
+            backend_kv_cache() ? backend_kv_cache()->page_pool().capacity_pages() : 0;
+        const std::uint64_t host_bytes  = plan.context_cache.host_kv_capacity_bytes;
+        const std::uint64_t spill_bytes = main_pages * main_stride +
+                                          backend_pages * (backend_kv_pages ? backend_stride : 0);
+        if (host_bytes < spill_bytes) {
+            throw std::invalid_argument(
+                "NInfer startup: host KV pool cannot absorb the Device KV pool under "
+                "spill-first: freeing " +
+                std::to_string(main_pages) + " main pages x " + std::to_string(main_stride) +
+                " B + " + std::to_string(backend_pages) + " backend pages x " +
+                std::to_string(backend_stride) + " B = " + std::to_string(spill_bytes) +
+                " bytes of landing, but host_kv_capacity_bytes=" + std::to_string(host_bytes) +
+                ". Every saturated request would queue until its deadline. Raise the host KV "
+                "setting (AGENT_HOST_KV_MIB for the small rig, host-kv-mib for production).");
+        }
+        const std::uint32_t device_state_slots = state_store->device_capacity();
+        const std::uint32_t host_state_slots =
+            state_store->host_occupied() + state_store->host_free();
+        if (host_state_slots != 0 && host_state_slots < device_state_slots) {
+            throw std::invalid_argument(
+                "NInfer startup: host state pool (" + std::to_string(host_state_slots) +
+                " slots) is smaller than the device state pool (" +
+                std::to_string(device_state_slots) +
+                " slots): a Device state image can never demote into a Host slot it does not "
+                "have, so saturation would queue forever. Raise the host state setting "
+                "(AGENT_HOST_SLOTS for the small rig, host-state-slots for production).");
+        }
+    }
+
     io = qwen3_6::RoundState(backing, plan.persistent.round);
     if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
         throw std::logic_error("round-state MTP extension does not match the sequence plan");
@@ -10072,6 +10114,27 @@ void ProgramImplCore::enqueue_active_capture_transfers(ActiveCaptureTransaction&
         std::optional<StateImageTransfer> snapshot =
             state_store->begin_device_to_host(transaction.source_state, device.transfer_stream);
         if (!snapshot) {
+            // Which replica state the source is left in, and by whose hand, is the whole
+            // diagnosis: a capture transaction's source must survive every ladder run between
+            // reserve and this enqueue.
+            const StateReplicaResidency res = state_store->residency(transaction.source_state);
+            std::fprintf(stderr,
+                         "[FATAL] capture HostSnapshot source handle=%u residency=%d role=%d"
+                         " pins=%u dest_pinned=%d refs=%u bound_active=%d bound_live=%d"
+                         " release_protected=%d\n",
+                         state_store->debug_index(transaction.source_state),
+                         static_cast<int>(res),
+                         static_cast<int>(state_store->role(transaction.source_state)),
+                         state_store->source_pins(transaction.source_state),
+                         state_store->destination_pinned(transaction.source_state) ? 1 : 0,
+                         state_store->checkpoint_references(transaction.source_state),
+                         state_bound_by_active_sequence(transaction.source_state) ? 1 : 0,
+                         state_bound_by_live_sequence(transaction.source_state) ? 1 : 0,
+                         (release_protected_state &&
+                          *release_protected_state == transaction.source_state)
+                             ? 1
+                             : 0);
+            std::fflush(stderr);
             throw std::logic_error("selected Host capture has no prepared State target");
         }
         transaction.state_snapshot.emplace(std::move(*snapshot));
