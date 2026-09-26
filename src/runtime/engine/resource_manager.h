@@ -371,9 +371,29 @@ public:
                 private_has_active_edge(slot)) {
                 continue;
             }
-            if (program.continuation_is_live(*entry.handle)) { continue; }
-            std::fprintf(stderr, "catalog: clear retired private owner slot=%u\n", slot);
-            clear_catalog_entry(entry);
+            if (!program.continuation_is_live(*entry.handle)) {
+                std::fprintf(stderr, "catalog: clear retired private owner slot=%u\n", slot);
+                clear_catalog_entry(entry);
+                continue;
+            }
+            // A LIVE owner's summary can still be stale: the release ladder degrades a single
+            // checkpoint of an idle owner (R2 component eviction) inside the Program with no
+            // engine-side publication, so the catalog kept the pre-degrade count and the seal's
+            // outcome validation rejected a correct plan (2026-09-26 battery: owner=22
+            // observed=7/8 after the fill's degrade dropped its anchor at frontier5561 - and
+            // reuse matching kept offering the already-dropped anchor, which only cost a
+            // StalePlanningReference skip).
+            if constexpr (requires { program.continuation_summary(*entry.handle); }) {
+                // The real Program exposes the live summary; test fakes without the API keep
+                // their entry as published (their owners never degrade in place). Copy through
+                // assign_continuation_summary: a plain `entry.summary = <prvalue>` would MOVE
+                // the Program's freshly built (unreserved) vector into the entry and REPLACE
+                // its reserve(max_long_anchors) buffer - the next capture adoption then hit
+                // assign's noexcept capacity guard (2026-09-26 rig crash: source anchors=3,
+                // destination capacity=2).
+                const ContinuationSummary live = program.continuation_summary(*entry.handle);
+                assign_continuation_summary(entry.summary, live);
+            }
         }
         for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
             SharedCatalogEntry& entry = shared_catalog_[slot];
@@ -2132,7 +2152,20 @@ private:
 
     static void assign_continuation_summary(ContinuationSummary& destination,
                                             const ContinuationSummary& source) noexcept {
-        if (source.long_anchors.size() > destination.long_anchors.capacity()) { std::terminate(); }
+        if (source.long_anchors.size() > destination.long_anchors.capacity()) {
+            // Which side overflowed is the whole diagnosis: the destination vectors are
+            // reserved to max_long_anchors at construction, so a source beyond that means the
+            // PROGRAM side accumulated more anchors than the engine's configured maximum.
+            std::fprintf(stderr,
+                         "[FATAL] assign_continuation_summary: source anchors=%zu"
+                         " destination capacity=%zu endpoint=%d rewrite=%d active_refs=%d"
+                         " source_active_refs=%d\n",
+                         source.long_anchors.size(), destination.long_anchors.capacity(),
+                         destination.endpoint ? 1 : 0, destination.rewrite ? 1 : 0,
+                         destination.active_references, source.active_references);
+            std::fflush(stderr);
+            std::terminate();
+        }
         destination.endpoint          = source.endpoint;
         destination.rewrite           = source.rewrite;
         destination.active_references = 0;

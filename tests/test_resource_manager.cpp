@@ -3622,10 +3622,12 @@ void test_victim_score_ranks_by_value_not_by_one_field() {
             "more reuses must mean more protection");
 }
 
-// Fair-share protection must hold on the capture path as well: a shared-capture offer whose
-// only feasible target would consume a protected session's checkpoint set falls back to the
-// private baseline / skip instead of evicting the bucket.
-void test_fair_share_capture_pressure_cannot_touch_protected_sessions() {
+// Fair-share protection is a VALUE, not an exclusion (缓存模块v2.md §六.4): a shared-capture
+// offer whose only feasible target needs pressure no longer refuses the bucket outright - it
+// RESERVES, and the one importance chain prices the protected session (K + age ranks it
+// last-but-eligible, so it is only taken when nothing cheaper exists). The catalog entry must
+// still be untouched at reserve time: claims land when the pressure target seals, not here.
+void test_fair_share_capture_prices_protected_sessions_instead_of_refusing() {
     FakeManager manager = make_manager(1, 4, 1); // default fair_share_buckets = 8
     FakeProgram program;
     const ActiveRequest idle = start_active(
@@ -3652,10 +3654,19 @@ void test_fair_share_capture_pressure_cannot_touch_protected_sessions() {
 
     const auto reserved =
         manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 11}, 0, {});
-    require(reserved == FakeManager::ActiveCaptureReserveResult::Skipped,
-            "shared capture pressure tried to consume a fair-share bucket");
-    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
-            "protected session was claimed for a shared-capture pressure target");
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+            "fair-share must be priced by importance, not refused (section6.4: value, "
+            "not exclusion)");
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Claimed,
+            "reserve prices its victim and claims it atomically - fair-share is a value the "
+            "chain pays for, not a veto the path refuses with");
+    // The reservation opened a capture transaction: drive it home the way every other reserved
+    // capture does, then the lane must be finishable again.
+    auto progress = manager.progress_context_transaction(program, {});
+    auto outcome  = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+    require(!manager.context_transaction_kind(),
+            "reserved capture transaction must close on progress");
+    (void)outcome;
     (void)finish_active(manager, program, active);
 }
 
@@ -3770,8 +3781,8 @@ int main() {
              test_shortlist_collision_requires_program_exact_verification);
     run_test("fair-share oldest bucket release",
              test_fair_share_releases_oldest_bucket_only_when_shared_pool_exhausted);
-    run_test("fair-share capture protection",
-             test_fair_share_capture_pressure_cannot_touch_protected_sessions);
+    run_test("fair-share capture pricing",
+             test_fair_share_capture_prices_protected_sessions_instead_of_refusing);
     run_test("manager hands over the retire preference",
              test_manager_hands_the_retire_preference_to_the_program);
     run_test("victim score combines value and reuse evidence",
