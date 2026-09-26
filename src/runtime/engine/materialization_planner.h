@@ -38,6 +38,12 @@ struct MaterializationOwnerPolicy {
     std::uint64_t last_hit_epoch           = 0;
     std::uint32_t private_retention_weight = 0;
     bool explicit_shared_credit            = false;
+    // Fair-share bucket membership: one of the most recently active idle sessions. Like the
+    // recency horizon this is a VALUE, not a veto - 缓存模块v2.md §2.2. It used to be an
+    // exclusion from the victim domain, which forced the planner to re-plan once per released
+    // bucket; folded into `importance` the protected owner simply sorts behind every unprotected
+    // one and is taken oldest-first only when nothing cheaper remains.
+    bool fair_share_protected               = false;
     // Recency-horizon membership: active within the last minute. It is a sort key, never a veto -
     // see ResourceManager::within_recency_horizon for why protection must not empty the domain.
     bool within_recency_horizon            = false;
@@ -504,7 +510,8 @@ public:
                 .value = cache_owner_importance(
                     materialization_victim_score(pressure.owner_policy, pressure.checkpoint_policy,
                                                  policy.owner),
-                    cache_owner_protected(false, policy.within_recency_horizon),
+                    cache_owner_protected(policy.fair_share_protected,
+                                          policy.within_recency_horizon),
                     static_cast<std::int64_t>(policy.last_hit_epoch)),
             });
         }

@@ -2706,30 +2706,21 @@ private:
             });
         }
 
-        // Fair-share retention: the most recently active `fair_share_buckets_` idle sessions
-        // with a resident checkpoint set are victim-protected. The first planning attempt
-        // excludes the whole protected set from the pressure victim domain, so an active
-        // neighbor's churn can only evict shared-pool owners before it may touch a bucket.
-        // When the search finds no feasible target at all - even the root maximal, which
-        // releases every unprotected owner - the shared pool is exhausted: the oldest bucket
-        // is released and planning re-runs with one fewer protected session. The final
-        // attempt runs with the complete victim domain, whose root maximal target is the
-        // unbounded correctness fallback, so fair share can never make a runnable request
-        // report as blocked without every bucket having been offered up, oldest first.
+        // 缓存模块v2.md §2.2: fair-share protection is an importance VALUE, not a second rule.
+        // It used to be an exclusion: the first attempt removed every bucket from the pressure
+        // victim domain and, when no target survived even the root maximal, released one more
+        // bucket and re-planned - so one request could run the whole planning problem
+        // `fair_share_buckets_` times, and the escape hatch was a loop. A protected owner is now
+        // worth a step above every unprotected one and is ordered inside its group by recency
+        // (cache_owner_importance), which gives the same verdict in a single plan: skip it while
+        // anything cheaper exists, take the oldest one when nothing else remains.
         const std::vector<std::uint32_t> protected_slots = fair_share_protected_slots();
         std::optional<typename Planner::Result> planned;
+        // Kept in the diagnostics for schema stability. There is structurally no bucket to
+        // release any more, so this is always 0 - the comment on the field still reads true.
         std::uint32_t released_buckets = 0;
-        // The verdict of the LAST attempt is the one that stands: each earlier attempt ran with
-        // a smaller victim domain, so only the final (full-domain) one can prove infeasibility.
-        bool final_negative_sound = false;
-        for (std::size_t attempt = 0;; ++attempt) {
-            const std::size_t protected_limit =
-                attempt < protected_slots.size() ? protected_slots.size() - attempt : 0;
-            released_buckets =
-                static_cast<std::uint32_t>(protected_slots.size() - protected_limit);
-            const std::vector<std::uint32_t> limited_protected(
-                protected_slots.begin(),
-                protected_slots.begin() + static_cast<std::ptrdiff_t>(protected_limit));
+        bool final_negative_sound      = false;
+        {
             private_owners.clear();
             private_owner_ids.clear();
             shared_owners.clear();
@@ -2761,9 +2752,6 @@ private:
                 if (entry.state != CatalogState::Catalogued || !entry.handle ||
                     private_has_active_edge(slot)) {
                     continue;
-                }
-                if (is_fair_share_protected(limited_protected, slot)) {
-                    continue; // fair-share bucket: victim-protected this attempt
                 }
                 const PlanningOwnerId owner{.value =
                                                 static_cast<std::uint32_t>(owner_records.size())};
@@ -2814,6 +2802,9 @@ private:
                     .selected_hit_count       = entry.lifetime_selected_hits,
                     .last_hit_epoch           = newest_hit_epoch(entry),
                     .private_retention_weight = private_retention_weight(entry.retention),
+                    // The bucket is carried as a value from here on (§2.2); it no longer removes
+                    // this owner from the victim domain, so the planner never re-plans per bucket.
+                    .fair_share_protected     = is_fair_share_protected(protected_slots, slot),
                     .within_recency_horizon   = within_recency_horizon(slot),
                     .reuse_evidence_q16       = reuse_evidence_q16(
                         entry.lifetime_selected_hits, entry.last_selected_at, observation_now),
@@ -3004,17 +2995,12 @@ private:
                                                           provisional_demand, split_cost);
         };
 
-            // Reset: plan() only writes the out-param on the nullopt paths that classify the
-            // verdict, so a stale value from an earlier attempt must not survive into this one.
+            // plan() only writes the out-param on the nullopt paths that classify the verdict.
             final_negative_sound = false;
             planned = planner_.plan(program, prompt, cost_model_, candidate_inputs, 0,
                                     build_pressure_inputs, logical_goal, final_schedule,
                                     base.summary().prompt_tokens, planning_started,
                                     &final_negative_sound);
-            if (planned || protected_limit == 0) { break; }
-            // No feasible target while this attempt's buckets are closed: the shared pool and
-            // every unprotected owner are exhausted, so the oldest bucket is released and the
-            // planning problem re-runs with one fewer protected session.
         }
         const auto selected_candidate =
             planned ? std::find_if(candidate_inputs.begin(), candidate_inputs.end(),

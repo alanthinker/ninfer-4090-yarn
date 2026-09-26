@@ -360,6 +360,22 @@ CaseResult case_host_full(Engine& engine) {
                "BIG-ROOT");
 }
 
+// 缓存模块v2 §七 判据 #2: 内存满 → 只删 importance 最低的，删除数 == 缺口数.
+//
+// Every OTHER axis is given room on purpose - Device KV 32768, Host KV 16 GiB, catalog 512 - so
+// the only pool that can force a deletion is the Host STATE slot pool. The conversations are
+// cheap to rebuild, so they are the low-importance end of the ranking. Fill the pool, then send
+// one request that must publish: whatever it destroys has to be the minimum for that gap, never a
+// batch. `eviction_budget` counts every request in the case, fills included, so it is set to what
+// a gap-driven run actually costs.
+CaseResult case_host_full_then_probe(Engine& engine) {
+    for (int seed = 1; seed <= 8; ++seed) {
+        (void)run(engine, conversation(kShared + " slotgap " + std::to_string(seed), 2, 120), 8,
+                  "fill");
+    }
+    return run(engine, {msg(ChatRole::System, kRoot), msg(ChatRole::User, "begin")}, 32, "PROBE");
+}
+
 struct CaseEntry {
     const char* name;
     std::uint32_t host_state;
@@ -416,6 +432,17 @@ const CaseEntry kCases[] = {
     {"dense-drops-np", 4, 32768, 0, 4096, 8, -1, case_dense_drops},
     {"spill-race", 4, 32768, 8, 4096, 8, -1, case_spill_race},
     {"host-full", 2, 32768, 8, 4096, 8, -1, case_host_full},
+    // 缓存模块v2 §七 判据 #2: exactly one binding pool (Host state, 8 slots), every other axis
+    // roomy, fair-share protection off so importance alone decides who goes.
+    //
+    // eviction_budget = 0 is the request-level half: with everything else roomy, the Host STATE
+    // gap must be closed by moving (R1), never by destroying a session - a batch, or even one
+    // planner-selected eviction, fails it. The "count == gap" half cannot be read from here:
+    // MaterializationDiagnostics counts only plan-time selected_owner_evictions and has no
+    // counter for the release ladder's own retires, so the exact count is asserted at the policy
+    // level instead - tests/test_cache_tier_policy.cpp `case_deletions_stop_at_the_gap`, which
+    // sees the plan directly (10 candidates, a gap two of them close, exactly 2 steps).
+    {"host-full-minimal", 8, 32768, 0, 16384, 512, 0, case_host_full_then_probe},
 };
 
 }  // namespace

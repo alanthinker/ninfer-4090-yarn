@@ -7220,8 +7220,28 @@ std::uint32_t ProgramImplCore::retirable_host_state_slots() const noexcept {
 
 bool ProgramImplCore::retire_oldest_idle_continuation() {
     if (!state_store) { return false; }
+    // §6.3 / invariant 1: the ladder may only delete on the Host side. Device data has two
+    // legal fates - it is in use, or it moved to Host (R1) - so retiring an owner that still
+    // holds Device residency is a Device-side delete, which the rules forbid. Report the
+    // footprint before the release rather than asserting it: how often this happens is exactly
+    // what has to be measured before the rule can be enforced.
+    const auto report_device_delete = [&](const char* kind, std::uint32_t slot,
+                                          const detail::PhysicalResources& footprint) {
+        const std::uint32_t device_kv =
+            footprint.device.main_kv_pages + footprint.device.backend_kv_pages;
+        if (device_kv == 0 && footprint.device.state_slots == 0) { return; }
+        const char* diag = std::getenv("NINFER_REUSE_DIAG");
+        if (diag != nullptr && *diag == '0') { return; }
+        std::fprintf(stderr,
+                     "[invariant1] retire %s slot=%u deletes Device data: kv=%u pages "
+                     "state=%u slots (R1 says move it; R2 may only delete Host)\n",
+                     kind, slot, device_kv, footprint.device.state_slots);
+        std::fflush(stderr);
+    };
     const RetireVictim victim = select_retire_victim();
     if (victim.continuation) {
+        report_device_delete("continuation", *victim.continuation,
+                             owner_exclusive_resources(continuation_states[*victim.continuation]));
         std::fprintf(stderr,
                      "[exhaust] drop idle continuation slot=%u source=%s rank=%zu/%zu "
                      "score=%.3fs\n",
@@ -7233,6 +7253,8 @@ bool ProgramImplCore::retire_oldest_idle_continuation() {
         return true;
     }
     if (victim.shared) {
+        report_device_delete("shared", *victim.shared,
+                             owner_exclusive_resources(shared_prefix_states[*victim.shared]));
         std::fprintf(stderr,
                      "[exhaust] drop idle shared prefix slot=%u source=%s rank=%zu/%zu "
                      "score=%.3fs\n",
