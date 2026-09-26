@@ -10135,7 +10135,7 @@ bool ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
     return true;
 }
 
-void ProgramImplCore::enqueue_active_capture_transfers(ActiveCaptureTransaction& transaction) {
+bool ProgramImplCore::enqueue_active_capture_transfers(ActiveCaptureTransaction& transaction) {
     if (!transaction.prepared || !transaction.transfer_enqueue_pending ||
         transaction.transfer_submitted) {
         throw std::logic_error("active capture transfer batch is not enqueueable");
@@ -10176,29 +10176,23 @@ void ProgramImplCore::enqueue_active_capture_transfers(ActiveCaptureTransaction&
             }
         }
         if (!snapshot) {
-            // Which replica state the source is left in, and by whose hand, is the whole
-            // diagnosis: a capture transaction's source must survive every ladder run between
-            // reserve and this enqueue.
+            // Nothing can give this capture a Host slot (degrade and whole-release both
+            // declined) - and a capture is OPTIONAL: the documented treatment of one that
+            // cannot be placed is a skip, never a fatal. The caller aborts the transaction and
+            // generation continues without this boundary. Facts for the log first: the
+            // source's replica state and binding are the whole diagnosis.
             state_store->dump_object_debug(transaction.source_state);
-            const StateReplicaResidency res = state_store->residency(transaction.source_state);
+            stop_context_transfer_timer(runtime::ContextResourceClass::State);
             std::fprintf(stderr,
-                         "[FATAL] capture HostSnapshot source handle=%u residency=%d role=%d"
-                         " pins=%u dest_pinned=%d refs=%u bound_active=%d bound_live=%d"
-                         " release_protected=%d\n",
+                         "[capture-skip] no Host snapshot slot: source handle=%u residency=%d"
+                         " role=%d pins=%u bound_active=%d (degrade and whole-release declined)\n",
                          state_store->debug_index(transaction.source_state),
-                         static_cast<int>(res),
+                         static_cast<int>(state_store->residency(transaction.source_state)),
                          static_cast<int>(state_store->role(transaction.source_state)),
                          state_store->source_pins(transaction.source_state),
-                         state_store->destination_pinned(transaction.source_state) ? 1 : 0,
-                         state_store->checkpoint_references(transaction.source_state),
-                         state_bound_by_active_sequence(transaction.source_state) ? 1 : 0,
-                         state_bound_by_live_sequence(transaction.source_state) ? 1 : 0,
-                         (release_protected_state &&
-                          *release_protected_state == transaction.source_state)
-                             ? 1
-                             : 0);
+                         state_bound_by_active_sequence(transaction.source_state) ? 1 : 0);
             std::fflush(stderr);
-            throw std::logic_error("selected Host capture has no prepared State target");
+            return false;
         }
         transaction.state_snapshot.emplace(std::move(*snapshot));
         stop_context_transfer_timer(runtime::ContextResourceClass::State);
@@ -10239,6 +10233,7 @@ void ProgramImplCore::enqueue_active_capture_transfers(ActiveCaptureTransaction&
     context_completion_.record(device.transfer_stream);
     transaction.transfer_enqueue_pending = false;
     transaction.transfer_submitted       = true;
+    return true;
 }
 
 void ProgramImplCore::abort_active_capture(ActiveCaptureTransaction& transaction) noexcept {
@@ -10769,7 +10764,13 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     if (transaction.transfer_enqueue_pending) {
         if (cancellation.requested()) { return abort(); }
         try {
-            enqueue_active_capture_transfers(transaction);
+            if (!enqueue_active_capture_transfers(transaction)) {
+                // Optional capture that cannot be placed: skip it (the documented degradation)
+                // and continue generation - never fail the request over a cache boundary.
+                log_capture_decision("skip", transaction.group.frontier,
+                                     "host-state-snapshot-unavailable", {});
+                return abort();
+            }
         } catch (...) {
             if (device.transfer_stream != nullptr) {
                 (void)cudaStreamSynchronize(device.transfer_stream);

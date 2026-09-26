@@ -47,7 +47,11 @@ export AGENT_HOST_SLOTS="${AGENT_HOST_SLOTS:-48}"
 # target came back blocked_host=1065353216 against an EMPTY Host pool, and every fill request
 # parked in R0 until its queue deadline (rig battery, 2026-09-26). Production runs host ~80% of
 # device (8192 vs10284 pages); the rig needs the same ratio to exercise the same paths.
-export AGENT_HOST_KV_MIB="${AGENT_HOST_KV_MIB:-4096}"
+# Production runs Host at ~3x Device KV (30720 vs10284 pages): spill landing, restores and
+# extent fragmentation all draw from that same pool, and at1x every churn cycle hit a wall
+# (arena refused runs with byte-room free, landing demand over a tight pool, requests parking
+# to their deadline).3x = the production ratio at the rig's page size (1024 x4 MiB x3).
+export AGENT_HOST_KV_MIB="${AGENT_HOST_KV_MIB:-12288}"
 export AGENT_MAX_CTX="${AGENT_MAX_CTX:-32768}" AGENT_KV_CAPACITY="${AGENT_KV_CAPACITY:-65536}"
 # Catalog: production is 512 over 320 host state slots (1.6x) and never binds - observed peak
 # 66/512 - so a catalog that fills is a limit production does not run. The rig's host ceiling is

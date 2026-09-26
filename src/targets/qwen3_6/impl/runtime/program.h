@@ -1403,7 +1403,9 @@ private:
     // destination has no device slot left), in which case the caller aborts the transaction and
     // skips the capture: publishing an optional checkpoint must not fail the request.
     [[nodiscard]] bool prepare_active_capture(ActiveCaptureTransaction& transaction);
-    void enqueue_active_capture_transfers(ActiveCaptureTransaction& transaction);
+    // Returns false when the capture must be SKIPPED (its Host snapshot slot cannot be had and
+    // nothing can free one): an optional capture degrades to a skip, never to a fatal.
+    [[nodiscard]] bool enqueue_active_capture_transfers(ActiveCaptureTransaction& transaction);
     void abort_active_capture(ActiveCaptureTransaction& transaction) noexcept;
     [[nodiscard]] ActiveCaptureResult publish_active_capture(ActiveCaptureTransaction& transaction);
     void release_active_shared_references_strict(SequenceState& sequence) noexcept;
