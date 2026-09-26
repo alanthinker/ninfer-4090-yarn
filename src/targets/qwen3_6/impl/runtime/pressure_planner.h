@@ -780,14 +780,31 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
     // The demand carries its own Host reservation: whatever moves off Device lands on Host, so the
     // policy needs no conversion of its own. KV meets its Host landing unit here - one logical page
     // is one Host page, so the stride is exact - and state is one slot on either side.
+    // ABSOLUTE peaks, never residuals: the policy's plan() asks shortfall(need, free) - feeding
+    // it a deficit (already net of free) subtracts free a SECOND time and the plan sheds half
+    // of what the pool actually has to give up (rig req89: deficit177, computed gap90, delivered
+    // 139 < the177 the assessment required, request parked to its deadline while every number
+    // on both sides was honest). shortfall(peak, free) IS the shed, so peak is the right input.
+    const detail::PhysicalResources& peak = candidate_state.demand.physical_peak_additional;
+    const std::uint64_t device_free_total =
+        tiers.device_kv_free() + tiers.device_backend_kv_free();
+    const std::uint64_t shed_device_state =
+        peak.device.state_slots > tiers.device_state_free()
+            ? peak.device.state_slots - tiers.device_state_free()
+            : 0;
+    const std::uint64_t shed_device_kv =
+        (peak.device.main_kv_pages + peak.device.backend_kv_pages) > device_free_total
+            ? (peak.device.main_kv_pages + peak.device.backend_kv_pages) - device_free_total
+            : 0;
     cachep::Demand demand{
-        .device_kv         = residual.device.main_kv_pages,
-        .device_backend_kv = residual.device.backend_kv_pages,
-        .device_state      = device_state(residual),
+        .device_kv         = peak.device.main_kv_pages,
+        .device_backend_kv = peak.device.backend_kv_pages,
+        .device_state      = peak.device.state_slots,
         // The Host landing budget covers BOTH pools: every page that moves off Device (main or
-        // backend) lands here, and one logical page is one Host page either way.
-        .host_kv           = host_kv(residual) + device_kv(residual) * page_bytes,
-        .host_state        = host_state(residual) + device_state(residual),
+        // backend) lands here, and one logical page is one Host page either way. The candidate's
+        // own Host peak is absolute; the landing terms are the SHED above - what really moves.
+        .host_kv           = peak.host.kv_bytes + shed_device_kv * page_bytes,
+        .host_state        = peak.host.state_slots + shed_device_state,
         .catalog_rows      = need_rows,
     };
 
