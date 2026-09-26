@@ -891,7 +891,14 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
             evict_device_state      = removed.device.state_slots;
         }
         if (move.device_kv == 0 && move.device_state == 0 && droppable_kv == 0 &&
-            droppable_state == 0 && need_rows == 0) {
+            droppable_state == 0 && need_rows == 0 && evict_device_kv == 0 &&
+            evict_device_backend_kv == 0 && evict_device_state == 0) {
+            // Nothing this owner could answer on ANY axis - no move relief, no Host release,
+            // no row, no Device release. The evict_device_* fields must stay in the filter:
+            // without them an owner whose ONLY value is its Device footprint (no move option,
+            // no Host pages) gets dropped from the pool entirely and the pool comes back
+            // EMPTY - the pure-Device-gap release can never see it (rig soak: steps=0,
+            // device-not-closable with1024/1024 Device pages held).
             continue;
         }
         // Device relief of the move the apply step will run (move.choice), counted once per
