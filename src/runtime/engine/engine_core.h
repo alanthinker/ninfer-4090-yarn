@@ -1823,7 +1823,7 @@ private:
 
     [[nodiscard]] ResourceInspection inspect_admission(const std::shared_ptr<Request>& request) {
         return resources_.inspect(*instance_.program, request->prompt, *request->base_plan,
-                                  request->publication_order, !request->reuse_suppressed);
+                                  request->publication_order);
     }
 
     [[nodiscard]] AdmissionProgress remove_pending_error(const std::shared_ptr<Request>& request,
@@ -1840,6 +1840,12 @@ private:
     // taken back from the Program, because re-planning needs it and it is move-only. Without this a
     // capacity miss surfaced as HTTP 500 ('prepared prompt is empty' / the raw exhaustion message)
     // for a request a root prefill would have served.
+    //
+    // 缓存模块v2.md §三 R0: the source this request wanted to restore still exists on Host - a
+    // capacity refusal deletes nothing - so the retry restores it again instead of being downgraded
+    // to a cold prefill, and the request is never rejected on an attempt count: it waits in pending
+    // until the pool changes (memoized verdict, re-inspected whenever a counter moves) or its queue
+    // deadline expires. The deadline check at the top of the admission loop is the only rejection.
     [[nodiscard]] AdmissionProgress retry_materialization_after_capacity_miss(const char* what) {
         if (!materializing_) { throw std::logic_error("capacity miss has no materializing request"); }
         const std::shared_ptr<Request> request = materializing_->request;
@@ -1850,25 +1856,12 @@ private:
         // prefill with a nonzero count here was a reuse the pools refused, not a silent fallback.
         ++request->materialization_diagnostics.capacity_replans;
         ++cumulative_stats_.materialization_capacity_replans;
-        // Recompute rather than repeat: the next admission plans this request from root, so a pool
-        // that cannot make room costs one cold prefill instead of a failed request.
-        request->reuse_suppressed = true;
+        ++request->admission_replans; // telemetry: how often this request re-entered the queue
         std::atomic<bool> abort{true};
         (void)resources_.progress_context_transaction(*instance_.program,
                                                       CancellationFlagView{&abort});
         materializing_.reset();
         restore_failed_materialization_prompt(request);
-        if (++request->admission_replans > kMaximumAdmissionReplans) {
-            std::fprintf(stderr, "[engine] request %llu gave up after %u re-plans\n",
-                         static_cast<unsigned long long>(request->id), request->admission_replans);
-            std::fflush(stderr);
-            complete_error(request,
-                           std::make_exception_ptr(std::runtime_error(
-                               "no admissible plan fits the available context cache capacity")));
-            request_admission_check();
-            publish_runtime_stats();
-            return AdmissionProgress::ControlProgress;
-        }
         // The failed materialization produced no token, so this generation never started: clear what
         // the abandoned admission published so the next one can publish it again.
         request->admitted_begin.reset();
@@ -1883,6 +1876,15 @@ private:
             std::lock_guard lock(queue_mutex_);
             pending_.push_back(request);
         }
+        // The reserve just PROVED this pool state cannot serve this request (the planner's
+        // ladder-credit and the ladder itself disagreed). Park the head on that verdict: the
+        // negative memo makes the next admission skip re-planning while the pool stands still,
+        // so R0's wait is a wait instead of a hot plan-fail-replan loop (the old
+        // kMaximumAdmissionReplans bounded that loop by rejecting after N attempts; §三 R0
+        // forbids rejecting on a count, so the memo plus the queue deadline bound it instead -
+        // observed as 24k allocate retries inside one request's queue wait, 2026-09-26).
+        request->admission_negative_memo.active = true;
+        request->admission_negative_memo.usage  = instance_.program->physical_usage();
         request_admission_check();
         publish_runtime_stats();
         return AdmissionProgress::ControlProgress;
@@ -1893,11 +1895,6 @@ private:
         if (request == nullptr || request->prompt) { return; }
         request->prompt = instance_.program->take_failed_materialization_prompt();
     }
-
-    // Consecutive re-plans one request may spend before it is reported as unplaceable. Every attempt
-    // re-plans against the pool the release ladder just produced, so a healthy pool needs one; the
-    // bound only stops a request the pools genuinely cannot serve.
-    static constexpr std::uint32_t kMaximumAdmissionReplans = 8;
 
     [[nodiscard]] AdmissionProgress progress_context_transaction(bool yield_requested) {
         const std::optional<ContextTransactionKind> kind = resources_.context_transaction_kind();
@@ -2082,26 +2079,12 @@ private:
             // Re-planning needs the prompt the reserve consumed; the Program kept it when the
             // reservation failed on capacity.
             restore_failed_materialization_prompt(request);
-            if (++request->admission_replans > kMaximumAdmissionReplans) {
-                // No admissible plan fits the pools this request can see, even after the release
-                // ladder ran on each attempt. Fail this request with a stated reason and keep the
-                // engine serving: the alternative was an exception that cleared every session.
-                std::fprintf(stderr,
-                             "[engine] request %llu gave up after %u re-plans\n",
-                             static_cast<unsigned long long>(request->id),
-                             request->admission_replans);
-                std::fflush(stderr);
-                if (!erase_pending(request)) {
-                    throw std::logic_error("unplaceable materialization lost its waiting request");
-                }
-                on_waiting_removed(request);
-                complete_error(request,
-                               std::make_exception_ptr(std::runtime_error(
-                                   "no admissible plan fits the available context cache capacity")));
-                request_admission_check();
-                publish_runtime_stats();
-                return AdmissionProgress::ControlProgress;
-            }
+            // §三 R0: never reject on an attempt count. A Stale reserve means the sealed plan
+            // predates a catalog/revision move; the next admission re-seals against the current
+            // one, and the loop is bounded by the request's queue deadline (checked first in the
+            // admission loop) plus cancellation - not by a re-plan budget that used to turn a
+            // stale race into "no admissible plan fits".
+            ++request->admission_replans; // telemetry
             request_admission_check();
             return AdmissionProgress::ControlProgress;
         }
@@ -2180,7 +2163,7 @@ private:
             // stops, open transaction, no free lane) is never memoized.
             const PhysicalUsageSnapshot usage_before = instance_.program->physical_usage();
             const bool head_memo_hit =
-                head->admission_negative_memo.active && !head->reuse_suppressed &&
+                head->admission_negative_memo.active &&
                 head->admission_negative_memo.usage == usage_before;
             // Inspection holds a move-only Choice, so it is produced by one call that either
             // reuses the memoized verdict or runs the inspection and records the memo.
@@ -2192,7 +2175,7 @@ private:
                 ResourceInspection inspection = inspect_admission(head);
                 head->admission_negative_memo.active =
                     inspection.readiness == Readiness::TemporarilyBlocked &&
-                    inspection.negative_sound && !head->reuse_suppressed &&
+                    inspection.negative_sound &&
                     usage_before == instance_.program->physical_usage();
                 if (head->admission_negative_memo.active) {
                     head->admission_negative_memo.usage = usage_before;
@@ -2221,7 +2204,26 @@ private:
             const ActiveAdmissionSet active =
                 scheduler_.active_admission_set(slots_, max_concurrency_);
             if (active.size == 0) {
-                throw std::logic_error("isolated-feasible request is blocked in an idle Engine");
+                // 缓存模块v2.md §三 R0: a TemporarilyBlocked head in an idle Engine is not an
+                // invariant violation — the pool still holds cache the rules can move or drop, or
+                // one plan under-delivered (§十.11), and the memoized verdict is re-inspected the
+                // moment a pool counter moves. Park until the queue deadline instead of failing
+                // the Engine: fail_all_locked here wiped every session and latched 503s until a
+                // restart (2026-09-26: five blocked-head events in one run — four while a request
+                // was running, the fifth only because the Engine happened to be idle). The
+                // deadline check at the top of this loop is what rejects: R0 says only the queue
+                // timeout rejects, never "tried N times" and never a mid-wait wipe.
+                if (!head_memo_hit) {
+                    std::fprintf(stderr,
+                                 "[engine] blocked-in-idle: head=%llu waits for its queue "
+                                 "deadline (R0; revision=%llu, active=0)\n",
+                                 static_cast<unsigned long long>(head->id),
+                                 static_cast<unsigned long long>(
+                                     instance_.program->resource_revision().value));
+                    std::fflush(stderr);
+                }
+                return control_progress ? AdmissionProgress::ControlProgress
+                                        : AdmissionProgress::None;
             }
             if (!scheduler_.protect_blocked_head(head->id, active.span(),
                                                  instance_.program->resource_revision())) {
@@ -2277,7 +2279,7 @@ private:
                 const PhysicalUsageSnapshot candidate_usage_before =
                     instance_.program->physical_usage();
                 const bool candidate_memo_hit =
-                    candidate->admission_negative_memo.active && !candidate->reuse_suppressed &&
+                    candidate->admission_negative_memo.active &&
                     candidate->admission_negative_memo.usage == candidate_usage_before;
                 ResourceInspection candidate_inspection = [&]() -> ResourceInspection {
                     if (candidate_memo_hit) {
@@ -2286,7 +2288,7 @@ private:
                     ResourceInspection inspection = inspect_admission(candidate);
                     candidate->admission_negative_memo.active =
                         inspection.readiness == Readiness::TemporarilyBlocked &&
-                        inspection.negative_sound && !candidate->reuse_suppressed &&
+                        inspection.negative_sound &&
                         candidate_usage_before == instance_.program->physical_usage();
                     if (candidate->admission_negative_memo.active) {
                         candidate->admission_negative_memo.usage = candidate_usage_before;

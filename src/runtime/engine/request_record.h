@@ -180,9 +180,6 @@ struct RequestRecord {
     bool queue_wait_recorded = false;
     std::optional<GenerationBudget> budget;
     std::optional<BeginSummary> admitted_begin;
-    // Set when a materialization this request sealed could not get capacity: the next admission
-    // plans from root (recompute) instead of re-selecting the same reuse.
-    bool reuse_suppressed = false;
     std::optional<BeginSummary> begin;
     std::vector<TokenId> generated;
     std::string content;
@@ -197,9 +194,9 @@ struct RequestRecord {
     std::string abandoned_prefix_detail;
     EngineRequestState model_state        = EngineRequestState::Waiting;
     bool capture_pending                  = false;
-    // Re-plans already spent on this request because its sealed plan could not be reserved (the
-    // catalog moved, or the pools could not produce the capacity it needs). Bounded, so a request
-    // that no admissible plan can serve fails on its own instead of re-planning forever.
+    // Re-plans this request already spent (its sealed plan could not be reserved, or a
+    // materialization hit a capacity miss). Telemetry only: 缓存模块v2.md §三 R0 never rejects on
+    // an attempt count — the queue deadline and cancellation are the only rejection paths.
     std::uint32_t admission_replans       = 0;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;
     std::optional<FinishReason> terminal_reason;
