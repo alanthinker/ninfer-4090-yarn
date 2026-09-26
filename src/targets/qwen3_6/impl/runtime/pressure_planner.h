@@ -753,6 +753,15 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         if (found != owner_values.end()) { age_by_victim[victim_index] = found->age_key; }
     }
 
+    // The fifth pool (catalog rows): a fresh conversation with no source row to consume needs
+    // one vacant row to publish into. When none is vacant the plan must release a conversation
+    // (its row comes with it) - unless this candidate will consume its own source's row.
+    const std::uint64_t rows_vacant =
+        program->continuation_capacity > program->occupied_catalog_slots()
+            ? program->continuation_capacity - program->occupied_catalog_slots()
+            : 0;
+    const std::uint64_t need_rows =
+        (rows_vacant == 0 && !(protection && protection->consumed_private_source)) ? 1 : 0;
     const detail::PhysicalResources occupancy  = program->physical_occupancy();
     const detail::PhysicalResources capacity   = program->admission_capacity();
     const cachep::TierOccupancy tiers{
@@ -764,15 +773,17 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         .host_kv_capacity      = host_kv(capacity),
         .host_state_used       = host_state(occupancy),
         .host_state_capacity   = host_state(capacity),
+        .catalog_rows_vacant   = rows_vacant,
     };
     // The demand carries its own Host reservation: whatever moves off Device lands on Host, so the
     // policy needs no conversion of its own. KV meets its Host landing unit here - one logical page
     // is one Host page, so the stride is exact - and state is one slot on either side.
     const cachep::Demand demand{
-        .device_kv    = device_kv(residual),
-        .device_state = device_state(residual),
-        .host_kv      = host_kv(residual) + device_kv(residual) * page_bytes,
-        .host_state   = host_state(residual) + device_state(residual),
+        .device_kv     = device_kv(residual),
+        .device_state  = device_state(residual),
+        .host_kv       = host_kv(residual) + device_kv(residual) * page_bytes,
+        .host_state    = host_state(residual) + device_state(residual),
+        .catalog_rows  = need_rows,
     };
 
     // For every victim, ask what MOVING it can actually hand back to Device. This is NOT the same
@@ -837,6 +848,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
     pool.reserve(options.victims.size());
     for (std::size_t victim_index = 0; victim_index < options.victims.size(); ++victim_index) {
         const CandidateVictimOptions& victim = options.victims[victim_index];
+        const Owner& owner_entry             = owners[victim.owner_index];
         const MoveOption& move               = move_options[victim_index];
         std::uint64_t droppable_kv           = 0;
         std::uint64_t droppable_state        = 0;
@@ -858,7 +870,6 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         if (move.choice != 0 && move.choice <= victim.decisions.size()) {
             const PressureDecision& chosen = victim.decisions[move.choice - 1U];
             if (!chosen.evicts_continuation) {
-                const Owner& owner_entry = owners[victim.owner_index];
                 const NINFER_QWEN36_RUNTIME_NS::SequenceKVBundle* kv =
                     owner_entry.shared
                         ? [&]() -> const NINFER_QWEN36_RUNTIME_NS::SequenceKVBundle* {
@@ -886,6 +897,10 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
             .device_state = move.device_state,  // ... and the Device state slots it hands back
             .host_kv      = droppable_kv,       // what R2 would free on Host, in bytes
             .host_state   = droppable_state,    // ... and the Host state slots it hands back
+            // A shared prefix occupies a SHARED catalog row: releasing it never gives a fresh
+            // private session anywhere to publish (the goal's slot assignment only accepts
+            // private owners), so it must not answer the private row gap.
+            .catalog_row  = owner_entry.shared ? 0 : 1,
             .importance   = importance_by_victim[victim_index],
             .age_key      = age_by_victim[victim_index],
             .active       = false,
