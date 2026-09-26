@@ -1286,6 +1286,12 @@ private:
     // would violate invariant 1, so the ladder spills what it can and otherwise fails to R0
     // (§三 R0; the 280-of-557 baseline is acceptance 7#3).
     [[nodiscard]] bool release_idle_owner_host_side();
+    // Victim prelude (§三 R1): before a cache-path whole-conversation teardown, move what may
+    // not be destroyed in place - Device KV pages spill to Host, Both-resident state images drop
+    // their Device replica for free, DeviceOnly state demotes when a Host slot allows. What
+    // cannot move stays for the [invariant1] probe to record; the teardown still runs.
+    void prepare_victim_teardown(std::uint32_t index);
+    void prepare_shared_victim_teardown(std::uint32_t index);
     // #12 先搬后释 (spill-then-release): move one idle owner's Device KV to Host - the
     // DemoteToHost runs (device-only pages) and DropDeviceDuplicate runs (redundant copies)
     // prepared/published against a LOCAL PressureWork, never joined to a transaction - so the
@@ -1294,7 +1300,7 @@ private:
     // every page (writers/pins/active references) so prepare can never throw: a page that cannot
     // move makes the whole spill decline, not latch the engine. Requires the owner's Device STATE
     // to already be zero - state relocation is the demote step's job.
-    [[nodiscard]] bool spill_owner_device_kv_to_host(std::uint32_t index);
+    [[nodiscard]] bool spill_owner_device_kv_to_host(std::uint32_t index, bool shared = false);
     // The owner that step would delete, without deleting it, and the Host state slots deleting it
     // would return. Split out so the capacity-relief credit prices what the ladder can actually
     // deliver instead of guessing (storage doc 4.2).

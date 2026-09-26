@@ -6267,6 +6267,7 @@ ProgramImplCore::release_materialization_victim(MaterializationTransaction& tran
         std::fflush(stderr);
         throw std::logic_error("materialization victim is not strictly releasable");
     }
+    prepare_victim_teardown(index); // §三 R1: move first, then the R2 teardown
     out.delta.removed = owner_exclusive_resources(continuation_states[index]);
     // Closes the pressure path's attribution gap: planner victims released here previously printed
     // bare [evict] lines (no [exhaust], no site=seal, no handle-release). A burst of these is a
@@ -6427,6 +6428,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                     shared_prefix_states[index].active_references != 0) {
                     throw std::logic_error("shared pressure victim changed before release");
                 }
+                prepare_shared_victim_teardown(index); // §三 R1: move first
                 const detail::PhysicalResources exclusive =
                     owner_exclusive_resources(shared_prefix_states[index]);
                 if (work.option.effect.added != detail::PhysicalResources{}) {
@@ -7259,6 +7261,61 @@ bool ProgramImplCore::degrade_idle_owner_host_state() {
             return false;
         }
         bool spilled = false;
+        // #12-a shared image: the Host slot frees only when the LAST reference to the image
+        // goes. Fully pre-validate the other referencer first - its gates, its surviving
+        // checkpoint, and its own Device-KV spill if its truncation would touch Device
+        // residency - so the compound either commits both drops back to back or touches
+        // nothing beyond this candidate's own validated drop.
+        const auto validate_partner =
+            [&](std::uint32_t mine, StateImageHandle handle)
+                -> std::optional<std::pair<std::uint32_t, runtime::CheckpointRef>> {
+            for (std::uint32_t other = 0; other < continuation_capacity; ++other) {
+                if (other == mine) { continue; }
+                if (continuation_slots[other].role != ContinuationSlotRole::Catalogued) {
+                    continue;
+                }
+                SequenceState& oseq = continuation_states[other];
+                if (!oseq.kv || oseq.state.fork_pending) { continue; }
+                if (owner_holds_release_protected_state(other)) { continue; }
+                if (materialization_pins(other, continuation_slots[other].generation)) {
+                    continue;
+                }
+                const qwen3_6::ContinuationSummary osum = continuation_summary(oseq);
+                std::optional<runtime::CheckpointRef> oref;
+                if (oseq.endpoint_valid && oseq.state.read == handle && osum.endpoint) {
+                    oref = osum.endpoint->ref;
+                } else if (oseq.rewrite_state && *oseq.rewrite_state == handle && osum.rewrite) {
+                    oref = osum.rewrite->ref;
+                } else {
+                    for (const LongAnchorCheckpoint& anchor : oseq.long_anchors) {
+                        if (anchor.state == handle) {
+                            oref = runtime::CheckpointRef{
+                                .kind     = runtime::CheckpointKind::LongAnchor,
+                                .frontier = anchor.frontier,
+                                .ordinal  = anchor.ordinal,
+                            };
+                            break;
+                        }
+                    }
+                }
+                if (!oref) { continue; }
+                const std::optional<qwen3_6::TargetKVRequirement> oretained =
+                    retained_requirement_after_drop(osum, *oref);
+                if (!oretained) { continue; } // the partner could not drop alone
+                const auto partner_beyond = [&]() {
+                    return device_beyond(*text_kv_addresses, *text_kv_pages, oseq.kv->text,
+                                         oretained->main_frontier) ||
+                           (oseq.kv->backend && backend_kv_addresses && backend_kv_pages &&
+                            device_beyond(*backend_kv_addresses, *backend_kv_pages,
+                                          *oseq.kv->backend, oretained->backend_frontier));
+                };
+                if (partner_beyond()) {
+                    if (!spill_owner_device_kv_to_host(other) || partner_beyond()) { continue; }
+                }
+                return std::pair{other, *oref};
+            }
+            return std::nullopt;
+        };
         const auto try_drop = [&](StateImageHandle handle,
                                   const runtime::CheckpointRef& ref) -> bool {
             if (!state_store->valid(handle)) { ++skip_invalid; return false; }
@@ -7274,7 +7331,13 @@ bool ProgramImplCore::degrade_idle_owner_host_state() {
                 ++skip_residency;
                 return false;
             }
-            if (state_store->checkpoint_references(handle) != 1) { ++skip_refs; return false; }
+            std::uint32_t refs = state_store->checkpoint_references(handle);
+            std::optional<std::pair<std::uint32_t, runtime::CheckpointRef>> partner;
+            if (refs != 1) {
+                if (refs != 2) { ++skip_refs; return false; } // >2 referencers: no compound
+                partner = validate_partner(index, handle);
+                if (!partner) { ++skip_refs; return false; }
+            }
             const std::optional<qwen3_6::TargetKVRequirement> retained =
                 retained_requirement_after_drop(continuation_summary(sequence), ref);
             if (!retained) { ++skip_noplace; return false; } // nothing would survive this drop
@@ -7298,6 +7361,12 @@ bool ProgramImplCore::degrade_idle_owner_host_state() {
             const std::uint32_t host_now = state_store->host_occupied();
             try {
                 publish_checkpoint_drop(sequence, ref);
+                if (partner) {
+                    // last reference: this second component drop releases the image itself,
+                    // which is what actually frees the Host slot (two drops, one gap).
+                    publish_checkpoint_drop(continuation_states[partner->first],
+                                            partner->second);
+                }
             } catch (const std::exception&) {
                 ++skip_race; // inventory moved under the drop: next candidate
                 return false;
@@ -7445,7 +7514,20 @@ bool ProgramImplCore::release_idle_owner_host_side() {
         if (role == SharedPrefixSlotRole::Free || !shared_prefix_states[index].kv) {
             return false;
         }
-        if (!device_free(owner_exclusive_resources(shared_prefix_states[index]))) { return false; }
+        detail::PhysicalResources shared_footprint =
+            owner_exclusive_resources(shared_prefix_states[index]);
+        if (!device_free(shared_footprint)) {
+            // #12: a shared prefix's Device KV moves to Host first (R1). Device state blocks
+            // the release - relocating it is the demote step's job, one slot at a time.
+            const std::uint32_t device_pages =
+                shared_footprint.device.main_kv_pages + shared_footprint.device.backend_kv_pages;
+            if (shared_footprint.device.state_slots != 0 || device_pages == 0 ||
+                !spill_owner_device_kv_to_host(index, /*shared=*/true)) {
+                return false;
+            }
+            shared_footprint = owner_exclusive_resources(shared_prefix_states[index]);
+            if (!device_free(shared_footprint)) { return false; }
+        }
         if (!can_release_shared_prefix_state(index, role)) { return false; }
         std::fprintf(stderr,
                      "[ladder] release host-only idle shared prefix slot=%u (R2: Device already"
@@ -7506,11 +7588,27 @@ bool ProgramImplCore::release_idle_owner_host_side() {
     return false;
 }
 
-bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index) {
-    if (index >= continuation_capacity || !host_kv_extents || !state_store) { return false; }
-    if (continuation_slots[index].role != ContinuationSlotRole::Catalogued) { return false; }
-    const SequenceState& sequence = continuation_states[index];
-    if (!sequence.kv || !text_kv_addresses || !text_kv_pages) { return false; }
+bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool shared) {
+    if (!host_kv_extents || !state_store) { return false; }
+    if (shared) {
+        if (index >= shared_prefix_capacity ||
+            shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued ||
+            shared_prefix_states[index].active_references != 0) {
+            return false;
+        }
+    } else {
+        if (index >= continuation_capacity ||
+            continuation_slots[index].role != ContinuationSlotRole::Catalogued) {
+            return false;
+        }
+    }
+    const SequenceState* sequence = shared ? nullptr : &continuation_states[index];
+    const SharedPrefixState* shared_state =
+        shared ? &shared_prefix_states[index] : nullptr;
+    const SequenceKVBundle* kv =
+        sequence != nullptr ? (sequence->kv ? &*sequence->kv : nullptr)
+                            : (shared_state->kv ? &*shared_state->kv : nullptr);
+    if (kv == nullptr || !text_kv_addresses || !text_kv_pages) { return false; }
     // Pre-screen every Device page under exactly the conditions prepare_pressure_work re-checks,
     // so its latching "replica changed" throw stays unreachable: one unmovable page (writer,
     // source pin, active reference) declines the whole candidate instead of half-spilling it.
@@ -7528,10 +7626,10 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index) {
         }
         return true;
     };
-    if (!spillable(*text_kv_addresses, *text_kv_pages, sequence.kv->text) ||
-        (sequence.kv->backend != std::nullopt &&
+    if (!spillable(*text_kv_addresses, *text_kv_pages, kv->text) ||
+        (kv->backend != std::nullopt &&
          (backend_kv_addresses == nullptr || backend_kv_pages == nullptr ||
-          !spillable(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend)))) {
+          !spillable(*backend_kv_addresses, *backend_kv_pages, *kv->backend)))) {
         std::fprintf(stderr, "[ladder] spill declined slot=%u stage=prescreen\n", index);
         std::fflush(stderr);
         return false;
@@ -7542,11 +7640,12 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index) {
     // transaction - so the ladder can run it at reserve time like the state demote does.
     MaterializationTransaction::PressureWork work;
     work.continuation_index      = index;
-    work.continuation_generation = continuation_slots[index].generation;
-    work.shared_owner            = false;
-    work.option.shared_owner     = false;
-    work.option.id               = 1;
-    std::uint32_t moved_pages    = 0;
+    work.continuation_generation =
+        shared ? shared_prefix_slots[index].generation : continuation_slots[index].generation;
+    work.shared_owner        = shared;
+    work.option.shared_owner = shared;
+    work.option.id           = 1;
+    std::uint32_t moved_pages = 0;
     const auto build_runs        = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
                                        KVAddressSpaceHandle address,
                                        std::vector<qwen3_6::detail::PressureKVDecision>& changes,
@@ -7583,11 +7682,11 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index) {
             begin = end;
         }
     };
-    build_runs(*text_kv_addresses, *text_kv_pages, sequence.kv->text, work.option.main_kv_changes,
+    build_runs(*text_kv_addresses, *text_kv_pages, kv->text, work.option.main_kv_changes,
                work.main_kv_changes);
-    if (sequence.kv->backend != std::nullopt && backend_kv_addresses != nullptr &&
+    if (kv->backend != std::nullopt && backend_kv_addresses != nullptr &&
         backend_kv_pages != nullptr) {
-        build_runs(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend,
+        build_runs(*backend_kv_addresses, *backend_kv_pages, *kv->backend,
                    work.option.backend_kv_changes, work.backend_kv_changes);
     }
     if (work.option.main_kv_changes.empty() && work.option.backend_kv_changes.empty()) {
@@ -7596,33 +7695,179 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index) {
         std::fflush(stderr);
         return false;
     }
+    std::uint32_t fund_pages = 0;
+    bool fund_can             = false;
+    bool fund_ok              = false;
+    const auto cleanup_partial = [&]() {
+        if (work.submitted && device.transfer_stream != nullptr) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
+        }
+        abort_pressure_work(work);
+    };
+    const auto decline = [&](const char* stage) {
+        std::fprintf(stderr, "[ladder] spill declined %s slot=%u stage=%s\n",
+                     shared ? "shared" : "", index, stage);
+        std::fflush(stderr);
+        return false;
+    };
     try {
         prepare_pressure_work(work, runtime::ContextResourceClass::MainKV);
         if (!work.option.backend_kv_changes.empty()) {
             prepare_pressure_work(work, runtime::ContextResourceClass::BackendKV);
         }
     } catch (const std::exception&) {
-        // A page flipped between the pre-screen and prepare, or the Host arena refused the
-        // landing: unwind whatever staged (copies first, then reservations) and decline - the
-        // candidate is skipped, the engine is never latched.
-        if (work.submitted && device.transfer_stream != nullptr) {
-            (void)cudaStreamSynchronize(device.transfer_stream);
+        fund_pages = 0;
+        fund_can   = false;
+        fund_ok    = false;
+        // Most likely the Host arena refused the landing (host KV full). Self-fund it: this
+        // owner disappears entirely moments later (the teardown that requested the spill), so
+        // ITS OWN exclusive Host pages are room that comes back anyway - release them (R2,
+        // zero net loss: the teardown would have destroyed them regardless) and retry once.
+        // Anything else - a page that flipped, a foreign pin - declines as before; the engine
+        // is never latched.
+        cleanup_partial();
+        const auto fund_once = [&]() -> bool {
+            if (!host_kv_extents || kv == nullptr) { return false; }
+            // Per store: a logical handle only means anything to ITS LogicalKVPageStore, so the
+            // Text and Backend collects stay separate all the way through can/release.
+            const auto collect = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                     KVAddressSpaceHandle address,
+                                     std::vector<LogicalKVPageHandle>& out) {
+                if (!addresses.valid(address)) { return; }
+                const std::uint32_t mapped = addresses.mapped_pages(address);
+                for (std::uint32_t page = 0; page < mapped; ++page) {
+                    const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+                    if (!pages.host_resident(logical)) { continue; }
+                    if (pages.writer_references(logical) != 0 ||
+                        pages.source_pins(logical) != 0 ||
+                        addresses.has_active_reference(logical)) {
+                        continue;
+                    }
+                    if (pages.address_references(logical) > 1) { continue; } // frees nothing
+                    out.push_back(logical);
+                }
+            };
+            std::vector<LogicalKVPageHandle> own_text;
+            collect(*text_kv_addresses, *text_kv_pages, kv->text, own_text);
+            bool funded = false;
+            // Diagnostics for the decline line: HOW the self-fund failed (no exclusive Host
+            // page to reclaim vs. a pin/refusal) is the difference between "host is full of
+            // shared pages" and "the victim is still referenced" - two different next steps.
+            fund_pages = static_cast<std::uint32_t>(own_text.size());
+            if (!own_text.empty() &&
+                host_kv_extents->can_release_page_replicas(*text_kv_pages, own_text)) {
+                fund_can = true;
+                funded = host_kv_extents->release_page_replicas(*text_kv_pages, own_text);
+                fund_ok = funded;
+            }
+            if (kv->backend != std::nullopt && backend_kv_addresses != nullptr &&
+                backend_kv_pages != nullptr) {
+                std::vector<LogicalKVPageHandle> own_backend;
+                collect(*backend_kv_addresses, *backend_kv_pages, *kv->backend, own_backend);
+                if (!own_backend.empty() &&
+                    host_kv_extents->can_release_page_replicas(*backend_kv_pages, own_backend)) {
+                    funded = host_kv_extents->release_page_replicas(*backend_kv_pages,
+                                                                    own_backend) ||
+                             funded;
+                }
+            }
+            return funded;
+        };
+        if (!fund_once()) {
+            std::fprintf(stderr,
+                         "[ladder] spill declined %s slot=%u stage=prepare fund_pages=%u"
+                         " fund_can=%d fund_ok=%d\n",
+                         shared ? "shared" : "", index, fund_pages, fund_can ? 1 : 0,
+                         fund_ok ? 1 : 0);
+            std::fflush(stderr);
+            return false;
         }
-        abort_pressure_work(work);
-        std::fprintf(stderr, "[ladder] spill declined slot=%u stage=prepare\n", index);
-        std::fflush(stderr);
-        return false;
+        try {
+            prepare_pressure_work(work, runtime::ContextResourceClass::MainKV);
+            if (!work.option.backend_kv_changes.empty()) {
+                prepare_pressure_work(work, runtime::ContextResourceClass::BackendKV);
+            }
+        } catch (const std::exception&) {
+            cleanup_partial();
+            return decline("prepare-retry");
+        }
     }
     if (device.transfer_stream != nullptr) {
         (void)cudaStreamSynchronize(device.transfer_stream);
     }
     publish_pressure_work(work);
     std::fprintf(stderr,
-                 "[ladder] spill continuation slot=%u kv pages=%u Device->Host (#12 先搬后释: "
+                 "[ladder] spill %s slot=%u kv pages=%u Device->Host (#12 先搬后释: "
                  "moved first, the Host-side release may follow)\n",
-                 index, moved_pages);
+                 shared ? "shared" : "continuation", index, moved_pages);
     std::fflush(stderr);
     return true;
+}
+
+void ProgramImplCore::prepare_victim_teardown(std::uint32_t index) {
+    if (index >= continuation_capacity || !state_store) { return; }
+    const SequenceState& sequence = continuation_states[index];
+    // §三 R1 before the R2 teardown: move what may not be destroyed in place. The KV spill is
+    // pre-screened (declines instead of latching); state images only lose a redundant Device
+    // replica for free or demote when a Host slot allows - anything left is what the
+    // [invariant1] probe inside the strict release records as residue.
+    (void)spill_owner_device_kv_to_host(index);
+    const auto move_state = [&](StateImageHandle handle) {
+        if (!handle.valid() || !state_store->valid(handle)) { return; }
+        if (release_protected_state && *release_protected_state == handle) { return; }
+        const StateReplicaResidency residency = state_store->residency(handle);
+        if (residency == StateReplicaResidency::Both) {
+            (void)state_store->drop_device_replica(handle);
+            return;
+        }
+        if (residency != StateReplicaResidency::DeviceOnly) { return; }
+        std::optional<StateImageTransfer> transfer =
+            state_store->begin_device_to_host(handle, device.transfer_stream);
+        if (!transfer && state_store->host_free() == 0 && degrade_idle_owner_host_state()) {
+            // The Host state pool is the wall this step exists for: free ONE slot the same way
+            // the ladder does (degrade the least-important idle owner's HostOnly checkpoint),
+            // then the demotion lands. Frees MORE Host room than planned, which only ever helps
+            // a sealed target - never under-delivers it.
+            std::optional<StateImageTransfer> second =
+                state_store->begin_device_to_host(handle, device.transfer_stream);
+            if (second) { transfer.emplace(std::move(*second)); }
+        }
+        if (!transfer) { return; } // leave it; the probe counts the residue
+        if (device.transfer_stream != nullptr) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
+        }
+        state_store->publish_transfer(std::move(*transfer), false);
+    };
+    if (sequence.endpoint_valid) {
+        move_state(sequence.state.read);
+        if (sequence.state.write != sequence.state.read) { move_state(sequence.state.write); }
+    }
+    if (sequence.rewrite_state) { move_state(*sequence.rewrite_state); }
+    for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) {
+        move_state(anchor.state);
+    }
+}
+
+void ProgramImplCore::prepare_shared_victim_teardown(std::uint32_t index) {
+    if (index >= shared_prefix_capacity || !state_store) { return; }
+    const SharedPrefixState& shared = shared_prefix_states[index];
+    (void)spill_owner_device_kv_to_host(index, /*shared=*/true);
+    const StateImageHandle handle = shared.state;
+    if (!state_store->valid(handle)) { return; }
+    if (release_protected_state && *release_protected_state == handle) { return; }
+    const StateReplicaResidency residency = state_store->residency(handle);
+    if (residency == StateReplicaResidency::Both) {
+        (void)state_store->drop_device_replica(handle);
+        return;
+    }
+    if (residency != StateReplicaResidency::DeviceOnly) { return; }
+    std::optional<StateImageTransfer> transfer =
+        state_store->begin_device_to_host(handle, device.transfer_stream);
+    if (!transfer) { return; }
+    if (device.transfer_stream != nullptr) {
+        (void)cudaStreamSynchronize(device.transfer_stream);
+    }
+    state_store->publish_transfer(std::move(*transfer), false);
 }
 
 bool ProgramImplCore::can_release_continuation_slot_strict(std::uint32_t index) const {
@@ -10152,6 +10397,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     shared_prefix_states[index].active_references != 0) {
                     throw std::logic_error("capture shared pressure victim changed before release");
                 }
+                prepare_shared_victim_teardown(index); // §三 R1: move first
                 const detail::PhysicalResources exclusive =
                     owner_exclusive_resources(shared_prefix_states[index]);
                 if (!can_release_shared_prefix_state(index, SharedPrefixSlotRole::Catalogued)) {
@@ -10200,6 +10446,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                 if (!can_release_continuation_slot_strict(index)) {
                     throw std::logic_error("capture private victim is not strictly releasable");
                 }
+                prepare_victim_teardown(index); // §三 R1: move first
                 const detail::PhysicalResources exclusive =
                     owner_exclusive_resources(continuation_states[index]);
                 release_continuation_slot_strict(index);
@@ -11169,6 +11416,20 @@ ProgramImplCore::release_shared_prefix_state_strict(std::uint32_t index,
         SharedPrefixState& shared               = shared_prefix_states[index];
         SharedPrefixSlot& slot                  = shared_prefix_slots[index];
         const detail::PhysicalResources removed = owner_exclusive_resources(shared);
+        // §四 invariant 1 / §七判据 #3: the shared teardown reports its Device footprint too, so
+        // the counter sees every cache-path Device destruction - private or shared.
+        {
+            const std::uint32_t device_kv =
+                removed.device.main_kv_pages + removed.device.backend_kv_pages;
+            if (device_kv != 0 || removed.device.state_slots != 0) {
+                std::fprintf(stderr,
+                             "[invariant1] strict-shared slot=%u destroys Device data:"
+                             " kv=%u pages state=%u slots (R1 says move it; R2 may only"
+                             " delete Host)\n",
+                             index, device_kv, removed.device.state_slots);
+                std::fflush(stderr);
+            }
+        }
         const bool last_state_reference = state_store->checkpoint_references(shared.state) == 1;
         if (shared.kv->backend) {
             if (!backend_kv_addresses->release(*shared.kv->backend)) {

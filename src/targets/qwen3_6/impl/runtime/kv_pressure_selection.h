@@ -249,11 +249,12 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
                 ++demote_ok;
             }
             std::fprintf(stderr,
-                         "[spill] short by %u page(s): mapped=%u taken=%u not_device=%u"
+                         "[spill] short by %u page(s) of requested=%u (UINT32_MAX = full"
+                         " endpoint): mapped=%u taken=%u not_device=%u"
                          " writers=%u pins=%u active=%u protected=%u host_resident=%u"
                          " demote_ok=%u\n",
-                         device_remaining, mapped, taken, not_device, writers, pins, active,
-                         protected_pages, host_resident, demote_ok);
+                         device_remaining, requested_device_pages, mapped, taken, not_device,
+                         writers, pins, active, protected_pages, host_resident, demote_ok);
             std::fflush(stderr);
         }
     }
