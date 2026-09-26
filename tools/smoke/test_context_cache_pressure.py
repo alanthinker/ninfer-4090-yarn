@@ -116,7 +116,9 @@ def summarize_log(path: str, mark: int):
         print(f"  (log not readable: {error})")
         return
     evictions = [line for line in lines if "[evict] slot=" in line]
-    exhaust = [line for line in lines if line.startswith("[exhaust]")]
+    # `[exhaust]` was the ladder's destructive retire; since 缓存模块v2.md §10.4 the cache-
+    # losing ladder step logs `[ladder] degrade` (one HostOnly checkpoint, owner retained).
+    exhaust = [line for line in lines if line.startswith("[ladder] degrade")]
     errors = [line for line in lines if "HTTP 500" in line or "HTTP 503" in line]
 
     def peak(pattern: str):
@@ -130,7 +132,7 @@ def summarize_log(path: str, mark: int):
     print(f"  peak device state    : {peak(r'device_state=(\d+)/')}/{max((int(v) for v in device), default=0)}")
     print(f"  peak host KV         : {peak(r'host_kv=(\d+)MiB')} MiB")
     print(f"  peak anchors held    : {peak(r'anchors=(\d+)')}")
-    print(f"  exhaustion drops     : {len(exhaust)}")
+    print(f"  ladder degrade steps : {len(exhaust)}")
     print(f"  HTTP 500/503 lines   : {len(errors)}")
 
 

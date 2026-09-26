@@ -149,7 +149,7 @@ def main() -> int:
             break
     window = read_log()[len(log_before):]
     evictions = [line for line in window.splitlines() if line.startswith("[evict] slot=")]
-    fallbacks = [line for line in window.splitlines() if line.startswith("[exhaust]")]
+    fallbacks = [line for line in window.splitlines() if line.startswith("[ladder] degrade")]
     print(f"  retirements during the flood: {len(evictions)}")
     for line in evictions[-4:]:
         print("   ", line[:140])

@@ -319,7 +319,7 @@ echo "== phase 3: pressure/eviction-sensitive tests (pool is FULL) =="
 # state_index FIRST: its invariant is idle-retention (build, wait5s, switch back hits), and its
 # conversations must PUBLISH checkpoints to exist at all. At gate time the host state pool still
 # holds only the fill's sessions (room to publish; the pool is full either way); run it after the
-# other suites and the pool is already at its ceiling with [exhaust] drop churn, so fresh
+# other suites and the pool is already at its ceiling with [ladder] degrade churn, so fresh
 # checkpoints miss publication and the all-hit expectation measures someone else's pool pressure.
 # (The catalog is 128 and never binds - it was 16 when this ordering was written.)
 # conversations=verify=4 keeps every conversation inside the4 fair-share buckets (and avoids
