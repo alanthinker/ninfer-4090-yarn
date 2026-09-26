@@ -191,6 +191,47 @@ void case_shell_pass_defers_to_move() {
     check(action_count(outcome, Action::DropFromHost) == 0, "and not dropped");
 }
 
+// EXACT soak numbers (from the production gap line): the plan must take at least the
+// Host-state step the pool clearly allows - if this yields steps=0 the loop itself is broken.
+void case_soak_exact_numbers() {
+    std::printf("case_soak_exact_numbers\n");
+    TierOccupancy occ;
+    occ.device_kv_used = 1024;
+    occ.device_kv_capacity = 1024;
+    occ.device_state_used = 8;
+    occ.device_state_capacity = 8;
+    occ.device_backend_kv_used = 0;
+    occ.device_backend_kv_capacity = 0;
+    occ.host_kv_used = 1354760192;
+    occ.host_kv_capacity = 12884901888;
+    occ.host_state_used = 48;
+    occ.host_state_capacity = 48;
+    occ.catalog_rows_vacant = 116;
+    const Demand need{.device_kv = 70,
+                      .device_backend_kv = 0,
+                      .device_state = 1,
+                      .host_kv = 293601280,
+                      .host_state = 1,
+                      .catalog_rows = 0};
+    const std::vector<Datum> pool{
+        {.id = 0, .device_kv = 134, .evict_device_kv = 11, .host_state = 2, .importance = 10},
+        {.id = 1, .device_kv = 49, .evict_device_kv = 11, .host_state = 4, .importance = 20},
+        {.id = 2,
+         .device_kv = 49,
+         .evict_device_kv = 11,
+         .evict_device_state = 1, // production's ev_state=8: the ONLY route for the dstate gap
+         .host_state = 9,
+         .importance = 30},
+        {.id = 3, .device_kv = 11, .evict_device_kv = 11, .host_state = 2, .importance = 40},
+    };
+    const Plan outcome = decide(need, occ, pool);
+    if (outcome.steps.empty() && !outcome.enqueue) {
+        std::printf("  (no steps, no enqueue)\n");
+    }
+    check(outcome.steps.size() >= 1,
+          "the pool plainly allows a step (Host-state gap + droppable state) - steps>=1");
+}
+
 void case_device_short_host_roomy() {
     std::printf("case device_short_host_roomy\n");
     const std::vector<Datum> pool{
@@ -542,6 +583,7 @@ int main() {
     case_backend_pool_closes_independently();
     case_shell_group_release_closes_device_gap();
     case_shell_pass_defers_to_move();
+    case_soak_exact_numbers();
     case_device_short_host_roomy();
     case_host_room_reserved_for_spill();
     case_nothing_spillable_enqueues_without_dropping();

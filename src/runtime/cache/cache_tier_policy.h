@@ -245,11 +245,17 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
     // pages NO option may touch (orphan tails beyond every retained prefix) has no move relief
     // at all - only then does a whole release shed Device pages (rig req34: Device free=0,
     // Host12.7 GB free, zero move options, steps=0, device-not-closable forever).
-    const bool spill_capable =
+    // Per axis, not all-or-nothing: a pool that can MOVE main KV may still have nobody able
+    // to MOVE Device state - gating every axis on one flag blocked the only remaining route
+    // (soak: mv_state=0, ev_state=8, dstate gap1 -> nothing could ever close it and the whole
+    // plan enqueued). Each axis falls back to release exactly when THAT axis has no mover.
+    const bool spill_capable_kv =
         std::any_of(candidates.begin(), candidates.end(), [](const Datum* datum) {
-            return datum->device_kv > 0 || datum->device_backend_kv > 0 ||
-                   datum->device_state > 0;
+            return datum->device_kv > 0 || datum->device_backend_kv > 0;
         });
+    const bool spill_capable_state =
+        std::any_of(candidates.begin(), candidates.end(),
+                    [](const Datum* datum) { return datum->device_state > 0; });
     std::vector<std::uint64_t> dropped;
     dropped.reserve(candidates.size());
     std::uint64_t host_kv_freed        = 0;
@@ -277,13 +283,13 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
         // prelude moves what is moveable, the tail goes with its owner (rig req34: Device
         // free=0 with12.7 GB Host free, steps=0, device-not-closable).
         const bool helps_device_kv =
-            !spill_capable && released_device_kv < device_kv_gap &&
+            !spill_capable_kv && released_device_kv < device_kv_gap &&
             (datum->evict_device_kv > 0 || datum->device_kv > 0);
         const bool helps_device_backend =
-            !spill_capable && released_device_backend < device_backend_gap &&
+            !spill_capable_kv && released_device_backend < device_backend_gap &&
             (datum->evict_device_backend_kv > 0 || datum->device_backend_kv > 0);
         const bool helps_device_state =
-            !spill_capable && released_device_state < device_state_gap &&
+            !spill_capable_state && released_device_state < device_state_gap &&
             (datum->evict_device_state > 0 || datum->device_state > 0);
         if (!helps_kv && !helps_state && !helps_rows && !helps_device_kv &&
             !helps_device_backend && !helps_device_state) {
@@ -449,7 +455,23 @@ inline std::string describe(const Plan& outcome, const Demand& need,
         std::to_string(occupancy.host_state_free()) + " rows=" +
         std::to_string(occupancy.catalog_rows_vacant) + " | cand=" +
         std::to_string(candidates) + " steps=" +
-        std::to_string(outcome.steps.size());
+        std::to_string(outcome.steps.size()) +
+        " | gaps dkv=" +
+        std::to_string(need.device_kv > occupancy.device_kv_free()
+                           ? need.device_kv - occupancy.device_kv_free()
+                           : 0) +
+        " dstate=" +
+        std::to_string(need.device_state > occupancy.device_state_free()
+                           ? need.device_state - occupancy.device_state_free()
+                           : 0) +
+        " hkv=" +
+        std::to_string(need.host_kv > occupancy.host_kv_free()
+                           ? need.host_kv - occupancy.host_kv_free()
+                           : 0) +
+        " hstate=" +
+        std::to_string(need.host_state > occupancy.host_state_free()
+                           ? need.host_state - occupancy.host_state_free()
+                           : 0);
     if (outcome.enqueue) {
         line += " enqueue reason=";
         line += reason_name(outcome.reason);
