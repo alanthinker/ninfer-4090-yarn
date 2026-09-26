@@ -230,6 +230,17 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
     // that was already released would fail prepare and latch the engine. A conversation is
     // only taken when it answers a gap that is still open (§ invariant 3); the last one may
     // still free more than the gap, because a conversation cannot be dropped halfway.
+    // Spill first, release only when the spill route does not exist: a Device gap with ANY
+    // move relief in the pool must be answered by moving (never by deleting Host cache - the
+    // contract case_device_short_host_roomy asserts exactly that), but a Device pool whose
+    // pages NO option may touch (orphan tails beyond every retained prefix) has no move relief
+    // at all - only then does a whole release shed Device pages (rig req34: Device free=0,
+    // Host12.7 GB free, zero move options, steps=0, device-not-closable forever).
+    const bool spill_capable =
+        std::any_of(candidates.begin(), candidates.end(), [](const Datum* datum) {
+            return datum->device_kv > 0 || datum->device_backend_kv > 0 ||
+                   datum->device_state > 0;
+        });
     std::vector<std::uint64_t> dropped;
     dropped.reserve(candidates.size());
     std::uint64_t host_kv_freed        = 0;
@@ -240,7 +251,10 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
     std::uint64_t released_device_state   = 0;
     for (const Datum* datum : candidates) {
         if (host_kv_freed >= host_kv_gap && host_state_freed >= host_state_gap &&
-            rows_freed >= rows_gap) {
+            rows_freed >= rows_gap &&
+            released_device_kv >= device_kv_gap &&
+            released_device_backend >= device_backend_gap &&
+            released_device_state >= device_state_gap) {
             break;
         }
         const bool helps_kv =
@@ -248,7 +262,24 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
         const bool helps_state =
             host_state_freed < host_state_gap && datum->host_state > 0;
         const bool helps_rows = rows_freed < rows_gap && datum->catalog_row > 0;
-        if (!helps_kv && !helps_state && !helps_rows) { continue; }
+        // A PURE Device gap also enters here: when the Device pool is full of pages no spill
+        // may touch (orphan tails beyond every retained prefix) while Host has room, only a
+        // whole-conversation release sheds Device pages - the spill loop below cannot. The
+        // prelude moves what is moveable, the tail goes with its owner (rig req34: Device
+        // free=0 with12.7 GB Host free, steps=0, device-not-closable).
+        const bool helps_device_kv =
+            !spill_capable && released_device_kv < device_kv_gap &&
+            (datum->evict_device_kv > 0 || datum->device_kv > 0);
+        const bool helps_device_backend =
+            !spill_capable && released_device_backend < device_backend_gap &&
+            (datum->evict_device_backend_kv > 0 || datum->device_backend_kv > 0);
+        const bool helps_device_state =
+            !spill_capable && released_device_state < device_state_gap &&
+            (datum->evict_device_state > 0 || datum->device_state > 0);
+        if (!helps_kv && !helps_state && !helps_rows && !helps_device_kv &&
+            !helps_device_backend && !helps_device_state) {
+            continue;
+        }
         dropped.push_back(datum->id);
         host_kv_freed += datum->host_kv;
         host_state_freed += datum->host_state;
