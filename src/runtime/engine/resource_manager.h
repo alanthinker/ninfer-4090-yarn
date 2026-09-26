@@ -433,11 +433,20 @@ public:
         if (!destination) { return {.readiness = Readiness::TemporarilyBlocked}; }
 
         const typename Planner::Clock::time_point planning_started = Planner::Clock::now();
-        rebuild_prefix_index();
-        // Before reuse matching and before plan_materialization: see reconcile_catalog. A stale
-        // cell blocks the publication-slot scan that decides whether a plan without an eviction
-        // can exist at all.
+        // Reconcile BEFORE rebuilding the shortlist index: the index is DERIVED from the catalog
+        // summaries (`rebuild_prefix_index` reads endpoint/rewrite/long_anchors), so building it
+        // first leaves it one request behind every cell this pass is about to correct - and a stale
+        // cell is exactly what the reconcile exists for (the ladder degrades an idle owner's
+        // checkpoint inside the Program with no engine-side publication). An owner can therefore
+        // hold 8 long anchors while its cell still says 0; reuse matching reads the INDEX, so that
+        // owner was invisible to matching: the important-session battery step (one deep
+        // conversation after a flood) reused only a 5 076-token shared prefix instead of its own
+        // 20 166-token turn closure (rig 2026-09-26: index entry `endpoint frontier=20178
+        // anchors=0` for an owner whose /slots listed 9 checkpoints).
+        // The reconcile still precedes reuse matching and plan_materialization: a stale cell blocks
+        // the publication-slot scan that decides whether a plan without an eviction can exist.
         reconcile_catalog(program);
+        rebuild_prefix_index();
         log_reuse_diagnostics(base);
         PrefixDemandRecord provisional_demand;
         provisional_demand.domain =
@@ -2401,9 +2410,12 @@ private:
                 ++accepted;
             }
             if (!verdict.starts_with("CANDIDATE")) { ++rejected; }
-            std::fprintf(stderr, "reuse-diag:   %-8s frontier=%-7u shared=%d%s %s\n", kind,
-                         index.key.frontier, index.shared ? 1 : 0, detail.c_str(),
-                         verdict.c_str());
+            // The owning cell is part of the line: without it a rejected candidate proves only
+            // that SOME entry mismatched, never WHICH owner lost its deep checkpoint (a deep
+            // conversation whose cell went stale looked identical to a foreign prompt).
+            std::fprintf(stderr, "reuse-diag:   %-8s slot=%-4u frontier=%-7u shared=%d%s %s\n",
+                         kind, index.slot, index.key.frontier, index.shared ? 1 : 0,
+                         detail.c_str(), verdict.c_str());
         }
         std::fprintf(stderr, "reuse-diag: candidates=%d rejected=%d\n", accepted, rejected);
         std::fflush(stderr);

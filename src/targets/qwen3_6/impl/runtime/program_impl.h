@@ -3964,8 +3964,15 @@ bool ProgramImplCore::compose_pressure_candidate(
             append_host_releases(addresses, pages, address, action);
             if (action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
                 host_layouts.push_back(plan_host_kv_page_layout(pages.physical_pool().geometry()));
-                host_requests.push_back(
-                    {.layout = &host_layouts.back(), .pages = action.page_count});
+                // `max_run_pages` makes the pre-check answer the SAME question execution answers:
+                // "can this landing be served as runs of at most this many pages", not "is there
+                // one free extent big enough". The arena is fragmented at page granularity once
+                // cached owners have been dropped and re-spilled a few times, and the old
+                // whole-action request turned that into `blocked_host` -> Infeasible -> R0 park
+                // while GiB sat free (rig: 488-page landing, 2.58 GiB free, refused as one block).
+                host_requests.push_back({.layout        = &host_layouts.back(),
+                                         .pages         = action.page_count,
+                                         .max_run_pages = kHostLandingRunPages});
             }
         }
     };
@@ -5878,21 +5885,20 @@ void ProgramImplCore::prepare_pressure_bookkeeping(MaterializationTransaction::P
             std::span<const qwen3_6::detail::PressureKVDecision> actions,
             std::vector<MaterializationTransaction::PressureWork::KVChangeWork>& changes) {
             changes.reserve(actions.size());
-            constexpr std::uint32_t kMaxLandingPages = 16;
+            // One change = ONE prepare = ONE contiguous Host extent, so the run size is ASKED of
+            // the arena before every run instead of being a fixed page cap. A fixed 16-page ask is
+            // itself a feasibility requirement, and the plan then dies of `blocked_host` while GiB
+            // sit free (rig: a488-page landing against2.58 GiB free refused as ONE2.00 GiB block,
+            // then `search produced no incumbent` -> R0 park -> HTTP503). Fragmentation may cost
+            // copy runs; it may never cost the request (`缓存模块v2.md` §三 R2).
+            const auto next_run_pages = [&](std::uint32_t remaining) -> std::uint32_t {
+                if (host_kv_extents == nullptr) {
+                    return std::min(remaining, kHostLandingRunPages);
+                }
+                return host_kv_extents->landing_run_pages(*pages, remaining);
+            };
             for (std::size_t action_i = 0; action_i < actions.size(); ++action_i) {
                 const qwen3_6::detail::PressureKVDecision& action = actions[action_i];
-                // One change = ONE prepare = ONE contiguous Host extent: a458-page run asked the
-                // arena for a single1.83 GiB contiguous block while2.65 GiB sat free in pieces,
-                // and the refusal surfaced as blocked_host -> assessment reject -> R0 park
-                // (forensics: arena refused, suballoc entries=0). Chunk the landing: each
-                // <=16-page change needs its own modest extent, and the work's change vector
-                // already supports N of them (same pages, same order, same effect - only the
-                // physical layout of the copy changes).
-                const std::uint32_t chunk_count =
-                    (action.page_count + kMaxLandingPages - 1U) / kMaxLandingPages;
-                for (std::uint32_t chunk = 0; chunk < chunk_count; ++chunk) {
-                changes.emplace_back();
-                MaterializationTransaction::PressureWork::KVChangeWork& change = changes.back();
                 if (action.kind == qwen3_6::detail::PressureKVDecisionKind::None) {
                     throw std::logic_error("pressure KV action has no operation kind");
                 }
@@ -5904,17 +5910,21 @@ void ProgramImplCore::prepare_pressure_bookkeeping(MaterializationTransaction::P
                     action.page_count > mapped - action.begin_page) {
                     throw std::logic_error("pressure KV action range is invalid");
                 }
-                const std::uint32_t run_begin =
-                    action.begin_page + chunk * kMaxLandingPages;
-                const std::uint32_t run_count =
-                    std::min(kMaxLandingPages, action.page_count - chunk * kMaxLandingPages);
+                const bool lands_on_host =
+                    action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost;
+                std::uint32_t run_offset = 0;
+                while (run_offset < action.page_count) {
+                const std::uint32_t run_begin = action.begin_page + run_offset;
+                const std::uint32_t run_count = next_run_pages(action.page_count - run_offset);
+                changes.emplace_back();
+                MaterializationTransaction::PressureWork::KVChangeWork& change = changes.back();
                 change.action_index  = static_cast<std::uint32_t>(action_i);
-                change.action_offset = chunk * kMaxLandingPages;
+                change.action_offset = run_offset;
                 change.pages.reserve(run_count);
                 for (std::uint32_t offset = 0; offset < run_count; ++offset) {
                     change.pages.push_back(addresses->logical_page(*address, run_begin + offset));
                 }
-                if (action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
+                if (lands_on_host) {
                     change.sources.resize(run_count);
                 }
                 // Baseline for the prepare-time verdict below: this runs when the committed plan
@@ -5941,7 +5951,8 @@ void ProgramImplCore::prepare_pressure_bookkeeping(MaterializationTransaction::P
                                  run_begin, run_count, dev_off, host_on, writers, pins, active);
                     std::fflush(stderr);
                 }
-                } // kMaxLandingPages chunks
+                run_offset += run_count;
+                } // landing runs
             }
         };
     prepare(text_kv_addresses.get(), text_kv_pages.get(), kv->text, work.option.main_kv_changes,
@@ -7519,6 +7530,12 @@ bool ProgramImplCore::degrade_idle_owner_host_state() {
         // The endpoint last (largest truncation window): legal exactly when another checkpoint
         // survives it - the primitive reports "no retained requirement" otherwise, so an
         // endpoint-only owner is never reduced to nothing here.
+        // The owner's TURN CLOSURE is deliberately NOT on this list. It is the frontier a later
+        // request of the same conversation resumes from, so dropping it destroys exactly the reuse
+        // this step is supposed to protect: adding it made `prefix_switch` / `prefix_mixed` fail in
+        // the battery's churned pool (rig 2026-09-26: both red with the closure droppable, both
+        // green without it, same build otherwise). A conversation's cheap components are its
+        // ANCHORS, which is why the walk above is anchor-first and depth-ascending.
         const qwen3_6::ContinuationSummary summary = continuation_summary(sequence);
         if (summary.endpoint && sequence.endpoint_valid) {
             if (try_drop(sequence.state.read, summary.endpoint->ref)) { return true; }
@@ -7786,10 +7803,18 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool sh
         };
         const std::uint32_t mapped = addresses.mapped_pages(address);
         std::uint32_t begin        = 0;
-        // Chunk cap shared with prepare_pressure_bookkeeping: one change = one prepare = ONE
-        // contiguous Host extent, and a458-page run asks for a single1.83 GiB block that a
-        // fragmented arena cannot produce even with2.65 GiB free.
-        constexpr std::uint32_t kMaxLandingPages = 16;
+        // Chunk cap shared with prepare_pressure_bookkeeping (kHostLandingRunPages): one change =
+        // one prepare = ONE contiguous Host extent. The cap is a transfer-efficiency bound, not a
+        // feasibility one - this runs in the CopyPreparation phase, AFTER the HostReleases phase
+        // has returned the planned Host replicas to the arena, so every run asks for what the
+        // arena can hand out right now (down to a single page when the free space is cut fine).
+        // A fixed 16-page ask that the arena cannot serve is how a landing dies with GiB free.
+        const auto next_run_pages = [&](std::uint32_t remaining) -> std::uint32_t {
+            if (host_kv_extents == nullptr) {
+                return std::min(remaining, kHostLandingRunPages);
+            }
+            return host_kv_extents->landing_run_pages(pages, remaining);
+        };
         while (begin < mapped) {
             const auto kind = kind_of(begin);
             if (kind == qwen3_6::detail::PressureKVDecisionKind::None) { ++begin; continue; }
@@ -7797,8 +7822,7 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool sh
             while (end < mapped && kind_of(end) == kind) { ++end; }
             std::uint32_t piece = begin;
             while (piece < end) {
-                const std::uint32_t count =
-                    std::min<std::uint32_t>(kMaxLandingPages, end - piece);
+                const std::uint32_t count = next_run_pages(end - piece);
                 changes.push_back(qwen3_6::detail::PressureKVDecision{
                     .begin_page = piece,
                     .page_count = count,

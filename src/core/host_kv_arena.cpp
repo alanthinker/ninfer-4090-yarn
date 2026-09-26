@@ -276,6 +276,16 @@ bool HostKVArena::can_allocate(const HostKVPageLayout& layout, std::uint32_t pag
     return find_free_extent(layout.page_stride * static_cast<std::size_t>(pages)).has_value();
 }
 
+std::uint32_t HostKVArena::largest_free_run_pages(const HostKVPageLayout& layout) const noexcept {
+    if (!find_layout(layout) || layout.page_stride == 0) { return 0; }
+    std::size_t largest = 0;
+    for (const FreeExtent& free : free_extents_) { largest = std::max(largest, free.bytes); }
+    const std::size_t pages = largest / layout.page_stride;
+    return pages > std::numeric_limits<std::uint32_t>::max()
+               ? std::numeric_limits<std::uint32_t>::max()
+               : static_cast<std::uint32_t>(pages);
+}
+
 std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& layout,
                                                       std::uint32_t pages) noexcept {
     const std::optional<std::uint32_t> layout_index = find_layout(layout);
@@ -438,7 +448,12 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
     }
 
     std::size_t available_descriptors = free_descriptors_.size();
-    std::size_t required_descriptors  = target_allocations.size();
+    // One descriptor per CONTIGUOUS request; a bounded-run request needs one per run, and how
+    // many runs it needs depends on the free list, so that count is taken in the loop below.
+    std::size_t required_descriptors = 0;
+    for (const HostKVAllocationRequest& request : target_allocations) {
+        if (request.max_run_pages == 0) { ++required_descriptors; }
+    }
     for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
         const HostKVAllocationHandle allocation = proposed_releases[index].allocation;
         bool first                              = true;
@@ -472,6 +487,7 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
         }
     }
     if (required_descriptors > available_descriptors) { return false; }
+    std::size_t spare_descriptors = available_descriptors - required_descriptors;
 
     for (const HostKVAllocationRequest& request : target_allocations) {
         if (request.layout == nullptr || request.pages == 0) { return false; }
@@ -480,15 +496,47 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
             request.layout->page_stride > std::numeric_limits<std::size_t>::max() / request.pages) {
             return false;
         }
-        const std::size_t bytes =
-            request.layout->page_stride * static_cast<std::size_t>(request.pages);
-        const auto extent =
-            std::find_if(simulated.begin(), simulated.end(),
-                         [&](const FreeExtent& free) { return free.bytes >= bytes; });
-        if (extent == simulated.end()) { return false; }
-        extent->offset += bytes;
-        extent->bytes -= bytes;
-        if (extent->bytes == 0) { simulated.erase(extent); }
+        const std::size_t stride = request.layout->page_stride;
+        if (request.max_run_pages == 0) {
+            if (spare_descriptors == 0) { return false; }
+            const std::size_t bytes = stride * static_cast<std::size_t>(request.pages);
+            const auto extent =
+                std::find_if(simulated.begin(), simulated.end(),
+                             [&](const FreeExtent& free) { return free.bytes >= bytes; });
+            if (extent == simulated.end()) { return false; }
+            extent->offset += bytes;
+            extent->bytes -= bytes;
+            if (extent->bytes == 0) { simulated.erase(extent); }
+            --spare_descriptors;
+            continue;
+        }
+        // Bounded-run request: take each run from the LARGEST free extent first, at most
+        // `max_run_pages` per run - the same order the execution-time chunker asks in (it reads
+        // `largest_free_run_pages` before every run). One descriptor per run, so a landing that
+        // can only be cut into single pages still fails here when descriptors, not bytes, are the
+        // binding constraint; that is the one resource fragmentation can genuinely exhaust.
+        std::uint32_t remaining = request.pages;
+        while (remaining != 0) {
+            if (spare_descriptors == 0) { return false; }
+            auto best  = simulated.end();
+            for (auto candidate = simulated.begin(); candidate != simulated.end(); ++candidate) {
+                if (best == simulated.end() || candidate->bytes > best->bytes) { best = candidate; }
+            }
+            if (best == simulated.end()) { return false; }
+            const std::size_t servable = best->bytes / stride;
+            if (servable == 0) { return false; }
+            const std::uint32_t available =
+                servable > std::numeric_limits<std::uint32_t>::max()
+                    ? std::numeric_limits<std::uint32_t>::max()
+                    : static_cast<std::uint32_t>(servable);
+            const std::uint32_t run =
+                std::min(std::min(remaining, request.max_run_pages), available);
+            best->offset += static_cast<std::size_t>(run) * stride;
+            best->bytes -= static_cast<std::size_t>(run) * stride;
+            if (best->bytes == 0) { simulated.erase(best); }
+            remaining -= run;
+            --spare_descriptors;
+        }
     }
     return true;
 }

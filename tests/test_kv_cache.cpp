@@ -411,6 +411,53 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
                            !subrelease_arena.can_allocate_after_suballocation_releases(
                                subrelease, three_page_target),
                        label + " Host suballocation release feasibility is not extent exact");
+
+    // Fragmented Host: free BYTES suffice while no single free run does. This is the production
+    // shape that parked requests in R0 (rig 2026-09-26: a488-page landing against2.58 GiB free
+    // refused as ONE2.00 GiB block -> blocked_host -> Infeasible -> queue timeout). The rule is
+    // byte based (`缓存模块v2.md` §三 R2: Host is full when it cannot RECEIVE), so a landing that
+    // may be cut into bounded runs must be served whenever its bytes fit; only a request that
+    // insists on one contiguous extent may be refused.
+    {
+        ninfer::HostKVArena fragmented(host_layout.page_stride * 4,
+                                       std::span<const ninfer::HostKVPageLayout>(layouts));
+        auto first  = fragmented.allocate(host_layout, 1);
+        auto second = fragmented.allocate(host_layout, 1);
+        auto third  = fragmented.allocate(host_layout, 1);
+        auto fourth = fragmented.allocate(host_layout, 1);
+        failures += expect(first && second && third && fourth,
+                           label + " fragmented Host fixture allocation failed");
+        failures += expect(fragmented.largest_free_run_pages(host_layout) == 0,
+                           label + " a full Host arena reported a free run");
+        first->release();
+        third->release();
+        failures += expect(fragmented.largest_free_run_pages(host_layout) == 1,
+                           label + " interrupted Host holes were not reported as one-page runs");
+        const std::array two_page_contiguous{
+            ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = 2}};
+        const std::array two_page_runs{ninfer::HostKVAllocationRequest{
+            .layout = &host_layout, .pages = 2, .max_run_pages = 1}};
+        const std::array three_page_runs{ninfer::HostKVAllocationRequest{
+            .layout = &host_layout, .pages = 3, .max_run_pages = 1}};
+        const std::array three_page_capped_runs{ninfer::HostKVAllocationRequest{
+            .layout = &host_layout, .pages = 3, .max_run_pages = 4}};
+        failures += expect(!fragmented.can_allocate_after_suballocation_releases(
+                               {}, two_page_contiguous),
+                           label + " fragmented Host served a two-page contiguous landing");
+        failures += expect(fragmented.can_allocate_after_suballocation_releases({}, two_page_runs),
+                           label + " fragmented Host refused a landing its free bytes cover");
+        failures += expect(!fragmented.can_allocate_after_suballocation_releases({},
+                                                                                three_page_runs),
+                           label + " fragmented Host served a landing larger than its free bytes");
+        failures += expect(!fragmented.can_allocate_after_suballocation_releases(
+                               {}, three_page_capped_runs),
+                           label + " a run cap widened the Host landing beyond its free bytes");
+        second->release();
+        fourth->release();
+        failures += expect(fragmented.largest_free_run_pages(host_layout) == 4 &&
+                               fragmented.free_bytes() == host_layout.page_stride * 4,
+                           label + " fully released Host arena did not coalesce into one run");
+    }
     (void)left;
     (void)tail;
     (void)blockers;

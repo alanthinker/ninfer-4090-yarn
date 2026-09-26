@@ -195,7 +195,9 @@ struct MaterializationVictimCost {
 // so value alone cannot tell a session created two seconds ago from one created two hours ago,
 // and a saturation run evicts the sessions it just published. Observed exactly that: Host KV
 // stopped accumulating at 0 MiB instead of reaching 395 MiB, and `state_index` / `prefix_switch`
-// lost their switch-back hits.
+// lost their switch-back hits. Re-measured 2026-09-26 by ordering the protected group by score
+// again: the same three suites failed in the same way with `host_kv=0.0MB` in the fill, so the
+// age magnitude is load-bearing and the value ordering lives OUTSIDE the group.
 //
 // `age_key` is "when this owner was last active", ASCENDING, so a larger key means more recent.
 // It is signed so a caller may hand over a raw steady_clock tick count.

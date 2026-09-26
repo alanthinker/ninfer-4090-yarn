@@ -153,6 +153,17 @@ private:
 struct HostKVAllocationRequest {
     const HostKVPageLayout* layout = nullptr;
     std::uint32_t pages            = 0;
+    // 0 = one contiguous extent, the historical contract.
+    //
+    // Non-zero = the request may be served as SEVERAL runs of at most this many pages, which is
+    // what the caller's execution path actually does (one Host extent per landing run). The
+    // distinction matters because the arena is fragmented at page granularity once cached owners
+    // have been released and re-spilled a few times: "is there one free extent of N pages" and
+    // "do N pages of free space exist" then give different answers, and only the second one is
+    // the rule (`缓存模块v2.md` §三 R2 -- Host is full when it has no room to RECEIVE). A one-page
+    // run is always servable while any free page exists, so a bounded-run request can be served
+    // whenever its BYTES fit; fragmentation then costs copy operations, never feasibility.
+    std::uint32_t max_run_pages = 0;
 };
 
 struct HostKVSuballocationRelease {
@@ -215,6 +226,12 @@ public:
                                     std::uint32_t pages) const noexcept;
     [[nodiscard]] std::optional<HostKVAllocation> allocate(const HostKVPageLayout& layout,
                                                            std::uint32_t pages) noexcept;
+
+    // Largest number of pages of this layout that ONE free extent could serve right now. A landing
+    // chunker asks this before every run, so each run it asks for is servable by construction; the
+    // value shrinks as the chunker consumes free space, which is exactly the state the next run
+    // must fit into.
+    [[nodiscard]] std::uint32_t largest_free_run_pages(const HostKVPageLayout& layout) const noexcept;
 
     [[nodiscard]] std::optional<HostKVAllocationRecipe>
     plan_after_releases(std::span<const HostKVAllocationHandle> proposed_releases,

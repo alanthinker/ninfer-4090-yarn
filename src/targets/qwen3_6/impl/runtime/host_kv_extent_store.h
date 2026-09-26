@@ -16,6 +16,13 @@
 
 namespace ninfer::targets::qwen3_6::detail {
 
+// The largest Host extent ONE landing run asks the arena for. It is shared by the feasibility
+// pre-check (`HostKVAllocationRequest::max_run_pages`) and by every execution-time landing
+// builder, so "the plan fits" and "the copies fit" are answered with the same geometry. Runs
+// smaller than this are taken when the arena is fragmented: the run limit is a transfer-efficiency
+// cap, never a feasibility requirement (`缓存模块v2.md` §三 R2).
+inline constexpr std::uint32_t kHostLandingRunPages = 16;
+
 class HostKVExtentStore;
 
 struct HostKVPageReplicaRelease {
@@ -86,6 +93,17 @@ public:
             throw std::invalid_argument("Host KV page store has no arena layout");
         }
         return *layout;
+    }
+
+    // Pages the NEXT landing run may take: as many as the arena can hand out in one free extent,
+    // capped by the run limit and by what is left to land. Never zero while pages remain - one
+    // page is the smallest ask, and a failure to serve even that is reported by `prepare`, which
+    // is the only place that can tell "no free page" from "asked too much at once".
+    [[nodiscard]] std::uint32_t landing_run_pages(const LogicalKVPageStore& pages,
+                                                  std::uint32_t remaining) const {
+        const std::uint32_t largest = arena_->largest_free_run_pages(page_layout(pages));
+        return std::min(std::min(remaining, kHostLandingRunPages),
+                        std::max<std::uint32_t>(1, largest));
     }
 
     [[nodiscard]] std::optional<HostKVExtentReservation>
@@ -387,10 +405,29 @@ public:
         }
         if (!arena_->can_allocate_after_suballocation_releases(suballocation_scratch_,
                                                                allocations)) {
+            // Name the axis that actually refused: bytes free, the largest single run, and the
+            // first request's shape. "fragmentation" alone cannot distinguish "Host is full"
+            // (rule R2 must drop cache) from "one request was too greedy" (the chunker must cut
+            // finer) - and those two need opposite fixes.
+            std::size_t requested_bytes = 0;
+            std::uint32_t requested_pages = 0;
+            std::uint32_t run_cap         = 0;
+            std::uint32_t largest_run     = 0;
+            std::size_t stride            = 0;
+            if (!allocations.empty() && allocations.front().layout != nullptr) {
+                requested_pages = allocations.front().pages;
+                run_cap         = allocations.front().max_run_pages;
+                stride          = allocations.front().layout->page_stride;
+                requested_bytes = stride * static_cast<std::size_t>(requested_pages);
+                largest_run = arena_->largest_free_run_pages(*allocations.front().layout);
+            }
             std::fprintf(stderr,
                          "[host-alloc] arena refused: suballoc entries=%zu allocations=%zu"
-                         " (fragmentation)\n",
-                         suballocation_scratch_.size(), allocations.size());
+                         " free=%zu occupied=%zu largest_run=%u pages stride=%zu"
+                         " first_request=%u pages (%zu bytes) run_cap=%u\n",
+                         suballocation_scratch_.size(), allocations.size(), arena_->free_bytes(),
+                         arena_->occupied_bytes(), largest_run, stride, requested_pages,
+                         requested_bytes, run_cap);
             std::fflush(stderr);
             return false;
         }
