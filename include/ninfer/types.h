@@ -154,10 +154,10 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
     std::optional<std::uint32_t> max_long_anchors_per_continuation;
-    // Fair-share checkpoint retention: the most recently active N private sessions are
-    // victim-protected (their checkpoints are excluded from pressure victim domains and from
-    // shared-capture pressure) until a request that fits no other way forces the engine to
-    // release them, oldest first. 0 disables protection. Only meaningful with the cache enabled.
+    // Fair-share checkpoint retention: the most recently active N private sessions are ranked
+    // ahead of every other cached record (protection is a value inside importance, so they stay
+    // in the victim set and are sacrificed last, least valuable first - 缓存模块v2.md §2.2).
+    // 0 disables protection. Only meaningful with the cache enabled.
     std::uint32_t fair_share_buckets = 8;
 };
 

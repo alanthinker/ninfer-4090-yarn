@@ -2146,9 +2146,10 @@ private:
         // The ONE ranking: value (with protection folded in as its recency), then recency, then
         // slot - the same chain the two-tier policy ranks its Datum by (缓存模块v2.md §6.4).
         // Protection here is fair-share OR the recency horizon: an ordering, never an exclusion,
-        // so this list always contains somebody and the ladder can always find a victim. Within
-        // the protected group the oldest goes first, which is the bucket escalation this step
-        // documents - dropping that made Host KV stop accumulating entirely.
+        // so this list always contains somebody and the ladder can always find a victim. INSIDE
+        // the protected group the same chain orders again (`value → age → id`) - age alone would
+        // erase value, and an age-only group lost the rig's 20 179-token important_session to a
+        // flood of freshly published sessions.
         std::sort(scored.begin(), scored.end(), [](const Scored& left, const Scored& right) {
             return cache_owner_rank_less(
                 cache_owner_importance(left.score, left.protected_by_fair_share,
@@ -2621,11 +2622,12 @@ private:
 
     // Fair-share retention: ranks the idle private sessions that still hold a resident
     // checkpoint set (endpoint, rewrite or long anchor) most-recently-active first. The first
-    // `fair_share_buckets_` of them form the guaranteed buckets: while the shared pool has
-    // capacity left, their checkpoint sets (StateImages and KV pages held together as one
-    // owner) are excluded from pressure victim domains and from shared-capture pressure, so an
-    // active neighbor's churn can no longer evict an idle session's deep endpoint. A request
-    // that fits no other way forces the buckets open, oldest first (see plan_materialization).
+    // `fair_share_buckets_` of them are PROTECTED - not excluded: this list feeds
+    // `cache_owner_importance`, which lifts them to `K + clamp(score)` so they sort above every
+    // unprotected owner and are taken LAST, inside their group by the same `value → age → id`
+    // chain (缓存模块v2.md §2.2 / §六.4). There is no bucket-release loop to describe: the old
+    // exclusion made one request run the whole planning problem `fair_share_buckets_` times, and
+    // `plan_materialization` keeps `released_buckets` at 0 for schema stability only.
     [[nodiscard]] std::vector<std::uint32_t> fair_share_protected_slots() const noexcept {
         std::vector<std::uint32_t> protected_slots;
         if (!cache_enabled_ || fair_share_buckets_ == 0) { return protected_slots; }

@@ -3527,10 +3527,11 @@ void test_shortlist_collision_requires_program_exact_verification() {
 
 // 2026-09-12 17:09 incident class: an idle deep session lost its endpoint to an active
 // neighbor's growth/compaction churn and paid a full re-prefill on return. With the default
-// fair-share buckets, both idle sessions here are victim-protected, so a request whose
-// pressure only closes by evicting one of them must first find nothing (both protected),
-// then release exactly the OLDEST bucket: the MRU session's endpoint survives the churn.
-void test_fair_share_releases_oldest_bucket_only_when_shared_pool_exhausted() {
+// fair-share buckets both idle sessions here are protected, i.e. ranked above every unprotected
+// record; between two equally valuable protected sessions the one chain falls through to age, so
+// the OLDEST is sacrificed and the MRU session's endpoint survives the churn (缓存模块v2.md
+// §2.2: protection is a value - the old exclusion + bucket-release path is gone).
+void test_fair_share_sacrifices_the_oldest_protected_session_last() {
     FakeManager manager = make_manager(1, 4); // default fair_share_buckets = 8
     FakeProgram program;
     const ActiveRequest older = start_active(
@@ -3542,13 +3543,13 @@ void test_fair_share_releases_oldest_bucket_only_when_shared_pool_exhausted() {
         make_base(402, FakeCacheSessionKey{402}, RetentionClass::LiveSession), 2);
     (void)finish_active(manager, program, newer);
 
-    // One pressure action is required and only an owner eviction can provide it: with both
-    // sessions in the protected set the first planning pass has an empty victim domain and
-    // must return nothing instead of evicting the MRU session.
+    // One pressure action is required and only an owner release can provide it: both sessions are
+    // protected, so the plan must take the one the chain ranks cheapest - the older of two equal
+    // scores - and never the MRU session.
     program.required_pressure_actions = 1;
     auto inspection = manager.inspect(program, FakePreparedPrompt{403}, make_base(403), 3);
     require(inspection.choice.has_value(),
-            "shared-pool exhaustion did not reach the oldest-bucket release path");
+            "a protected-session release must still be planned when nothing else can answer");
 
     program.abort_start = true;
     (void)manager.reserve_materialization(program, std::move(*inspection.choice),
@@ -4312,8 +4313,8 @@ int main() {
     run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
     run_test("shortlist exact verification",
              test_shortlist_collision_requires_program_exact_verification);
-    run_test("fair-share oldest bucket release",
-             test_fair_share_releases_oldest_bucket_only_when_shared_pool_exhausted);
+    run_test("fair-share sacrifices the oldest protected session last",
+             test_fair_share_sacrifices_the_oldest_protected_session_last);
     run_test("fair-share capture pricing",
              test_fair_share_capture_prices_protected_sessions_instead_of_refusing);
     run_test("manager hands over the retire preference",
