@@ -49,8 +49,12 @@ using ninfer::runtime::ProgramResourceRevision;
 using ninfer::runtime::Readiness;
 using ninfer::runtime::RequestPlanSummary;
 using ninfer::runtime::RetentionClass;
+using ninfer::runtime::live_multiplier_q16;
+using ninfer::runtime::OwnerScore;
+using ninfer::runtime::owner_score_ns;
 using ninfer::runtime::reuse_evidence_q16;
 using ninfer::runtime::RetirePreferenceEntry;
+using ninfer::runtime::victim_score_ns;
 using ninfer::runtime::VictimDisposition;
 
 int failures = 0;
@@ -3697,6 +3701,121 @@ void test_victim_score_prices_live_and_idle_owners_differently() {
     }
 }
 
+// EVERY consumer of the value order must price freshness, and they must do it through the same
+// function. The shape below is the production failure of 2026-09-27, at the decision level: a pool
+// full of deep-but-stale fill sessions, and one shallow conversation a client has just been reading.
+//
+//   * fresh probe:  7 s of rebuild work, re-read a second ago  -> live 8x, evidence ~0.5
+//   * stale filler: 31 s of rebuild work, never re-read         -> live 1x, evidence floor 1/8
+//
+// With freshness priced the probe is worth ~4x the filler, so the ladder may not degrade it; without
+// the multiplier the probe scored BELOW the filler and the pool destroyed what it had just built
+// (`fork@4 cached=0`, `continue cached=5611/7066 = 79%`). Fast tier for a rule whose slow tier is a
+// 20-45 minute battery.
+void test_owner_score_prices_freshness_for_every_consumer() {
+    const auto now              = std::chrono::steady_clock::now();
+    constexpr std::uint64_t kSecond = 1000000000ULL;
+    constexpr std::uint64_t kOne    = 1U << 16U;
+    constexpr std::uint64_t kWeight = 16U; // LiveSession
+
+    const auto probe_value  = 7U * kSecond * kWeight;
+    const auto filler_value = 31U * kSecond * kWeight;
+    const auto probe_live   = live_multiplier_q16(now - std::chrono::seconds(1), now);
+    const auto filler_live  = live_multiplier_q16({}, now); // no recorded use: 1x, never more
+    const auto probe_evidence  = reuse_evidence_q16(1, now - std::chrono::seconds(1), now);
+    const auto filler_evidence = reuse_evidence_q16(0, {}, now);
+
+    require(filler_live == kOne,
+            "an owner with no recorded reuse must not receive a freshness boost");
+    require(probe_live > 6U * kOne,
+            "a conversation read a second ago must be near the 8x freshness peak");
+    require(filler_value > probe_value,
+            "the stale filler must hold the deeper value this case is about");
+
+    const OwnerScore probe  = owner_score_ns(probe_value, probe_live, probe_evidence);
+    const OwnerScore filler = owner_score_ns(filler_value, filler_live, filler_evidence);
+    require(probe.score_ns > filler.score_ns,
+            "a just-read conversation must outrank a deeper stale one for every consumer: this is "
+            "what keeps the pool from degrading the conversation a client is currently using");
+    // And it must be the LIVE multiplier that flips it: with freshness removed the deeper stale
+    // owner wins, which is exactly the ladder bug this test exists for.
+    require(victim_score_ns(probe_value, probe_evidence) <
+                victim_score_ns(filler_value, filler_evidence),
+            "the case must be one where freshness decides - depth alone must favour the filler");
+    require(probe.boosted_value_ns ==
+                static_cast<std::uint64_t>(probe_value * probe_live / kOne),
+            "the diagnostic value must be the value at risk after freshness, before evidence");
+
+    // Saturation instead of wraparound, and zero stays zero.
+    const OwnerScore huge =
+        owner_score_ns(std::numeric_limits<std::uint64_t>::max(), 8U * kOne, kOne);
+    require(huge.score_ns == std::numeric_limits<std::uint64_t>::max(),
+            "a saturated owner score must clamp instead of wrapping");
+    require(owner_score_ns(0, kOne, kOne).score_ns == 0 &&
+                owner_score_ns(kOne, 0, kOne).score_ns == 0,
+            "a zero value or a zero multiplier must score zero");
+}
+
+// The LADDER's own call site, not just the shared arithmetic: the order the Program's last-resort
+// release step walks must price freshness. This is the production failure of 2026-09-27 reduced to
+// two owners: a deep 31K conversation nobody has re-read since it was built, and a 7K conversation
+// the client re-read just now. The cheap owner must be the STALE DEEP one (its never-read floor is
+// weight x 31000 tokens x 100 ns / 8 = 6.2 ms here); before `live(x)` reached this path the pool
+// made the just-read 7K conversation the cheapest thing it had and degraded that conversation's own
+// endpoint and anchors (`fork@4 cached=0`, `continue 79%` on a full production pool).
+void test_retire_order_prices_a_just_read_owner_above_a_stale_deeper_one() {
+    const auto cheapest_private = [](const FakeProgram& program) -> std::optional<std::uint64_t> {
+        std::optional<std::uint64_t> best;
+        for (const RetirePreferenceEntry& entry : program.retire_preference) {
+            if (entry.shared_prefix) { continue; }
+            best = best ? std::min(*best, entry.score_ns) : entry.score_ns;
+        }
+        return best;
+    };
+
+    FakeManager manager = make_manager(4, 8, 1);
+    FakeProgram program;
+    const auto deep_key = FakeCacheSessionKey{701};
+    const auto read_key = FakeCacheSessionKey{702};
+
+    const ActiveRequest deep = start_active(
+        manager, program, 701, make_base(701, deep_key, RetentionClass::LiveSession), 1);
+    const FakeFinishResult deep_finish = finish_active(manager, program, deep, 31000);
+    require(deep_finish.status == ConsumeStatus::Consumed &&
+                deep_finish.disposition == FinishDisposition::Catalogued,
+            "the deep session was not catalogued");
+    const ActiveRequest shallow = start_active(
+        manager, program, 702, make_base(702, read_key, RetentionClass::LiveSession), 2);
+    (void)finish_active(manager, program, shallow, 7000);
+
+    // Nobody has re-read the deep conversation: the shallow one is the cheapest owner.
+    program.retire_preference.clear();
+    (void)manager.inspect(program, FakePreparedPrompt{703}, make_base(703), 3);
+    const std::optional<std::uint64_t> before = cheapest_private(program);
+    require(before.has_value(), "the retire order named no private owner");
+
+    // Now the client re-reads the shallow conversation: one full reuse cycle over its checkpoint
+    // digest and session key, which is what records the reuse evidence the score reads.
+    const ActiveRequest follow_up = start_active(
+        manager, program, 702, make_base(702, read_key, RetentionClass::LiveSession), 4);
+    const FakeFinishResult follow_up_finish = finish_active(manager, program, follow_up, 7000);
+    require(follow_up_finish.status == ConsumeStatus::Consumed,
+            "the re-read of the shallow conversation did not complete");
+
+    program.retire_preference.clear();
+    (void)manager.inspect(program, FakePreparedPrompt{705}, make_base(705), 5);
+    const std::optional<std::uint64_t> after = cheapest_private(program);
+    require(after.has_value(), "the retire order named no private owner after the re-read");
+    require(*after > *before,
+            ("re-reading a conversation must raise its value: the cheapest owner must not stay the "
+             "one the client is using (before=" + std::to_string(*before) + " after=" +
+             std::to_string(*after) + ")").c_str());
+    require(*after >= 31000ULL * 100ULL * 16ULL / 8ULL,
+            ("after the re-read the cheapest owner must be the stale 31K conversation priced at its "
+             "never-read floor (freshness, not depth, decides) after=" +
+             std::to_string(*after)).c_str());
+}
+
 // Fair-share protection is a VALUE, not an exclusion (缓存模块v2.md §六.4): a shared-capture
 // offer whose only feasible target needs pressure no longer refuses the bucket outright - it
 // RESERVES, and the one importance chain prices the protected session (K + age ranks it
@@ -3895,6 +4014,10 @@ int main() {
              test_victim_score_ranks_by_value_not_by_one_field);
     run_test("victim score prices live against idle owners",
              test_victim_score_prices_live_and_idle_owners_differently);
+    run_test("owner score prices freshness for every consumer",
+             test_owner_score_prices_freshness_for_every_consumer);
+    run_test("retire order prices a just-read owner above a stale deeper one",
+             test_retire_order_prices_a_just_read_owner_above_a_stale_deeper_one);
     run_test("executing conversation is absent from the retire order",
              test_executing_conversation_is_absent_from_the_retire_order);
     if (failures != 0) { return 1; }

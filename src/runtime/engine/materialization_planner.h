@@ -164,6 +164,38 @@ struct MaterializationVictimCost {
                : (value_ns * reuse_evidence_q16) >> 16U;
 }
 
+// THE owner score: one value, multiplied by freshness and by reuse evidence. Both consumers of the
+// value order call exactly this - the planner's `materialization_victim_cost` and the Program
+// ladder's `retire_preference_order` - so "one chain" is a property of the code rather than of two
+// copies of the same arithmetic agreeing by inspection.
+//
+// It exists because they did NOT agree: the ladder omitted `live(x)` for a whole round, which made a
+// conversation used two seconds ago ("刚完成的对话价值很高") level with one idle for an hour, and a
+// saturated production pool then degraded the freshly built probe's own checkpoints while stale
+// sessions an order of magnitude shallower kept theirs (2026-09-27: `fork@4 cached=0`, `continue
+// cached=5611/7066 = 79%` on a 320-slot pool full of 31K fill sessions). A unit test on this
+// function pins that clause for EVERY consumer in milliseconds instead of a 20-45 minute battery
+// (tests/test_resource_manager.cpp `test_owner_score_prices_freshness_for_every_consumer`).
+struct OwnerScore {
+    // Value at risk AFTER freshness, BEFORE reuse evidence - the diagnostic's `value_ns`.
+    std::uint64_t boosted_value_ns = 0;
+    std::uint64_t score_ns         = 0;
+};
+
+[[nodiscard]] inline OwnerScore owner_score_ns(std::uint64_t value_ns,
+                                               std::uint64_t live_multiplier_q16,
+                                               std::uint64_t reuse_evidence_q16) noexcept {
+    if (value_ns == 0 || live_multiplier_q16 == 0) { return {}; }
+    const std::uint64_t boosted_ns =
+        value_ns > std::numeric_limits<std::uint64_t>::max() / live_multiplier_q16
+            ? std::numeric_limits<std::uint64_t>::max()
+            : value_ns * live_multiplier_q16 / (1U << 16U);
+    return OwnerScore{
+        .boosted_value_ns = boosted_ns,
+        .score_ns         = victim_score_ns(boosted_ns, reuse_evidence_q16),
+    };
+}
+
 // Victim ordering is one combined score in the planner's own currency, not a lexicographic field
 // chain. A field-first chain lets a single dimension decide alone - when the reuse count differs,
 // the retention weight and the recency are never read at all - which is how a deep endpoint that
@@ -203,13 +235,11 @@ struct MaterializationVictimCost {
     const std::uint64_t value_ns =
         victim_value_ns(policy->private_retention_weight, private_saving, demand_best,
                        policy->explicit_shared_credit);
-    const std::uint64_t boosted_ns =
-        value_ns > std::numeric_limits<std::uint64_t>::max() / policy->live_multiplier_q16
-            ? std::numeric_limits<std::uint64_t>::max()
-            : value_ns * policy->live_multiplier_q16 / (1U << 16U);
+    const OwnerScore priced_score =
+        owner_score_ns(value_ns, policy->live_multiplier_q16, policy->reuse_evidence_q16);
     return MaterializationVictimCost{
-        .value_ns         = boosted_ns,
-        .score            = victim_score_ns(boosted_ns, policy->reuse_evidence_q16),
+        .value_ns         = priced_score.boosted_value_ns,
+        .score            = priced_score.score_ns,
         .priced_checkpoints = priced,
     };
 }

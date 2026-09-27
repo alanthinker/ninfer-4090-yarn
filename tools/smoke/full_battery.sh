@@ -89,7 +89,17 @@ else
     # (the oldest) outside the protected set on a full pool - same math as the rig fix.
     SWITCH_ARGS=(--conversations 8)
     MIXED_ARGS=()
-    FORK_ARGS=()
+    # The fork probe must land on an anchor the PRODUCTION geometry actually publishes. Production
+    # keeps the last --auto-long-anchors 5 message boundaries plus --first-anchor-spacing 4096 and a
+    # spread stride scaled to the prompt; measured on a 40-round/~32K prompt (2026-09-27), the
+    # published anchor frontiers are
+    #   4686, 11878, 16646, 21417, 26214, 30964  (+ the turn closure at 31763)
+    # so an 8-round/~6.4K conversation forks at round 4 - ~3.5K, BELOW the first anchor - and its
+    # fork legitimately has no candidate: the engine must not guess, and a sparse anchor set is the
+    # documented product geometry (缓存模块v2.md §十.5: 几何保持不变,测试用例要按几何取).
+    # A longer conversation lands the fork just above a real anchor: measured
+    #   fork@22 cached=16881/19151 (88%),  continue cached=32073/32810 (98%).
+    FORK_ARGS=(--rounds 40 --fork-round 22 --words 250)
     # 320 host slots absorb a flood of SHORT disposable sessions by degrading the flood's OWN
     # anchors (the cheapest thing in the pool), so no owner is ever retired and the step reports
     # INCONCLUSIVE ("the flood caused no retirement, so nothing was tested") - its precondition,

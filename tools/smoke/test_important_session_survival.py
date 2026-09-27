@@ -163,7 +163,8 @@ def main() -> int:
     window = read_log()[len(log_before):]
     evictions = [line for line in window.splitlines() if line.startswith("[evict] slot=")]
     fallbacks = [line for line in window.splitlines() if line.startswith("[ladder] degrade")]
-    print(f"  retirements during the flood: {len(evictions)}")
+    print(f"  retirements during the flood: {len(evictions)} "
+          f"(component degradations: {len(fallbacks)})")
     for line in evictions[-4:]:
         print("   ", line[:140])
     for line in fallbacks[-4:]:
@@ -175,8 +176,15 @@ def main() -> int:
                  if entry.get("session_digest")}
     named = [line for line in evictions if digest in line]
     still_there = survivors.get(digest)
-    if len(evictions) == 0:
-        print("INCONCLUSIVE: the flood caused no retirement, so nothing was tested "
+    # The flood must have DESTROYED cached work, or the step proves nothing. That pressure can
+    # arrive two ways, and both are the engine behaving as designed: whole-conversation retirement
+    # (`[evict]`), or R2 component degradation (`[ladder] degrade` - the least valuable owner's
+    # shallowest checkpoint). Requiring a retirement specifically made the step report
+    # INCONCLUSIVE on a pool where the flood was fully absorbed by degrading stale checkpoints
+    # (production 2026-09-27: 120 nine-message sessions, zero retirements, thousands of
+    # degradations) - a better outcome than the precondition expected, not a failure.
+    if len(evictions) == 0 and len(fallbacks) == 0:
+        print("INCONCLUSIVE: the flood destroyed no cached work at all, so nothing was tested "
               "(raise --flood or check that the pool is small enough to saturate)")
         return 1
     if named:

@@ -2055,25 +2055,19 @@ private:
                     demand_best[bit] = std::max(demand_best[bit], saving);
                 }
             });
-            // The SAME product the planner prices (缓存模块v2.md §2.2): value x live(x) x evidence.
-            // Without the live multiplier the ladder read a conversation used two seconds ago as
-            // level with one idle for an hour - `reuse_evidence_q16`'s live term saturates at 0.5
-            // for both - so on a saturated pool the conversation a test had just built was the
-            // cheapest owner and lost its own endpoint and anchors to sessions an order of
-            // magnitude shallower but stale. Measured 2026-09-27 on production (320 slots full of
-            // 31K fill sessions): a 7K probe answered `continue cached=5611/7066 (79%)` and a
-            // mid-history fork fell back to root, because its deep checkpoint was degraded away
-            // while the stale fill sessions kept theirs; the same pool passes both once freshness
-            // is priced here (the probe's 8x outranks depth).
-            const std::uint64_t value_ns =
-                victim_value_ns(weight, private_saving, demand_best, credit);
-            const std::uint64_t live_q16 = live_multiplier_q16(last, now);
-            const std::uint64_t boosted_ns =
-                value_ns > std::numeric_limits<std::uint64_t>::max() / live_q16
-                    ? std::numeric_limits<std::uint64_t>::max()
-                    : value_ns * live_q16 / (1U << 16U);
+            // The SAME product the planner prices, through the SAME function (缓存模块v2.md §2.2):
+            // value x live(x) x evidence. Without the live multiplier the ladder read a conversation
+            // used two seconds ago as level with one idle for an hour - `reuse_evidence_q16`'s live
+            // term saturates at 0.5 for both - so on a saturated pool the conversation a test had
+            // just built was the cheapest owner and lost its own endpoint and anchors to sessions
+            // an order of magnitude shallower but stale. Measured 2026-09-27 on production (320
+            // slots full of 31K fill sessions): a 7K probe answered `continue cached=5611/7066
+            // (79%)` and a mid-history fork fell back to root, because its deep checkpoint was
+            // degraded away while the stale fill sessions kept theirs.
             const std::uint64_t score =
-                victim_score_ns(boosted_ns, reuse_evidence_q16(hits, last, now));
+                owner_score_ns(victim_value_ns(weight, private_saving, demand_best, credit),
+                               live_multiplier_q16(last, now), reuse_evidence_q16(hits, last, now))
+                    .score_ns;
             scored.push_back(Scored{
                 .entry = RetirePreferenceEntry{
                     .shared_prefix = shared_prefix, .slot = slot, .score_ns = score},
