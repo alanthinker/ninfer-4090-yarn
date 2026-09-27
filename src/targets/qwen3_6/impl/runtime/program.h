@@ -1201,12 +1201,6 @@ private:
     // publishing transfer makes the commit fail with "Host retained Fork destination was not
     // published" (reproduced on the agent test instance, 2026-09-21).
     std::optional<StateImageHandle> release_protected_state;
-    // What the CURRENT action is worth, in prompt tokens: the reuse it restores, or the prompt it
-    // is about to compute. The ladder's lossy step (R2 component eviction) may only destroy a
-    // checkpoint SHALLOWER than this - destroying a deeper one trades more reusable prefill for
-    // less, which is the trade §6.4 forbids for a capture and §三 R0 forbids for a request that
-    // gains no cache at all. Zero means unpriced (the historic behaviour).
-    std::uint32_t ladder_beneficiary_tokens = 0;
     // True when that continuation still holds the release-protected state anywhere in its retained
     // checkpoint set, so the ladder's final retirement step can skip it.
     [[nodiscard]] bool owner_holds_release_protected_state(std::uint32_t index) const;
@@ -1300,12 +1294,9 @@ private:
     // owner can be degraded this way - the caller then fails the step and the request waits (R0),
     // because the old fallback (retiring the owner, both tiers at once) violated invariant 1 in
     // 280 of 557 production retirements (§七判据 #3).
-    // R2 component eviction for a Host state slot. `beneficiary_tokens` prices the action: a
-    // capture publishes what a future reuse would save, and destroying a conversation at least as
-    // deep as that for a marginal slot is not a trade the rules allow (§6.4 - publishing a
-    // checkpoint is a VALUE judgment, and §三 R0 makes a capture that cannot be placed a skip).
-    // Zero means "unpriced" and keeps the ladder's historic behaviour.
-    [[nodiscard]] bool degrade_idle_owner_host_state(std::uint32_t beneficiary_tokens = 0);
+    // R2 component eviction for a Host state slot: ONE value ordering decides who gives way,
+    // and the conversation being executed is not in that ordering at all (§2.1/§2.2).
+    [[nodiscard]] bool degrade_idle_owner_host_state();
     // R2 at whole-conversation granularity (缓存模块v2.md §2.1): release the least-important
     // idle owner that holds NOTHING on Device - its Host KV, Host state and catalog row disappear
     // together, which is exactly the documented "整条对话从内存消失" (both sides zero -> catalog

@@ -53,6 +53,14 @@ struct MaterializationOwnerPolicy {
     // replaces its own checkpoint every turn, so a per-checkpoint count cannot represent "this
     // conversation has been reused fifty times".
     std::uint64_t reuse_evidence_q16 = 1U << 16U;
+    // LIVE multiplier, Q16, >= 1: a conversation being executed, or just published / just read, is
+    // worth far more than an idle one, and the boost decays FAST. The evidence term above can only
+    // ever REDUCE value (it lives in [floor, 1]), so no amount of freshness could let a session
+    // published two seconds ago outrank a stale conversation an order of magnitude deeper: measured
+    // on the rig, the 700-token conversation a switch-back needed was the cheapest thing in the
+    // pool and was retired for a stale 31 000-token one. Live-ness is a multiplier so that it can
+    // (缓存模块v2.md §2.2: 重建成本 × (1+命中) × 新近度).
+    std::uint64_t live_multiplier_q16 = 1U << 16U;
 };
 
 // Reuse evidence in Q16: a floored, saturating hyperbola over the age-decayed lifetime reuse
@@ -61,25 +69,56 @@ struct MaterializationOwnerPolicy {
 // free - without it "never reused" sorts as the cheapest owner, so a freshly built deep
 // conversation outranks every session a test loop has been hammering, no matter how much prefill
 // it holds. The decay is wall-clock, so evidence fades for a session nobody touches any more.
+// `8x at age 0, ~1x after 90 s` (three 30 s half-lives), then flat. It multiplies the VALUE at
+// risk, so freshness can outweigh depth instead of merely discounting it.
+[[nodiscard]] inline std::uint64_t live_multiplier_q16(
+    std::chrono::steady_clock::time_point last,
+    std::chrono::steady_clock::time_point now) noexcept {
+    constexpr std::uint64_t kOne    = 1U << 16U;
+    constexpr double kHalfLife      = 30.0;
+    constexpr double kPeakBoost     = 8.0;
+    if (last.time_since_epoch().count() == 0) { return kOne; }
+    const double age   = std::max(0.0, std::chrono::duration<double>(now - last).count());
+    const double boost = 1.0 + (kPeakBoost - 1.0) * std::exp2(-age / kHalfLife);
+    return static_cast<std::uint64_t>(boost * static_cast<double>(kOne));
+}
+
 [[nodiscard]] inline std::uint64_t reuse_evidence_q16(
     std::uint64_t hits, std::chrono::steady_clock::time_point last,
     std::chrono::steady_clock::time_point now) noexcept {
     constexpr std::uint64_t kOne    = 1U << 16U;
-    constexpr std::uint64_t kFloor  = kOne / 8U; // 0.125 for a never-reused owner
+    // Two floors, and the difference is the whole point:
+    //   * NO recorded last-use time -> exactly 1/8. Unknown history is priced conservatively: never
+    //     free, but cheap. The unit test pins this value (`reuse_evidence_q16(0, {}, now)`).
+    //   * a KNOWN last-use time -> 1/64, because the timestamp is real evidence: an owner idle for
+    //     ten minutes is genuinely worth less than one published two seconds ago, however deep it
+    //     is. With the flat 1/8 a stale 31 000-token session kept 3 875 while a session published
+    //     seconds ago held 2 400, so a saturation run evicted what it had just built.
+    constexpr std::uint64_t kFloorUnknown = kOne / 8U;
+    constexpr std::uint64_t kFloorTimed   = kOne / 64U;
     constexpr std::uint64_t kHalf   = 8U * kOne; // 8 decayed reuses reach half saturation
     constexpr std::uint64_t kHitCap = 4096U;     // bounds the fixed-point arithmetic
-    constexpr double kTauSeconds    = 1800.0;    // 30 minutes
-    std::uint64_t decayed_q16       = 0;
-    if (hits != 0 && last.time_since_epoch().count() > 0) {
-        const double age   = std::max(0.0, std::chrono::duration<double>(now - last).count());
-        const double decay = std::exp2(-age / kTauSeconds);
-        const std::uint64_t decay_q16 =
-            static_cast<std::uint64_t>(decay * static_cast<double>(kOne));
-        const std::uint64_t capped = std::min(hits, kHitCap);
-        decayed_q16                = ((capped << 16U) * decay_q16) >> 16U;
-    }
-    const std::uint64_t ratio_q16 = (decayed_q16 << 16U) / (decayed_q16 + kHalf);
-    return kFloor + (((kOne - kFloor) * ratio_q16) >> 16U);
+    constexpr double kTauSeconds    = 1800.0;    // 30 minutes (the re-read evidence's decay)
+    constexpr double kLiveSeconds   = 120.0;     // the "in use / just published" window
+    if (last.time_since_epoch().count() == 0) { return kFloorUnknown; }
+    const double age = std::max(0.0, std::chrono::duration<double>(now - last).count());
+    const std::uint64_t capped = std::min(hits, kHitCap);
+    const std::uint64_t decay_q16 =
+        static_cast<std::uint64_t>(std::exp2(-age / kTauSeconds) * static_cast<double>(kOne));
+    const std::uint64_t decayed_q16 = ((capped << 16U) * decay_q16) >> 16U;
+    const std::uint64_t ratio_q16   = (decayed_q16 << 16U) / (decayed_q16 + kHalf);
+    // LIVE-ness is value in its own right and it applies with or without recorded hits: a
+    // conversation just read, just published, or in use right now is about to be read again. The
+    // old formula skipped the recency term entirely when `hits == 0`, so a conversation published
+    // two seconds ago and one idle for an hour were priced identically - the pool then evicted the
+    // conversation it had just built, and a request's own capture destroyed the very anchors a
+    // sibling fork needed. Half a unit at age zero, so the reuse COUNT stays visible among equally
+    // fresh owners (the unit test pins "more reuses must mean more protection" at equal ages).
+    const std::uint64_t live_q16 =
+        static_cast<std::uint64_t>(0.5 * std::exp2(-age / kLiveSeconds) *
+                                   static_cast<double>(kOne));
+    const std::uint64_t best_q16 = std::max(ratio_q16, live_q16);
+    return kFloorTimed + (((kOne - kFloorTimed) * best_q16) >> 16U);
 }
 
 // One owner's victim cost, kept in parts because the diagnostic prints them: `value_ns` is the
@@ -161,12 +200,16 @@ struct MaterializationVictimCost {
         }
     }
 
-    std::uint64_t value_ns =
+    const std::uint64_t value_ns =
         victim_value_ns(policy->private_retention_weight, private_saving, demand_best,
                        policy->explicit_shared_credit);
+    const std::uint64_t boosted_ns =
+        value_ns > std::numeric_limits<std::uint64_t>::max() / policy->live_multiplier_q16
+            ? std::numeric_limits<std::uint64_t>::max()
+            : value_ns * policy->live_multiplier_q16 / (1U << 16U);
     return MaterializationVictimCost{
-        .value_ns         = value_ns,
-        .score            = victim_score_ns(value_ns, policy->reuse_evidence_q16),
+        .value_ns         = boosted_ns,
+        .score            = victim_score_ns(boosted_ns, policy->reuse_evidence_q16),
         .priced_checkpoints = priced,
     };
 }
@@ -198,20 +241,20 @@ struct MaterializationVictimCost {
 [[nodiscard]] inline std::uint64_t cache_owner_importance(std::uint64_t score,
                                                           bool protected_owner,
                                                           std::int64_t age_key) noexcept {
+    (void)age_key;  // the tie-break travels beside the value; see cache_owner_rank_less
     constexpr std::uint64_t kProtectedStep = 1ULL << 62U;
     if (!protected_owner) {
         return score > kProtectedStep - 1U ? kProtectedStep - 1U : score;
     }
-    // Above every unprotected score, and INSIDE the group ordered by age - the oldest gives way
-    // first. That magnitude is load-bearing and was measured twice: ordering the protected group by
-    // score instead let the pool evict the conversations a saturation run had just published
-    // (`prefix_switch` / `state_index` / `prefix_mixed` went red on the churned rig pool, 2026-09-26
-    // - both when the closure/gate changes were present and when they were not). The cost is real
-    // and is booked in §十.5: an idle high-value conversation can lose anchors to a flood of fresh
-    // disposables when the Host pool is small; production's 320 slots measured green.
-    const std::uint64_t age =
-        age_key < 0 ? std::uint64_t{0} : static_cast<std::uint64_t>(age_key);
-    const std::uint64_t bounded = age > kProtectedStep - 1U ? kProtectedStep - 1U : age;
+    // Above every unprotected score, and INSIDE the group the same chain orders again:
+    // `value → age → id`. Ordering the group by age alone let protection erase value: an idle
+    // 20 179-token conversation that had been reused on every turn ranked level with a 1 873-token
+    // session published seconds ago, and lost - the rig's important_session watched it lose all
+    // eight anchors (and then the whole conversation) to the flood. The reason age-ordering was
+    // introduced at all - "a fresh session must not be evicted by the pressure it causes" - is now
+    // carried by the value itself: `reuse_evidence_q16` prices LIVE-ness explicitly, so a
+    // just-published session scores above a stale deep one on its own merits.
+    const std::uint64_t bounded = score > kProtectedStep - 1U ? kProtectedStep - 1U : score;
     return kProtectedStep + bounded;
 }
 

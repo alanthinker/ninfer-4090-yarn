@@ -950,6 +950,10 @@ public:
                     .within_recency_horizon   = within_recency_horizon(slot),
                     .reuse_evidence_q16       = reuse_evidence_q16(
                         entry.lifetime_selected_hits, entry.last_selected_at, observation_now),
+                    // LIVE-ness: executed / just published / just read is worth far more than deep,
+                    // and it decays fast (30 s half-life, 8x at age 0).
+                    .live_multiplier_q16 =
+                        live_multiplier_q16(entry.last_selected_at, observation_now),
                 });
                 if (entry.summary.endpoint) {
                     append_private_checkpoint(owner, slot, *entry.summary.endpoint);
@@ -2066,6 +2070,11 @@ private:
         for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
             const CatalogEntry& entry = catalog_[slot];
             if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
+            // The conversation being EXECUTED is never a candidate. Ranking can only say who is
+            // least important; a session that is mid-flight cannot be re-derived at all, so its
+            // value is effectively infinite and it is left out of the list entirely
+            // (缓存模块v2.md §2.1: 活体数据是工作集，不参与 R1/R2).
+            if (private_has_active_edge(slot)) { continue; }
             append(false, slot, private_retention_weight(entry.retention),
                    entry.lifetime_selected_hits, entry.last_selected_at,
                    entry.last_active_at != std::chrono::steady_clock::time_point{}

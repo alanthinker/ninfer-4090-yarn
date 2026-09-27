@@ -3622,6 +3622,81 @@ void test_victim_score_ranks_by_value_not_by_one_field() {
             "more reuses must mean more protection");
 }
 
+// The two orderings the battery's saturation steps actually exercise, at the decision level. Both
+// were red on the rig for a whole round and both were the same defect: the score could not tell
+// "just published / in use" from "idle for an hour". A session published two seconds ago was priced
+// like one nobody had touched since the fill, so the pool evicted what it had just built (the reuse
+// suites lost their switch-back hits); a 20 179-token conversation reused on every turn lost its
+// anchors to a flood of 1 873-token disposables (important_session). Value now carries live-ness in
+// two places - `reuse_evidence_q16` prices it, and the ordering prices a recent owner at the
+// LiveSession weight - and these two cases pin them.
+void test_victim_score_prices_live_and_idle_owners_differently() {
+    const auto now = std::chrono::steady_clock::now();
+    constexpr std::uint64_t kSecond     = 1000000000ULL;
+    constexpr std::uint64_t kLiveWeight = 16U;
+    constexpr std::uint64_t kRecentWeight = 4U;
+
+    // (A) rejust published, never re-read, idle two seconds: must outrank a session ten minutes
+    //     idle however much deeper that stale one is (the reuse-suite shape).
+    {
+        const std::array owners{
+            MaterializationOwnerPolicy{
+                .owner                    = PlanningOwnerId{.value = 0},
+                .retention_class          = RetentionClass::LiveSession,
+                .private_retention_weight = kLiveWeight,
+                .reuse_evidence_q16 = reuse_evidence_q16(0, now - std::chrono::seconds(2), now),
+            },
+            MaterializationOwnerPolicy{
+                .owner                    = PlanningOwnerId{.value = 1},
+                .retention_class          = RetentionClass::RecentPrivate,
+                .private_retention_weight = kRecentWeight,
+                .reuse_evidence_q16 = reuse_evidence_q16(1, now - std::chrono::minutes(10), now),
+            },
+        };
+        const std::array checkpoints{
+            MaterializationCheckpointPolicy{.owner = PlanningOwnerId{.value = 0},
+                                            .rebuild_ns = 2U * kSecond},
+            MaterializationCheckpointPolicy{.owner = PlanningOwnerId{.value = 1},
+                                            .rebuild_ns = 31U * kSecond},
+        };
+        require(materialization_victim_score(owners, checkpoints, PlanningOwnerId{.value = 0}) >
+                    materialization_victim_score(owners, checkpoints,
+                                                 PlanningOwnerId{.value = 1}),
+                "a conversation published seconds ago must outrank a stale, deeper one");
+    }
+
+    // (B) A deep, repeatedly reused conversation idle for half a minute must outrank a shallow
+    //     disposable flood (the important-session shape: 8 x 2.5K turns against 40 x 1.9K
+    //     one-shot sessions).
+    {
+        const std::array owners{
+            MaterializationOwnerPolicy{
+                .owner                    = PlanningOwnerId{.value = 0},
+                .retention_class          = RetentionClass::RecentPrivate,
+                .selected_hit_count       = 8,
+                .private_retention_weight = kRecentWeight,
+                .reuse_evidence_q16 = reuse_evidence_q16(8, now - std::chrono::seconds(30), now),
+            },
+            MaterializationOwnerPolicy{
+                .owner                    = PlanningOwnerId{.value = 1},
+                .retention_class          = RetentionClass::LiveSession,
+                .private_retention_weight = kLiveWeight,
+                .reuse_evidence_q16       = reuse_evidence_q16(0, now, now),
+            },
+        };
+        const std::array checkpoints{
+            MaterializationCheckpointPolicy{.owner = PlanningOwnerId{.value = 0},
+                                            .rebuild_ns = 20U * kSecond},
+            MaterializationCheckpointPolicy{.owner = PlanningOwnerId{.value = 1},
+                                            .rebuild_ns = 2U * kSecond},
+        };
+        require(materialization_victim_score(owners, checkpoints, PlanningOwnerId{.value = 0}) >
+                    materialization_victim_score(owners, checkpoints,
+                                                 PlanningOwnerId{.value = 1}),
+                "a deep, repeatedly reused conversation must outrank a shallow disposable flood");
+    }
+}
+
 // Fair-share protection is a VALUE, not an exclusion (缓存模块v2.md §六.4): a shared-capture
 // offer whose only feasible target needs pressure no longer refuses the bucket outright - it
 // RESERVES, and the one importance chain prices the protected session (K + age ranks it
@@ -3707,6 +3782,37 @@ void test_uniform_private_anchor_replacement() {
 
 } // namespace
 
+
+// The conversation being EXECUTED is not "ranked last", it is absent from the victim order: ranking
+// can only say who is least important, and a session that is mid-flight cannot be re-derived at all.
+// This is the head of the `prefix_switch` shape in the fake harness: one conversation active, one
+// idle, a capture reservation asking for a Host state slot.
+void test_executing_conversation_is_absent_from_the_retire_order() {
+    FakeManager manager = make_manager(4, 8, 1);
+    FakeProgram program;
+    const ActiveRequest running = start_active(
+        manager, program, 601,
+        make_base(601, FakeCacheSessionKey{601}, RetentionClass::LiveSession), 1);
+    const ActiveRequest idle = start_active(
+        manager, program, 602,
+        make_base(602, FakeCacheSessionKey{602}, RetentionClass::RecentPrivate), 1);
+    (void)finish_active(manager, program, idle);
+
+    program.retire_preference.clear();
+    (void)manager.reserve_active_capture(program, running.lane, FakeCaptureOffer{.id = 17}, true, {});
+    require(!program.retire_preference.empty(),
+            "capture reservation did not hand a retire preference to the Program");
+    // Two conversations exist - one executed, one finished - so the order must name exactly ONE
+    // private owner: the executed one is absent by construction, not ranked last.
+    std::size_t private_entries = 0;
+    for (const ninfer::runtime::RetirePreferenceEntry& entry : program.retire_preference) {
+        if (!entry.shared_prefix) { ++private_entries; }
+    }
+    require(private_entries == 1,
+            "the conversation being executed was offered as a victim (only the idle one may be)");
+    (void)running;
+}
+
 int main() {
     run_test("private checkpoint identity loss",
              test_private_portfolio_loss_keeps_checkpoint_identity_fixed);
@@ -3787,6 +3893,10 @@ int main() {
              test_manager_hands_the_retire_preference_to_the_program);
     run_test("victim score combines value and reuse evidence",
              test_victim_score_ranks_by_value_not_by_one_field);
+    run_test("victim score prices live against idle owners",
+             test_victim_score_prices_live_and_idle_owners_differently);
+    run_test("executing conversation is absent from the retire order",
+             test_executing_conversation_is_absent_from_the_retire_order);
     if (failures != 0) { return 1; }
     std::cout << "ok\n";
     return 0;
