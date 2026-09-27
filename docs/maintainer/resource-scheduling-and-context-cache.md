@@ -71,8 +71,8 @@ settlement 的逻辑 lease。另一个 reader 改变同一 owner 的 Device/Host
 使已有 owner edge stale。所有 active logical reference counts 都从这些 edges 派生。
 
 catalog 中的 owner handle 在用于复用 source 之前必须重新确认 Program 侧仍然存在
-（`continuation_is_live` / `shared_prefix_is_live`）。Program 会在预留时回收容量（§6.2）并因此退休空闲
-owner，这种退休不经过 ResourceManager 的 pressure transaction，所以 catalog 可能短暂列出一个已经不存在的
+（`continuation_is_live` / `shared_prefix_is_live`）。Program 会在预留时回收容量（§6.2）并因此释放空闲
+owner，这种释放不经过 ResourceManager 的 pressure transaction，所以 catalog 可能短暂列出一个已经不存在的
 owner。把它当作 source 会以 `admission source continuation is stale` 让整条请求 500（2026-09-22
 harness）；现在在 candidate 循环里发现即清除该 entry（保留量随之修正），请求继续按其余 candidate 规划。
 
@@ -125,8 +125,8 @@ PhysicalCapacity = {
 }
 ```
 
-这些轴相互独立。一个资源轴的余量不能补偿另一个轴的缺口。Host KV 的总空闲字节也不能替代
-allocator 对具体 extent 几何的可分配性判断。
+这些轴相互独立。一个资源轴的余量不能补偿另一个轴的缺口。Host KV 按**字节**口径判定能否接收
+（缓存模块v2.md §三 R1）：碎片的唯一后果是把一次搬运切成多段落点，不构成"放不下"的结论。
 
 Engine 另有固定的逻辑容量：
 
@@ -652,7 +652,7 @@ Program 的 residual 抵扣释放阶梯能腾出的槽位：`state_slot_relief` 
 驻留检查点的冗余 Host 副本）。两条约束：
 
 - 计数用“活跃绑定”谓词（空闲 Catalogued 会话保留的锚点是缓存，不是活绑定）；
-- **最后一步的退休不计入**任何 credit：它会让规划器按“能退休会话”排计划，运行时随后销毁活跃引用
+- **整条释放不计入**任何 credit：它会让规划器按“能释放一条会话”排计划，运行时随后释放活跃引用
   仍在使用的状态（实测 500：`StateImage handle is stale`）。需要容量的**私有捕获**改为在预留时
   先回收再重新评估；需要容量的复用/物化则由阶梯在预留处按需释放。
 
@@ -745,29 +745,30 @@ last_hit_epoch, owner}`（`materialization_planner.h`）。而 `guided_closure_t
 真实会话，因为"建好之后还没被别人重读过"（`selected_hit_count=0`）排在所有被测试脚本反复命中的浅会话
 前面，2026-09-23 17:01 被整条驱逐，而池子里 ~200 张测试镜像继续留存 74 分钟。
 
-现在按**一个联合分**排序（`materialization_victim_score`，`materialization_planner.h`）：
-
-\[
-VictimCost(o)=\Big(w_o\max_p (Rebuild(p)-Recovery_b(p)) + PublicValue_o + Credit_o\Big)\times Evidence_o
-\]
+受害者排序**只有一条**，规则与公式以 [缓存模块 v2](缓存模块v2.md) §2.2 为准：`importance =
+受保护 ? K(1<<62)+clamp(score) : clamp(score)`，其中 `score = 重建价值 × live(x) × 复用证据`；
+`live(x) = 1 + 7·2^(−Δt/30s)`（刚被读到时 8 倍），复用证据按 owner 级寿命命中数计算（从未被复用的
+记录只按尺寸计分，证据下限 1/8）。运行时那一份（`ResourceManager::retire_preference_order()` →
+`Program::set_retire_preference()`）用**同一条链** `value → age → id`（`cache_owner_rank_less`），
+不再并存"规划器一套、兜底一套"。本节原先给出的 `VictimCost`/`Evidence` 公式（缺 `live(x)`、
+τ 取 30 min、以 `owner.value` 收尾）是 v2 之前的那一版，已删除。
 
 - 价值在险与 `PrivateLoss` 同源，单位是 ns：`rebuild_ns - baseline_recovery_ns` 是该 checkpoint 一旦丢失
   就要重算的 prefill 工作量；`PublicValue_o` 是已观测需求为该 owner 的 checkpoint 计出的 saving。
-- `Evidence_o`（Q16）= `1/8 + (7/8)·d/(d+8)`，其中 `d = 生命周期复用次数 × 2^(−age/τ)`、`τ = 30 min`，
-  并设上限（4096 次）以约束定点运算。下限 1/8 保证"还没被重读"只是便宜而不是免费；越久没人碰，乘子越小。
 - 复用次数是**owner 级寿命计数**（`CatalogEntry::lifetime_selected_hits`），不是 checkpoint 级：
   一条自回归增长的会话每轮都会替换自己的 endpoint，`migrate_observations` 会连同旧 ref 一起丢掉它的
   计数，所以"这条对话被复用了 50 次"只能记在 owner 上。命中计数随发布跨 cell 继承（`commit_materialization`）。
-- 因此：① 深会话即使 hits=0 也按 30 s 量级的价值在险参与排序；② 50 轮对话的 hits≈50，乘子接近饱和；
-  ③ 刚被读过的会话 `age≈0`，乘子最大。保留 `owner.value` 作为最终 tie-break 保证确定性。
+- 因此：① 深会话即使 hits=0 也按价值在险参与排序；② 50 轮对话的 hits≈50，证据乘子接近饱和；
+  ③ 刚被读过的会话 `age≈0`，`live(x)` 与证据同时最大。
 
-同一个序也交给 Program 的**兜底退休**（`[exhaust]`，阶梯最后一档）：那一档跑在 Program 内部，手上没有 cost model、
-同一套偏好也覆盖**刚用过的会话**：**60 秒活跃视界**内的 owner（`kRecencyHorizonSeconds`）在规划器 `preferred` 序里排到所有更久空闲者**之后**，在兜底序里落入第二梯队、组内按最久未活跃排序——**是排序不是排除**：排除会把受害者域排空（rig 实测 `fair=16/16` → `victims=0` → `isolated-feasible request is blocked in an idle Engine`）。理由是活跃名次无法表达"刚读过的别删"——生产每秒触碰 8 个以上 owner，1 秒前读过的会话会掉出 top-N；2026-09-24 实测：一条 7k 会话读完 1 秒后为腾 1 个 device 对象被退休（fork_hit 控制组 79.3%），而数小时没再读的 31k 会话按分排在它之后。视界只决定**谁先轮到**，不改变"必须能找到人"的兜底性。
+同一个序也交给 Program 的容量阶梯（`ResourceManager::retire_preference_order()` →
+`Program::set_retire_preference()`）：那一档跑在 Program 内部，手上没有 cost model、
+同一套偏好也覆盖**刚用过的会话**：**60 秒活跃视界**内的 owner（`kRecencyHorizonSeconds`）在规划器 `preferred` 序里排到所有更久空闲者**之后**，在兜底序里落入第二梯队——**是排序不是排除**：排除会把受害者域排空（rig 实测 `fair=16/16` → `victims=0` → `isolated-feasible request is blocked in an idle Engine`）。理由是活跃名次无法表达"刚读过的别删"——生产每秒触碰 8 个以上 owner，1 秒前读过的会话会掉出 top-N；2026-09-24 实测：一条 7k 会话读完 1 秒后为腾 1 个 device 对象被释放（fork_hit 控制组 79.3%），而数小时没再读的 31k 会话按分排在它之后。视界只决定**谁先轮到**，不改变"必须能找到人"的兜底性。
 observation 表和 demand window，所以由公共层定价并把序交过去（`ResourceManager::retire_preference_order()` →
 `Program::set_retire_preference()`，在 `inspect` / `reserve_materialization` / `reserve_active_capture` 前刷新）。
-公共层这一份定价唯一省略的是 recovery offset（要逐检查点回调 Program，而兜底恰恰发生在池子耗尽时，
-不能再加往返）；其余因子与规划器逐项相同。兜底仍以"最久未触碰"保底——那一步必须总能给出一个人，
-这是它存在的理由（2026-09-23 22:19：池满且无冗余副本时，它按 LRU 退役了一条 237k 真实会话，
+公共层这一份定价唯一省略的是 recovery offset（要逐检查点回调 Program，而这一步恰恰发生在池子耗尽时，
+不能再加往返）；其余因子与规划器逐项相同。阶梯仍以"最久未触碰"收尾——它必须总能给出一个人，
+这是它存在的理由（2026-09-23 22:19：池满且无冗余副本时，它按 LRU 释放了一条 237k 真实会话，
 而 9 条刚创建的 31k 测试会话存活；价值序修掉的就是这个选择）。
 
 Shared owner 没有固定 retention multiplier。`ExplicitBoundary` 或 `RequestedAutomatic` 在 publication 时带来
@@ -876,7 +877,7 @@ target 数还按"有风险的收益"折算：一次精确评估约 1 ms，一个
 占其 6.66 s TTFT 的 94%）。有效上限 = `clamp(可挽回时间 / 20 / 1ms, 256, kTargetBudget)`；
 下限 256 是为了给"每个候选的 guided closure + 有界种子探针"留出空间，否则探针会被上限提前打断
 而失去早停。同时，**由 guided closure 产生、且驱逐 owner 数不超过 8 的种子方案可以在有界探针后
-被接受**：闭包本身已按价值序（最冷、最少复用、最低保留权重优先）贪心挑选 victim，其释放集合就是
+被接受**：闭包本身已按 §2.2 那一个价值序贪心挑选 victim，其释放集合就是
 贪心最小集合，继续搜索通常只是在同一档位上细化。实测该规则把生产满池下的规划从 5.36 s 降到
 亚毫秒级，命中率不变（96.5%）。
 
@@ -897,7 +898,7 @@ cache quality，不改变 mandatory request readiness。
 贪心前缀**（按释放量降序、frontier 作确定并列，上限 4 个）与一条"丢弃其余全部锚点"的聚合后继。
 更深的保留集合仍可通过后续 expansion 到达，因此该界只限制探索量，不移除可达 post-state。
 
-**定价必须容忍 owner 已被退休（2026-09-21 补充）。** 阶梯最后一步可以在任何时刻退休一个空闲
+**定价必须容忍 owner 已被释放（2026-09-21 补充）。** 阶梯的 R2 档可以在预留处释放一个空闲
 owner，而 ResourceManager 的 catalog 视图要等下一次重建才对 齐；此时对该 owner 的检查点定价
 （`checkpoint_recovery_work`）抛出 `runtime::StalePlanningReference`。规划侧把该检查点视为不可用
 （其 saving 已不可实现）而跳过，预留阶段则返回 `MaterializationReserveResult::Stale` 让引擎重新
@@ -1063,26 +1064,22 @@ Placement 只在 admission、capture、finish 或显式 inactive release 的 res
 
 ### 10.2 Fair-share retention（保底桶）
 
-retention class 的 prior 只能影响可行 target 之间的取舍，无法阻止容量不足时唯一可行的 victim
-选择——一个空闲会话的深度端点仍会被活跃邻居的 churn 整段释放（2026-09-12 生产事故：空闲
-155k 会话在邻居 76 分钟增长/压缩 churn 中 0% 命中）。公平份额保留用结构性保护补上这一层：
+公平份额与 60 秒活跃视界**不是第二套规则，也不是"排除"**：它们只是 §2.2 那一个 `importance` 的
+取值——受保护的 owner **仍然在** materialization pressure 与 shared-capture pressure 的候选集里，
+只是被抬到 `K + score`（排到所有未受保护者之前），组内仍走同一条 `value → age → id` 链
+（判定见 [缓存模块 v2](缓存模块v2.md) §2.2 与 §六.4；`resource_manager.h` 里"保护是取值、不是否决"
+的代码注释是同一句话）。之所以必须是取值：排除会把受害者域排空（rig churn 下 `fair=16/16`、
+`victims=0`，一个本可运行的请求在空闲引擎里等到队列超时）。
+
+保底集合的定义（仍然有效）：
 
 1. ResourceManager 为每个 catalogued private continuation 维护 last-activity epoch
    （publication、reuse hit、restore 时推进）；
 2. 没有 active edge 且仍持有 checkpoint 集合的会话按 MRU 排序，前
-   `fair_share_buckets` 个（配置轴，默认 8，0 禁用）构成保底桶；
-3. 保底桶 owner 的 checkpoint 集合（StateImage 与 KV 页随 owner 一体）从 materialization
-   pressure 的 victim domain、shared-capture pressure domain 与 shared-capture portfolio
-   中整体缺席——价值模型永远看不到它们，因此任何压力目标都无法驱逐；
-4. 当共享池与全部未保护 owner 耗尽、连 root maximal 都不可行时，`plan_materialization`
-   释放最老的保底桶并整体重规划，直至请求可行或全部桶释放完毕；最后一次尝试运行于完整
-   victim domain，其 root maximal target 即无界 correctness fallback，因此保底桶永远不会
-   把一个本可运行的请求误判为 blocked；
-5. 释放桶只影响该次规划的 victim 域；会话的下一次活动会重新进入 MRU 排序。桶被释放后
-   会话被驱逐时，既有 eviction/spill 观察器照常生效。
+   `fair_share_buckets` 个（配置轴，默认 8，0 禁用）进入受保护量级。
 
-保底桶是硬保证，与 retention weight 的软排序正交：weight 决定“可行时牺牲谁”，保底桶决定
-“谁不可被牺牲”。
+原先这里写的"保底桶从 victim domain 中整体缺席""是硬保证""耗尽时释放最老桶重规划"是 v2 之前的
+排除式实现，已删除：现在结构上**没有桶可释放**，保护只改变谁先轮到。
 
 ### 10.3 规划器时间预算
 
@@ -1135,7 +1132,7 @@ terminal Finish 没有合法 publication capacity 时采用 Discard。
 | `max_private_continuations` | private owner/catalog 容量 |
 | `max_shared_prefixes` | shared immutable owner/catalog 容量 |
 | `max_long_anchors_per_continuation` | 每条 private history 的 retained long checkpoints 上限 |
-| `fair_share_buckets` | 保底桶数：按 MRU 顺序对空闲 private 会话 checkpoint 集合做硬 victim 保护的数量（默认 8，0 禁用；cache 禁用时强制 0） |
+| `fair_share_buckets` | 按 MRU 顺序把空闲 private 会话的 checkpoint 集合抬到 `importance` 的受保护量级（`K + score`，排到所有未受保护者之前，仍在候选集里；默认 8，0 禁用，见 [缓存模块 v2](缓存模块v2.md) §2.2） |
 
 所有 stores、catalogs、Program unique-object scratch 和 reusable planner frontiers 都按解析后的上限建立。
 每个 pressure planning session 的 target arena、hash 和 assessment storage 在 session 开始时按固定上限取得
@@ -1179,9 +1176,8 @@ Context cache disabled 时采用 root-only 语义：不读取或发布 inactive 
     saving。
 17. Candidate selection 不是资源预留；实际 capture target 必须在 frontier 到达后按当前 revision 重新
     证明完整物理终态。
-18. Fair-share 保底桶只改变哪些 owner 进入 pressure victim domain；最后一次规划运行于完整 victim
-    domain，因此保底桶永远不能把本可运行的请求判为 blocked，只会在共享池耗尽时按 MRU 顺序
-    让最老桶依次让出容量。
+18. Fair-share 与 60 秒活跃视界只是 `importance` 的量级（`K + score`），**不是**把 owner 排除出
+    victim domain；排除会把受害者域排空（见 [缓存模块 v2](缓存模块v2.md) §2.2/§六.4）。
 
 ---
 

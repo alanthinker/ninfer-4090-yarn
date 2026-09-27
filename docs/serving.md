@@ -94,11 +94,12 @@ state block (about 300 MiB with a held turn checkpoint on Qwen3.8-27B); a 6.9k-t
 session measures 416 MiB, saving in ~0.24 s and restoring in ~0.12 s on NVMe. The DFlash
 backend is not supported.
 
-When `--turn-checkpoints` is active, a snapshot also carries the slot's checkpoint ring at
-about 147 MiB per entry (format version 2; a snapshot with an empty ring stays version 1,
-which binaries without ring support keep reading). The restored ring lets a later
-mid-history edit reuse the session; see
-[turn-checkpoint-ring.md](turn-checkpoint-ring.md).
+A snapshot is the continuation-catalog format (version 3): beside the endpoint it carries the rewrite
+checkpoint and the retained long anchors, each an extra StateImage, while the KV payload already
+covers every checkpoint frontier. A later mid-history edit therefore reuses the session through those
+turn-boundary checkpoints exactly as it does for a warm one. Snapshot versions 1 and 2 - the retired
+per-slot turn-checkpoint ring format - are **rejected** by this build; the
+`--turn-checkpoints` flag is accepted and ignored.
 
 A successful save or restore binds the slot to its file. With `--auto-save-evicted`, an
 involuntary eviction (a fresh session claiming the slot, a restore over it, or a
@@ -866,7 +867,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--slot-save-path DIR` | enable `/slots/{id}?action=save\|restore\|erase` session persistence into DIR | disabled |
-| `--turn-checkpoints N` | retained turn checkpoints per slot for mid-history prompt reuse; see [turn-checkpoint-ring.md](turn-checkpoint-ring.md) | `0` |
+| `--turn-checkpoints N` | **retired**: accepted and ignored (the upstream reconciliation replaced the per-slot ring with the continuation-catalog snapshot format; see [turn-checkpoint-ring.md](turn-checkpoint-ring.md)) | `0` |
 | `--auto-save-evicted` | spill an involuntarily evicted session back to its bound slot file; requires `--slot-save-path` | off |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
@@ -888,7 +889,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
 | `--auto-long-anchors N` | propose a private long anchor at the boundary immediately before each of the last N user messages of every prompt (default 5), at least one window step apart - `--first-anchor-spacing` scaled down to the prompt, floor 1024 tokens; clamped to the anchor limit, `0` disables | anchor limit |
 | `--auto-anchor-spacing N` | also propose a private long anchor at the first message boundary at or after every N tokens of the prompt, so a divergence in the middle of a long history resumes nearby instead of from token zero; `0` disables | `0` |
-| `--fair-share-buckets N` | most recently active N idle private sessions are victim-protected: their checkpoint sets (state images plus KV pages) cannot be evicted by other sessions' pressure; a request that fits no other way releases them oldest first; `0` disables | `8` |
+| `--fair-share-buckets N` | the most recently active N idle private sessions are ranked ahead of every other cached record in the single `importance` ordering, so they are the LAST to be sacrificed, never the first; they are not removed from the victim set (a request that fits no other way still takes them, least valuable first); `0` disables | `8` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
@@ -920,14 +921,15 @@ about 147 MiB per slot); lowering `--max-long-anchors-per-continuation` costs ab
 session per anchor and gives up the deeper recovery points.
 
 The two capacity axes above size what can be resident; `--fair-share-buckets` decides who keeps a
-place when it cannot all fit. The most recently active N idle sessions are victim-protected against
-other sessions' pressure, so a chatty neighbor growing and compacting for an hour no longer evicts
-an idle session's deep endpoint out of the shared pool (the 2026-09-12 incident: an idle 155k
-session returned 0% after its neighbor's churn, then paid a full 3m40s re-prefill on return).
-Protection is structural, not a value-weight hint: protected checkpoints are absent from the
-pressure victim domain entirely. When the shared pool and every unprotected owner are exhausted and
-even the maximal plan does not fit, the engine releases the oldest protected bucket and replans,
-oldest first, so a request that fits only by giving up a bucket still runs. The cost is that a
+place when it cannot all fit. The most recently active N idle sessions are ranked ahead of every
+other cached record in the one `importance` ordering, so a chatty neighbor growing and compacting for
+an hour sacrifices the cheapest records first and no longer drops an idle session's deep endpoint out
+of the shared pool (the 2026-09-12 incident: an idle 155k session returned 0% after its neighbor's
+churn, then paid a full 3m40s re-prefill on return). Protection is a VALUE inside that ordering, not
+a separate exclusion: protected owners stay in the victim set (排到所有未受保护者之前, 组内仍走同一条
+`value → age → id` 链), which is what keeps the fallback bounded — an exclusion would empty the victim
+domain and turn a runnable request into a stall (rig: `fair=16/16`, `victims=0`, engine idle while the
+request waits out its deadline). The cost is that a
 single very large active session can borrow less of the pool while many buckets are full: the
 cut is the cheapest shallow anchors of shared-pool owners, and endpoint/tail-anchor reuse of the
 active session itself is unaffected.
@@ -1126,11 +1128,14 @@ Admission reserves the full prompt-plus-effective-output page entitlement throug
 completion. A request remains queued until a legal resource plan can satisfy that entitlement.
 
 Each reusable checkpoint contains KV and complete continuation state. At admission, capture, and
-finish boundaries, resource pressure may keep it on Device, move its StateImage and/or KV replicas
-to pinned Host memory, or evict it. The planner compares incoming-request work with the later
-recovery cost imposed on retained checkpoints. Active requests retain their state and completion
-reservations, and placement choices preserve model semantics. The full policy and invariants are
-defined in [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md).
+finish boundaries, resource pressure may keep it on Device, **move** its StateImage and/or KV
+replicas to pinned Host memory (R1), or — once the Host pool is full — delete the least valuable
+Host-side record (R2); the Device side never deletes. The planner compares incoming-request work with
+the later recovery cost imposed on retained checkpoints. Active requests retain their state and
+completion reservations, and placement choices preserve model semantics. The retention rules and
+invariants are defined in [缓存模块 v2](maintainer/缓存模块v2.md); resource selection, materialization,
+and physical transitions are in
+[Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md).
 
 Compatible prefixes are reused for both text and multimodal histories unless the server starts with
 `--no-prefix-reuse`. A multimodal hit additionally requires matching token types, three-axis MRoPE

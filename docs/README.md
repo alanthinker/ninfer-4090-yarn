@@ -45,7 +45,7 @@ Runtime and Op references:
 - [Resource scheduling, continuation/checkpoint, and Device/Host context-cache contracts](maintainer/resource-scheduling-and-context-cache.md)
 - [缓存模块 v2：两级缓存的设计意图（R0–R3 规则、单一 importance 排序、删除只在内存侧）](maintainer/缓存模块v2.md)
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
-- [Context-cache physical storage, eviction order, and recovery paths](maintainer/上下文缓存物理存储与恢复.md)
+- [Context-cache physical storage, transfer flows, and recovery paths](maintainer/上下文缓存物理存储与恢复.md)
 - [Operational logging channels, ownership, format, levels, and data policy](maintainer/logging.md)
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
@@ -57,10 +57,12 @@ Runtime and Op references:
 materialization, checkpoint ownership, and replica policy. The remaining files define physical
 storage, model, artifact, Op, or measurement contracts rather than parallel architecture variants.
 
-`缓存模块v2.md` is the design intent for the two-tier cache rewrite: the retention rules, the single
-`importance` ordering, and the invariants. When v2 lands, its rules become the retention authority
-and the eviction-order sections of `resource-scheduling-and-context-cache.md` are removed rather
-than kept beside it.
+`缓存模块v2.md` is the retention authority: the R0–R3 rules, the single `importance` ordering, and
+the invariants. It has landed (2026-09-27), so the retention/eviction-order material it supersedes is
+removed from the other references rather than kept beside it — the retention and victim-ordering
+sections of `resource-scheduling-and-context-cache.md` (its planning algorithm, ownership, revision,
+and publication contracts remain) and the eviction-order description of
+`上下文缓存物理存储与恢复.md` (its physical layouts, transfer flows, and recovery paths remain).
 
 Artifact and model references:
 

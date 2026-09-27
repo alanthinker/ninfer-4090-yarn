@@ -2,25 +2,30 @@
 
 ## Purpose
 
-Verify that the engine's state management (LRU device eviction + fair-share host
-protection) correctly preserves idle conversation state, allowing quick restoration
-when switching between conversations.
+Verify that the engine's state management correctly preserves idle conversation state, allowing quick
+restoration when switching between conversations. The retention rules themselves are
+[缓存模块 v2](缓存模块v2.md) (R0–R3, one `importance` ordering, deletion only on the Host side); this
+file only describes the test that exercises them.
 
 ## The Problem This Protects Against
 
-With 8 device state slots and potentially many concurrent conversations:
+With 4 Device state slots and potentially many concurrent conversations:
 
 1. An active conversation's repeated activity fills all device slots
-2. Idle conversations' device replicas get evicted (LRU)
-3. **If the host replica is also lost** (evicted from 320 host slots, or never
-   created because the state was DeviceOnly), the conversation is unrecoverable
+2. Idle conversations' device state images leave the Device pool — a redundant replica is dropped, or
+   a DeviceOnly image is **moved** to Host (R1: move, never destroy)
+3. **If the Host replica is also lost** (dropped from the 320 host slots because the Host pool is
+   full and this conversation's record is the least valuable one), the conversation is unrecoverable
    without full re-prefill (minutes for 100K+ token prompts)
 
 The correct behavior:
 
-- Device eviction is fine (100ms H2D reload)
-- Host replicas of protected sessions must survive (fair-share)
-- Switching to an idle conversation: LRU frees a device slot → H2D load → done
+- A Device-side move is fine (100ms H2D reload)
+- A recently active conversation's Host replicas survive because the one ordering ranks them first —
+  fair-share and the 60-second horizon are VALUES inside `importance`, never an exclusion from the
+  victim set (§2.2)
+- Switching to an idle conversation: a device slot is freed (drop a redundant replica / move the
+  least valuable image to Host) → H2D load → done
 
 ## Test Script
 
@@ -68,9 +73,9 @@ was truly lost (evicted from both device and host).
 
 | Config | Effect on test |
 |--------|---------------|
-| `--device-state-slots 4` | 8 total device slots; more active rounds = more eviction pressure |
+| `--device-state-slots 4` | 4 device slots next to the concurrent lanes; more active rounds = more move pressure |
 | `--host-state-slots 320` | Must be large enough for all conversations' host replicas |
-| `--fair-share-buckets 8` | Protects 8 most recent idle sessions; with 9 convs, conv 1 may NOT be protected. Switch-back/state-index scripts must therefore pass `--conversations <= buckets` (and `--verify <= conversations`): on a FULL pool an out-of-set oldest conversation is evicted legitimately and the all-hit assertion goes red for the wrong reason (both `prefix_switch` `9>8` and `state_index` `verify5>conversations4` produced false REDs on 2026-09-23) |
+| `--fair-share-buckets 8` | The 8 most recently active idle sessions are ranked AHEAD of everyone else in `importance`, not removed from the victim set; with 9 convs, conv 1 may legitimately be the cheapest record once the pool is full. Switch-back/state-index scripts must therefore pass `--conversations <= buckets` (and `--verify <= conversations`): on a FULL pool an out-of-set oldest conversation is sacrificed legitimately and the all-hit assertion goes red for the wrong reason (both `prefix_switch` `9>8` and `state_index` `verify5>conversations4` produced false REDs on 2026-09-23) |
 | `--auto-long-anchors N` (default 5) | Each conversation keeps up to N tail anchors, at least `--first-anchor-spacing` apart (more host slots consumed) |
 | `--max-private-continuations 16` | Catalog capacity; must be >= number of conversations |
 
@@ -131,12 +136,12 @@ Measured on 2026-09-22 at `host_state_slots 320/320` (`--host-state-slots 320`,
 **A saturated pool publishes the newest boundary, not the whole window.** The request's own tail
 anchor - the one its next message resumes from - is published even at `320/320`; the deeper members
 of the last-N window are skipped with `capture: skip reason=pressure-no-private-baseline`, because
-publishing them would have to evict another session's checkpoint and the per-request destructive
-reclaim is spent on the newest frontier. The consequence is measurable: at `320/320` a fork into
+publishing them would have to sacrifice another session's checkpoint and the one release the request
+is allowed to take (R2: the least valuable Host-side record) is spent on the newest frontier. The consequence is measurable: at `320/320` a fork into
 the middle of a 4.8K conversation reused 801 of 3,883 tokens (21 %) and a fork into the middle of a
 23K conversation reused 7,157 of 14,208 (50 %), while the same two shapes on a small pool with room
 to publish reused 62 % and 63 %. Deeper coverage at saturation is therefore a capacity decision
-(more `--host-state-slots`, or spending more than one destructive reclaim per cold request), not a
+(more `--host-state-slots`, or a second R2 step for a cold request), not a
 frontend one.
 
 ### Reading Cache Hits From a Client
@@ -150,9 +155,10 @@ a 99.8 % hit into a false "VERDICT miss". Every harness in `tools/smoke/` reads 
 ## When to Run
 
 Run this test after any change to:
-- `StateImageStore` (device/host slot allocation, eviction, LRU)
+- `StateImageStore` (device/host slot allocation, replica residency, demotion)
 - `MaterializationPlanner` (pressure search, budget)
-- Fair-share logic (bucket assignment, protection)
+- The one `importance` ordering (`cache_owner_rank_less`, fair-share and the 60-second horizon as
+  values inside it)
 - `program_impl.h` state placement (freeze, move_checkpoint, fork)
 - Host-to-device transfer path
 

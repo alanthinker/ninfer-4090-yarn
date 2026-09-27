@@ -160,6 +160,9 @@ routing map, not a mandatory reading list:
 - `docs/maintainer/engine-architecture.md`: Gateway/Frontend/Engine/Runtime boundaries, execution
   ownership, request/response/continuation lifecycles, admission, scheduling, output transactions,
   batched execution, and CUDA Graph semantics;
+- `docs/maintainer/缓存模块v2.md`: the retention authority for the two-tier cache - rules R0-R3, the
+  single `importance` ordering, and the invariants (a task that changes retention, victim ordering, or
+  what may be deleted reads this first);
 - `docs/maintainer/resource-scheduling-and-context-cache.md`: resource selection and accounting,
   continuation/checkpoint ownership, materialization transactions, and Device/Host replica policy;
 - `docs/maintainer/paged-kv-cache.md`: shared KV capacity, page ownership, retention, physical
