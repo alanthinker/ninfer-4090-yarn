@@ -1217,14 +1217,24 @@ public:
     bool cached_relief_available       = false;
     std::size_t cached_relief_requests = 0;
     // Shared-replacement model for the §三 R1 invariant: `shared_victim_device_data` says the
-    // catalogued shared owner still holds Device replicas, and `shared_replacement_inspections`
-    // counts how often the manager OFFERED an owner as a replacement victim (the moment that leads
-    // to `[invariant1] strict-shared site=capture-replacement`).
+    // catalogued shared owner still holds Device replicas, `shared_victim_move_possible` whether its
+    // data can be moved to Host, `shared_replacement_moves` counts the move attempts and
+    // `shared_replacement_inspections` how often the manager went on to OFFER that owner as a
+    // replacement victim (the moment that leads to
+    // `[invariant1] strict-shared site=capture-replacement`).
     bool shared_victim_device_data                    = false;
+    bool shared_victim_move_possible                  = true;
+    mutable std::size_t shared_replacement_moves      = 0;
     mutable std::size_t shared_replacement_inspections = 0;
-    [[nodiscard]] bool shared_owner_teardown_would_destroy_device(
-        const FakeSharedPrefixHandle&) const noexcept {
-        return shared_victim_device_data;
+    // §三 R1: move first. Nothing on Device is ready as is; Device data that CAN be moved is moved
+    // here (and is then Host-only); Device data that cannot be moved makes this victim unusable as a
+    // replacement, because destroying it is exactly what R1 forbids.
+    [[nodiscard]] bool prepare_shared_replacement(const FakeSharedPrefixHandle&) {
+        ++shared_replacement_moves;
+        if (!shared_victim_device_data) { return true; }
+        if (!shared_victim_move_possible) { return false; }
+        shared_victim_device_data = false;
+        return true;
     }
     std::size_t required_pressure_actions       = 0;
     std::size_t eviction_pressure_action_units  = 1;
@@ -3897,24 +3907,44 @@ void test_shared_replacement_is_not_offered_for_a_device_holding_victim() {
                                              {});
     };
 
-    // (A) The victim still holds Device data: it must not be offered as a replacement.
+    // (A) The victim holds Device data that CAN be moved: it is moved first (§三 R1: 显存里的数据只有
+    //     两种归宿, 正在用, 或搬到内存), and only then may the replacement go ahead.
     {
         FakeManager manager = make_manager(2, 3, 1);
         FakeProgram program;
         publish_seed(manager, program);
         program.shared_victim_device_data = true;
+        program.shared_victim_move_possible = true;
         offer_replacement(manager, program, 93);
+        require(program.shared_replacement_moves == 1,
+                "the replacement path must MOVE the victim's Device data to Host before destroying it");
+        require(!program.shared_victim_device_data,
+                "the move must leave the victim Host-only");
+        require(program.shared_replacement_inspections == 1,
+                "a victim that could be moved is still a replacement candidate");
+    }
+    // (B) The victim's Device data CANNOT be moved: it must not be replaced at all - destroying it is
+    //     what R1 forbids, and the promotion is optional (§7.2).
+    {
+        FakeManager manager = make_manager(2, 3, 1);
+        FakeProgram program;
+        publish_seed(manager, program);
+        program.shared_victim_device_data  = true;
+        program.shared_victim_move_possible = false;
+        offer_replacement(manager, program, 95);
+        require(program.shared_replacement_moves == 1,
+                "the path must TRY to move before declining");
         require(program.shared_replacement_inspections == 0,
-                "a shared owner that still holds Device data was offered as a replacement victim "
+                "a shared owner whose Device data cannot be moved was offered as a replacement victim "
                 "(releasing it would destroy Device data; R2 may only delete Host)");
     }
-    // (B) Control: a host-only victim is still replaceable, so the rule does not disable the path.
+    // (C) Control: nothing on Device is ready as is, so the path is not disabled.
     {
         FakeManager manager = make_manager(2, 3, 1);
         FakeProgram program;
         publish_seed(manager, program);
         program.shared_victim_device_data = false;
-        offer_replacement(manager, program, 95);
+        offer_replacement(manager, program, 97);
         require(program.shared_replacement_inspections == 1,
                 "a host-only shared owner must still be considered as a replacement victim");
     }

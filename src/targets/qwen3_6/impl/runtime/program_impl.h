@@ -8523,19 +8523,27 @@ std::string ProgramImplCore::retire_order_debug() const {
     return out;
 }
 
-bool ProgramImplCore::shared_owner_teardown_would_destroy_device(
-    const SharedPrefixHandle& shared) const noexcept {
+bool ProgramImplCore::prepare_shared_replacement(const SharedPrefixHandle& shared) {
     const std::uint32_t index = ContractAccess::index(shared);
-    if (index >= shared_prefix_capacity) { return false; }
+    if (index >= shared_prefix_capacity || !state_store) { return false; }
     if (shared_prefix_slots[index].generation != ContractAccess::epoch(shared) ||
         shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued) {
         return false;
     }
     const SharedPrefixState& state = shared_prefix_states[index];
     if (!state.kv) { return false; }
-    const detail::PhysicalResources exclusive = owner_exclusive_resources(state);
-    return exclusive.device.main_kv_pages != 0 || exclusive.device.backend_kv_pages != 0 ||
-           exclusive.device.state_slots != 0;
+    // Nothing on Device means the teardown already destroys Host data only - ready as is.
+    const auto holds_device_data = [&]() {
+        const detail::PhysicalResources exclusive = owner_exclusive_resources(state);
+        return exclusive.device.main_kv_pages != 0 || exclusive.device.backend_kv_pages != 0 ||
+               exclusive.device.state_slots != 0;
+    };
+    if (!holds_device_data()) { return true; }
+    // §三 R1: move first. This is the very prelude the pressure paths already run
+    // (`prepare_shared_victim_teardown`): spill the Device KV to Host and give the state image a Host
+    // replica, so the later strict release can only destroy Host-side data.
+    prepare_shared_victim_teardown(index);
+    return !holds_device_data();
 }
 
 bool ProgramImplCore::release_one_cached_unit() {

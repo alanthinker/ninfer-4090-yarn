@@ -651,10 +651,10 @@ public:
     }
 
     [[nodiscard]] qwen3_6::PhysicalUsageSnapshot physical_usage() const noexcept;
-    // §三 R1 / §四 invariant 1: true when releasing this shared owner would destroy Device data
-    // (its exclusive footprint still holds Device KV pages or Device state slots).
-    [[nodiscard]] bool
-    shared_owner_teardown_would_destroy_device(const SharedPrefixHandle& shared) const noexcept;
+    // §三 R1 / §四 invariant 1: move a shared owner's Device data to Host so that replacing it destroys
+    // only Host-side data. Returns true when the victim is Host-only afterwards (including "it held no
+    // Device data to begin with"); false means it could not be moved and must not be replaced.
+    [[nodiscard]] bool prepare_shared_replacement(const SharedPrefixHandle& shared);
     // Diagnostic for the R0 park line: how many owners the ladder may walk. An empty or tiny list
     // while the pool is full is the signature of "finished conversations hold the cache but are not
     // candidates" (2026-09-27).

@@ -598,9 +598,8 @@ std::string Program<Variant>::retire_order_debug() const {
 }
 
 template <>
-bool Program<Variant>::shared_owner_teardown_would_destroy_device(
-    const SharedPrefixHandle<Variant>& shared) const noexcept {
-    return impl_->shared_owner_teardown_would_destroy_device(shared);
+bool Program<Variant>::prepare_shared_replacement(const SharedPrefixHandle<Variant>& shared) {
+    return impl_->prepare_shared_replacement(shared);
 }
 
 template <>
