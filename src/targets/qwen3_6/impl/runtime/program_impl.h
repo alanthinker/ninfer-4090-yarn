@@ -4576,6 +4576,15 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
         active_continuations[lane] < continuation_capacity) {
         throw std::logic_error("materialization activation is stale");
     }
+    // What this admission is worth, in prompt tokens: the reuse it restores, or - for a request
+    // with nothing to reuse - the prompt it is about to compute itself. The ladder's lossy step
+    // reads it and refuses to destroy a checkpoint deeper than that, so a disposable session in a
+    // flood cannot spend a 20 179-token conversation's anchors on its own 1 873-token prefill
+    // (rig important_session, 2026-09-26: `catalog: refresh slot=16 anchors 2 -> 1`, then 0 %).
+    ladder_beneficiary_tokens = std::max<std::uint32_t>(
+        static_cast<std::uint32_t>(std::min<std::size_t>(
+            prompt.token_ids.size(), std::numeric_limits<std::uint32_t>::max())),
+        details.summary.reusable_prompt_tokens);
 
     const SequenceState* source_state =
         details.has_source ? &continuation_states[details.source_index] : nullptr;
@@ -7355,7 +7364,7 @@ std::uint32_t ProgramImplCore::retirable_host_state_slots() const noexcept {
     return slots;
 }
 
-bool ProgramImplCore::degrade_idle_owner_host_state() {
+bool ProgramImplCore::degrade_idle_owner_host_state(std::uint32_t beneficiary_tokens) {
     if (!state_store || !text_kv_addresses || !text_kv_pages) { return false; }
     // Invariant 1 compliance lives in the candidate gates below: this step releases ONE Host
     // state slot by shrinking one owner's checkpoint inventory - shallowest HostOnly anchor
@@ -7366,6 +7375,7 @@ bool ProgramImplCore::degrade_idle_owner_host_state() {
     // spill-then-release) so the truncation only releases Host pages - and the drop is declined
     // if even that cannot make the range Host-only.
     std::uint32_t skip_nokv = 0, skip_nohoststate = 0, skip_invalid = 0, skip_protected = 0,
+                  skip_price = 0,
                   skip_active = 0, skip_residency = 0, skip_refs = 0, skip_noplace = 0,
                   skip_beyond = 0, skip_race = 0, skip_shared = 0;
     const auto device_beyond = [&](const KVAddressSpaceStore& addresses,
@@ -7380,6 +7390,33 @@ bool ProgramImplCore::degrade_idle_owner_host_state() {
         return false;
     };
     const auto degrade_owner = [&](std::uint32_t index) -> bool {
+        // Price the action before touching anything: this owner's deepest retained checkpoint is
+        // its rebuild cost, and a capture may not destroy a conversation that deep to place its
+        // own. Without this the pool converged to "many conversations, no anchors": every capture
+        // paid for its slot with another owner's anchor, so an 8-round conversation ended with
+        // {closure, endpoint} only and a mid-history reuse had nothing to match (production
+        // 2026-09-26: `catalog: refresh slot=157 anchors 2 -> 1`, then `fork@4: cached=0`).
+        const std::uint32_t effective_price =
+            std::max(beneficiary_tokens, ladder_beneficiary_tokens);
+        if (effective_price != 0) {
+            const SequenceState& priced = continuation_states[index];
+            if (!priced.kv) { return false; }
+            const qwen3_6::ContinuationSummary priced_summary = continuation_summary(priced);
+            std::uint64_t deepest = 0;
+            if (priced_summary.endpoint) {
+                deepest = std::max(deepest, priced_summary.endpoint->rebuild_work.tokens);
+            }
+            if (priced_summary.rewrite) {
+                deepest = std::max(deepest, priced_summary.rewrite->rebuild_work.tokens);
+            }
+            for (const auto& anchor : priced_summary.long_anchors) {
+                deepest = std::max(deepest, anchor.rebuild_work.tokens);
+            }
+            if (deepest >= effective_price) {
+                ++skip_price;
+                return false;
+            }
+        }
         SequenceState& sequence = continuation_states[index];
         if (!sequence.kv || sequence.state.fork_pending) { ++skip_nokv; return false; }
         // Invariant 3: only an owner holding a Host state slot can repay this ladder step.
@@ -7588,9 +7625,11 @@ bool ProgramImplCore::degrade_idle_owner_host_state() {
     }
     std::fprintf(stderr,
                  "[ladder] degrade declined: nokv=%u nohoststate=%u invalid=%u protected=%u"
-                 " active=%u residency=%u refs=%u noplace=%u beyond=%u race=%u shared=%u\n",
+                 " active=%u residency=%u refs=%u noplace=%u beyond=%u race=%u shared=%u"
+                 " price=%u\n",
                  skip_nokv, skip_nohoststate, skip_invalid, skip_protected, skip_active,
-                 skip_residency, skip_refs, skip_noplace, skip_beyond, skip_race, skip_shared);
+                 skip_residency, skip_refs, skip_noplace, skip_beyond, skip_race, skip_shared,
+                 skip_price);
     std::fflush(stderr);
     return false;
 }
@@ -10311,7 +10350,8 @@ bool ProgramImplCore::enqueue_active_capture_transfers(ActiveCaptureTransaction&
             // idle owner's HostOnly checkpoint (R2), or release a whole device-free idle
             // conversation if nothing degrades - never destroy Device data (§三 R1/R2).
             const bool freed_host_slot =
-                degrade_idle_owner_host_state() || release_idle_owner_host_side();
+                degrade_idle_owner_host_state(transaction.group.frontier) ||
+                release_idle_owner_host_side();
             if (freed_host_slot) {
                 std::optional<StateImageTransfer> retry =
                     state_store->begin_device_to_host(transaction.source_state,
