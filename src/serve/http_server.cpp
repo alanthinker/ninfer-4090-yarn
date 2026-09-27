@@ -54,12 +54,17 @@ std::int64_t days_from_civil(std::int64_t year, std::int64_t month, std::int64_t
 
 } // namespace
 
-// Diagnostic-only raw request dump, enabled by NINFER_DUMP_REQUESTS=<dir> (unset by default).
+// Diagnostic-only raw request/response dump, enabled by NINFER_DUMP_REQUESTS=<dir> (unset by
+// default).
 //
 // Exists because prefix-reuse debugging needs the exact rendered payload: the engine reports how
 // many tokens were reused but never the tokens themselves, so a client whose sessions fail to
-// share a prefix cannot be diagnosed from the server side at all. Each accepted body is written as
-// its own file so two requests can be diffed byte for byte.
+// share a prefix cannot be diagnosed from the server side at all. Each accepted body is written
+// as its own file so two requests can be diffed byte for byte. Response dumps add the missing
+// other side of that diff: after a completion the generated assistant turn (content, reasoning
+// and tool calls, protocol-neutral) is written as "<time>-resp-<number>-<route>.json" next to
+// the request body, so a missed endpoint reuse can be attributed by diffing resp-N against the
+// assistant messages the client re-sends in request N+1.
 //
 // Retention is bounded so that a forgotten switch cannot fill the disk or leave conversation
 // content lying around indefinitely. Both bounds are read once, on first use:
@@ -68,17 +73,19 @@ std::int64_t days_from_civil(std::int64_t year, std::int64_t month, std::int64_t
 // The directory is pruned on every write, which costs one readdir of a <=limit-entry directory and
 // guarantees the count bound holds at all times.
 //
-// File names: finalized dumps are "<time>-req-<number>-<route>.json" with the capture instant
-// in RFC 3339 local form "YYYY-MM-DDTHH:MM:SS±HH:MM" leading (process-local wall clock plus
-// its explicit UTC offset, so the name is locale-independent, parses to the same instant on
-// any host in any timezone, and a plain directory listing reads in capture order); pending
-// dumps are "req-<unix-ms stamp>-s<sequence>-<route>.json" where the sequence is a
+// File names: finalized request dumps are "<time>-req-<number>-<route>.json" with the capture
+// instant in RFC 3339 local form "YYYY-MM-DDTHH:MM:SS±HH:MM" leading (process-local wall clock
+// plus its explicit UTC offset, so the name is locale-independent, parses to the same instant
+// on any host in any timezone, and a plain directory listing reads in capture order); pending
+// request dumps are "req-<unix-ms stamp>-s<sequence>-<route>.json" where the sequence is a
 // process-unique capture counter that keeps two captures in the same millisecond apart.
-// Names written by older builds ("req-<number>[-<time>]-<route>.json") parse through the same
-// code and coexist during the transition. The number is the engine request id after
-// finalization (it resets to zero on every process restart, so it is only a deterministic
-// tiebreak, never a retention order key); retention always orders by the filename time, with
-// stat() mtime as the fallback for names that carry neither.
+// Response dumps are written once, at completion, directly under their final name
+// "<time>-resp-<number>-<route>.json" with the completion instant. Names written by older
+// builds ("req-<number>[-<time>]-<route>.json") parse through the same code and coexist during
+// the transition. The number is the route-sequential id (it resets to zero on every process
+// restart, so it is only a deterministic tiebreak, never a retention order key); retention
+// always orders by the filename time, with stat() mtime as the fallback for names that carry
+// neither.
 //
 // Serving must never be affected: every failure path is swallowed and the directory is resolved
 // once, on first use.
@@ -96,13 +103,14 @@ std::uint64_t read_count_option(const char* name, std::uint64_t fallback) {
     return parsed;
 }
 
-// A dump file is named "<time>-req-<number>-<route>.json" after finalization (capture instant
-// leading) or "req-<unix-ms stamp>-s<sequence>-<route>.json" while pending; builds before the
-// time-leading form wrote "req-<number>[-<time>]-<route>.json" and those keep parsing. The
-// number is the engine request id after finalization, or the unix-ms capture stamp while
-// pending; it is used only as a deterministic tiebreak and as that pending-file time, never as
-// a retention order key (it resets on every process restart). Anything else in the directory
-// is left alone: the directory belongs to the operator, not to this diagnostic.
+// A dump file is named "<time>-req-<number>-<route>.json" or "<time>-resp-<number>-<route>.json"
+// after finalization (capture instant leading) or "req-<unix-ms stamp>-s<sequence>-<route>.json"
+// while pending; builds before the time-leading form wrote "req-<number>[-<time>]-<route>.json"
+// and those keep parsing. The number is the route-sequential id after finalization, or the
+// unix-ms capture stamp while pending; it is used only as a deterministic tiebreak and as that
+// pending-file time, never as a retention order key (it resets on every process restart).
+// Anything else in the directory is left alone: the directory belongs to the operator, not to
+// this diagnostic.
 struct DumpFile {
     std::int64_t number = 0;
     std::int64_t time_ms = 0;  // capture time (ms since epoch): filename timestamp, else mtime
@@ -126,13 +134,25 @@ bool parse_dump_file_name(const std::string& name, DumpFile& out) {
         if (*result.ptr != '-') { return false; }
         return true;
     }
-    // Time-leading finalized names: <time>-req-<number>-<route>.json.
-    const std::size_t marker = name.find("-req-");
-    if (marker == std::string::npos || marker == 0) { return false; }
-    auto result = std::from_chars(name.data() + marker + 5, end, out.number);
-    if (result.ec != std::errc() || result.ptr == end) { return false; }
-    if (result.ptr != end && *result.ptr != '-') { return false; }
-    return true;
+    // Time-leading finalized names: <time>-req-<number>-<route>.json (request bodies) and
+    // <time>-resp-<number>-<route>.json (responses). The leading time segment carries no
+    // letters, so at most one marker can occur. The markers have different lengths ("-req-"
+    // is 5 chars, "-resp-" 6), so the number's start offset depends on which one matched.
+    if (const std::size_t req_marker = name.find("-req-"); req_marker != std::string::npos) {
+        if (req_marker == 0) { return false; }
+        auto result = std::from_chars(name.data() + req_marker + 5, end, out.number);
+        if (result.ec != std::errc() || result.ptr == end) { return false; }
+        if (result.ptr != end && *result.ptr != '-') { return false; }
+        return true;
+    }
+    if (const std::size_t resp_marker = name.find("-resp-"); resp_marker != std::string::npos) {
+        if (resp_marker == 0) { return false; }
+        auto result = std::from_chars(name.data() + resp_marker + 6, end, out.number);
+        if (result.ec != std::errc() || result.ptr == end) { return false; }
+        if (result.ptr != end && *result.ptr != '-') { return false; }
+        return true;
+    }
+    return false;
 }
 
 // Capture time embedded in a dump file name, if any. Every character the names use (digits,
@@ -315,6 +335,37 @@ DumpCapture dump_request_body(const httplib::Request& request, const char* route
     }
 }
 
+// One-shot response dump: the completion instant is known up front (unlike the request body,
+// which is captured while the route id is still pending), so the file goes straight to its
+// final "<time>-resp-<number>-<route>.json" name. payload is the protocol-neutral assistant
+// turn produced for the request; see make_response_dump_payload.
+void dump_response_body(const char* route, std::uint64_t request_id,
+                        const nlohmann::json& payload) {
+    static const std::string directory = [] {
+        const char* value = std::getenv("NINFER_DUMP_REQUESTS");
+        return value == nullptr ? std::string() : std::string(value);
+    }();
+    if (directory.empty()) { return; }
+    try {
+        const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+        const std::string time = format_local_timestamp(stamp);
+        if (time.empty()) { return; }
+        const std::string path =
+            directory + "/" + time + "-resp-" + std::to_string(request_id) + "-" + route +
+            ".json";
+        std::FILE* file = std::fopen(path.c_str(), "wb");
+        if (file == nullptr) { return; }
+        const std::string body = payload.dump();
+        (void)std::fwrite(body.data(), 1, body.size(), file);
+        (void)std::fclose(file);
+        prune_dump_directory(directory, stamp);
+    } catch (...) {
+        // A diagnostic failure must never affect serving.
+    }
+}
+
 void finalize_dump_file(const DumpCapture& capture, std::uint64_t request_id, const char* route) {
     if (capture.stamp_ms <= 0) { return; }
     // RFC 3339 local form (YYYY-MM-DDTHH:MM:SS±HH:MM) for human readability: operators
@@ -336,6 +387,84 @@ void finalize_dump_file(const DumpCapture& capture, std::uint64_t request_id, co
 }
 
 namespace {
+
+// Route segment used by both dump file names; nullptr when the protocol has no raw-dump route,
+// in which case record_request_done skips the response dump for that protocol.
+const char* dump_route_for_protocol(const std::string& protocol) noexcept {
+    if (protocol == "openai_chat_completions") { return "chat"; }
+    if (protocol == "openai_responses") { return "responses"; }
+    if (protocol == "anthropic_messages") { return "messages"; }
+    return nullptr;
+}
+
+const char* finish_reason_dump_name(ninfer::FinishReason reason) noexcept {
+    switch (reason) {
+    case ninfer::FinishReason::None:
+        return "none";
+    case ninfer::FinishReason::OutputLimit:
+        return "output limit";
+    case ninfer::FinishReason::ContextCapacity:
+        return "context capacity";
+    case ninfer::FinishReason::StopToken:
+        return "stop token";
+    case ninfer::FinishReason::StopString:
+        return "stop string";
+    case ninfer::FinishReason::Cancelled:
+        return "cancelled";
+    }
+    return "unknown";
+}
+
+const char* reuse_path_dump_name(ninfer::PrefixReusePath path) noexcept {
+    switch (path) {
+    case ninfer::PrefixReusePath::Root:
+        return "root";
+    case ninfer::PrefixReusePath::PrivateEndpoint:
+        return "private endpoint";
+    case ninfer::PrefixReusePath::PrivateTurnClosure:
+        return "turn closure";
+    case ninfer::PrefixReusePath::PrivateResponseReplay:
+        return "response replay";
+    case ninfer::PrefixReusePath::PrivateLongAnchor:
+        return "long anchor";
+    case ninfer::PrefixReusePath::SharedStablePrefix:
+        return "shared prefix";
+    }
+    return "unknown";
+}
+
+// Protocol-neutral assistant turn exactly as the engine produced it: the content a client must
+// re-send for the endpoint reuse to keep matching, plus the cache facts of the completion that
+// tell whether it did.
+nlohmann::json make_response_dump_payload(const RequestLogContext& context,
+                                          const GenerationOutcome& outcome) {
+    nlohmann::json tool_calls = nlohmann::json::array();
+    for (const auto& call : outcome.tool_calls) {
+        tool_calls.push_back({{"type", "function"},
+                              {"function",
+                               {{"name", call.name}, {"arguments", call.arguments_json}}}});
+    }
+    return {
+        {"id", context.id},
+        {"protocol", context.protocol},
+        {"stream", context.stream},
+        {"finish_reason", finish_reason_dump_name(outcome.finish_reason)},
+        {"usage",
+         {{"prompt_tokens", outcome.prompt_tokens},
+          {"completion_tokens", outcome.completion_tokens},
+          {"reasoning_tokens", outcome.reasoning_tokens}}},
+        {"prefix_cache",
+         {{"hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
+          {"reuse_path", reuse_path_dump_name(outcome.metrics.prefix_reuse_path)}}},
+        {"id_slot", outcome.id_slot},
+        {"session_digest", outcome.session_digest},
+        {"message",
+         {{"role", "assistant"},
+          {"content", outcome.text},
+          {"reasoning_content", outcome.reasoning},
+          {"tool_calls", std::move(tool_calls)}}},
+    };
+}
 
 void write_exception(httplib::Response& res, const std::exception& ex) {
     ApiError error;
@@ -595,6 +724,9 @@ void HttpServer::record_request_done(const RequestLogContext& context,
     metrics_.end_request(context.id);
     metrics_.record(outcome);
     operational_log_.request_done(context, outcome);
+    if (const char* route = dump_route_for_protocol(context.protocol)) {
+        dump_response_body(route, context.id, make_response_dump_payload(context, outcome));
+    }
 }
 
 void HttpServer::record_request_failure(const RequestLogContext& context,

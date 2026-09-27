@@ -22,14 +22,17 @@
 #                        都相同的边界。见 README 前缀缓存一节。
 #   NINFER_MAX_SHARED_PREFIXES  共享前缀目录容量, 默认 4 (实测调大不解决长会话问题)
 #   NINFER_FAIR_SHARE_BUCKETS  公平份额桶数: 最近活跃的 N 个空闲会话被驱逐硬保护, 默认 8, 0 关闭
-#   NINFER_DUMP_REQUESTS  请求体落盘目录, 默认 $RUNTIME_DIR/reqdump (每次 start 自动开启)。服务把每个推理
-#                        请求的原始 JSON body 写进该目录, 是服务端排查"为什么前缀缓存没命中"的唯一
-#                        原始证据(相邻两次请求的 body 可逐字节 diff)。设为 0 或空字符串关闭。
+#   NINFER_DUMP_REQUESTS  请求/响应落盘目录, 默认 $RUNTIME_DIR/reqdump (每次 start 自动开启)。服务把每个推理
+#                        请求的原始 JSON body 写进该目录 (<time>-req-<id>-<route>.json), 请求完成时再把
+#                        引擎实际生成的 assistant 轮次(内容/思考/tool calls, 协议无关)写成
+#                        <time>-resp-<id>-<route>.json。req 与 resp 配对后可逐字节 diff, 是服务端排查
+#                        "为什么前缀缓存没命中"(客户端回传内容 vs 服务端生成内容)的唯一原始证据。
+#                        设为 0 或空字符串关闭。
 #                        自动清理(默认开启, 每次写入时清理一次, 不会无限增长):
 #                          NINFER_DUMP_REQUESTS_LIMIT         最多保留多少个 body, 本脚本默认 2000 (二进制内置 100 太小:
 #                                                             本服务 ~75 req/h, 100 个只有 ~1.5 小时; 0=不限)
 #                          NINFER_DUMP_REQUESTS_MAX_AGE_HOURS 超过多少小时删除, 默认 24 (0=不限)
-#                        只清理服务自己写的 req-*.json, 目录里其他文件不动。
+#                        只清理服务自己写的 req-*/resp-* 命名文件, 目录里其他文件不动。
 #   NINFER_REUSE_DIAG    前缀复用诊断, 默认 1 (生产开启)。每个请求把前缀索引里
 #                        每一个 checkpoint 及拒绝它的具体门槛(index-invalid / 状态 / 内容不匹配
 #                        等)逐条打到 stderr(即服务日志)。只读不改行为, 用于区分 0% 命中到底是
