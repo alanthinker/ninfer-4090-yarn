@@ -740,6 +740,11 @@ struct CaptureAssessment {
     std::uint32_t frontier                = 0;
     bool publishes_private                = false;
     bool publishes_shared                 = false;
+    // A group may carry a long anchor and a turn closure at once, and the anchor alone can be
+    // unpublishable (full anchor set, offered anchor redundant, or its chosen replacement vanished
+    // under the ladder). The closure is then still published, and this flag says the group's anchor
+    // is not part of it.
+    bool publishes_anchor = true;
     bool needs_transfer                   = false;
     bool physically_feasible              = false;
     bool recycles_private_state           = false;

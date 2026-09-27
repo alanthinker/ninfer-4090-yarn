@@ -986,6 +986,9 @@ private:
         CaptureGroup group;
         bool publish_private = false;
         bool publish_shared  = false;
+        // False when the group's long anchor was dropped at assessment time and only its turn
+        // closure (or response replay) is published.
+        bool publish_anchor = true;
         bool replaces_shared = false;
         std::optional<runtime::CheckpointRef> private_replacement;
         std::optional<std::uint32_t> shared_index;
@@ -1420,7 +1423,7 @@ private:
     [[nodiscard]] detail::PhysicalResources
     install_private_capture(SequenceState& sequence, const CaptureGroup& group,
                             StateImageHandle checkpoint,
-                            std::optional<runtime::CheckpointRef> replacement);
+                            std::optional<runtime::CheckpointRef> replacement, bool publish_anchor);
     // Returns false when the capture cannot be prepared against the live pool (its state
     // destination has no device slot left), in which case the caller aborts the transaction and
     // skips the capture: publishing an optional checkpoint must not fail the request.

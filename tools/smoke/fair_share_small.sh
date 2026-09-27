@@ -52,7 +52,13 @@ export AGENT_HOST_SLOTS="${AGENT_HOST_SLOTS:-48}"
 # (arena refused runs with byte-room free, landing demand over a tight pool, requests parking
 # to their deadline).3x = the production ratio at the rig's page size (1024 x4 MiB x3).
 export AGENT_HOST_KV_MIB="${AGENT_HOST_KV_MIB:-12288}"
-export AGENT_MAX_CTX="${AGENT_MAX_CTX:-32768}" AGENT_KV_CAPACITY="${AGENT_KV_CAPACITY:-65536}"
+# Device KV: `auto` (production's mode), not the old 65536 (1024 pages). The 2026-09-23 calibration
+# measured that value as 10x tighter than production on this axis, and a tight device-KV pool
+# produces whole-owner evictions and R0 queue-timeout 503s the A/B cannot attribute to the
+# escalation it is measuring (2026-09-27: `device.main_kv used=1016 cap=1024` parked a cold
+# request for its whole queue deadline). The pools this script makes tight are HOST state (48) and
+# host KV - see docs/maintainer/上下文缓存物理存储与恢复.md, "rig 容量校准".
+export AGENT_MAX_CTX="${AGENT_MAX_CTX:-32768}" AGENT_KV_CAPACITY="${AGENT_KV_CAPACITY:-auto}"
 # Catalog: production is 512 over 320 host state slots (1.6x) and never binds - observed peak
 # 66/512 - so a catalog that fills is a limit production does not run. The rig's host ceiling is
 # 48, so the catalog has to sit clear above it: at 16 it filled while host state was still 45/48,

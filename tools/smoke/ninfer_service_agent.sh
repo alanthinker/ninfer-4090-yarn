@@ -78,6 +78,30 @@ PENDING_TIMEOUT_MS="${AGENT_PENDING_TIMEOUT_MS:-60000}"  # tests fail fast: an R
 REUSE_DIAG="${REUSE_DIAG:-1}"
 REQUEST_LOG="${AGENT_REQUEST_LOG:-$NINFER_HARNESS_DIR/request_log_agent.jsonl}"
 
+# Parameter gate: refuse a rig that cannot bind the axes this harness exists to test.
+#
+# The rig's job is to reproduce PRODUCTION's binding axes (host state 48 ~ 320, device state 8) at
+# a size where a fill costs seconds. The device-KV axis is deliberately harness-supplied, and an
+# explicit `--kv-capacity` below max-concurrency x max-context puts it far under production: the
+# 2026-09-23 calibration measured the old 65536 default (1024 pages) as 10x tighter than production
+# there, producing whole-owner evictions and R0 queue-timeout 503s that the battery cannot attribute
+# to the policy it is testing (2026-09-27: the first cold 2 566-token request after the fill parked
+# its whole 60 s deadline at `device.main_kv used=1016 cap=1024`, while the same build passes every
+# step at the capacity the device can actually hold - see
+# docs/maintainer/上下文缓存物理存储与恢复.md, "rig 容量校准"). The engine considers such a pool
+# legal (--kv-capacity is the SHARED pool, see docs/serving.md), so the mistake is only visible
+# here, at the harness: fail before the model loads instead of 40 minutes later.
+if [ "$KV_CAPACITY" != "auto" ] && [ "${AGENT_ALLOW_UNDERSIZED_KV:-0}" != "1" ]; then
+    if [ "$KV_CAPACITY" -lt $((CONCURRENCY * MAX_CTX)) ] 2>/dev/null; then
+        echo "refusing this rig: AGENT_KV_CAPACITY=$KV_CAPACITY tokens < AGENT_CONCURRENCY($CONCURRENCY)" \
+             "x AGENT_MAX_CTX($MAX_CTX) = $((CONCURRENCY * MAX_CTX)) tokens" >&2
+        echo "  the device-KV axis would be far under production and dominate every pressure test;" >&2
+        echo "  use AGENT_KV_CAPACITY=auto (the default), or set AGENT_ALLOW_UNDERSIZED_KV=1 for a" >&2
+        echo "  deliberate tight-pool experiment." >&2
+        exit 2
+    fi
+fi
+
 PARAMS=(
     "$MODEL"
     --port "$PORT"

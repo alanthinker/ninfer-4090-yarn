@@ -7393,9 +7393,14 @@ bool ProgramImplCore::degrade_idle_owner_host_state() {
         // checkpoint, and its own Device-KV spill if its truncation would touch Device
         // residency - so the compound either commits both drops back to back or touches
         // nothing beyond this candidate's own validated drop.
-        const auto validate_partner =
-            [&](std::uint32_t mine, StateImageHandle handle)
-                -> std::optional<std::pair<std::uint32_t, runtime::CheckpointRef>> {
+        // Every OTHER catalogued owner that holds `handle` as one of its checkpoints AND can drop
+        // that checkpoint on its own. Returns fewer than `wanted` when any referent cannot, which
+        // the caller treats as "this compound drop is not available".
+        const auto validate_partners =
+            [&](std::uint32_t mine, StateImageHandle handle, std::uint32_t wanted)
+                -> std::vector<std::pair<std::uint32_t, runtime::CheckpointRef>> {
+            std::vector<std::pair<std::uint32_t, runtime::CheckpointRef>> found;
+            if (wanted == 0) { return found; }
             for (std::uint32_t other = 0; other < continuation_capacity; ++other) {
                 if (other == mine) { continue; }
                 if (continuation_slots[other].role != ContinuationSlotRole::Catalogued) {
@@ -7439,9 +7444,10 @@ bool ProgramImplCore::degrade_idle_owner_host_state() {
                 if (partner_beyond()) {
                     if (!spill_owner_device_kv_to_host(other) || partner_beyond()) { continue; }
                 }
-                return std::pair{other, *oref};
+                found.emplace_back(other, *oref);
+                if (found.size() >= wanted) { return found; }
             }
-            return std::nullopt;
+            return found;
         };
         const auto try_drop = [&](StateImageHandle handle,
                                   const runtime::CheckpointRef& ref) -> bool {
@@ -7458,12 +7464,20 @@ bool ProgramImplCore::degrade_idle_owner_host_state() {
                 ++skip_residency;
                 return false;
             }
-            std::uint32_t refs = state_store->checkpoint_references(handle);
-            std::optional<std::pair<std::uint32_t, runtime::CheckpointRef>> partner;
-            if (refs != 1) {
-                if (refs != 2) { ++skip_refs; return false; } // >2 referencers: no compound
-                partner = validate_partner(index, handle);
-                if (!partner) { ++skip_refs; return false; }
+            // Every OTHER owner that references this image must lose it in the same step: the
+            // image's Host slot is freed only when its last reference goes, and a shared anchor is
+            // exactly what a flood of disposable sessions holds. Requiring exactly ONE partner
+            // (`refs != 2`) left those unreleasable, so the ladder had to fall through to whatever
+            // was still droppable - measured on the rig, the shallowest anchors of the MOST
+            // valuable conversations (rig important_session, 2026-09-26: `degrade anchor slot=22
+            // frontier=7845`, a 20 179-token conversation losing its cheapest anchors while the
+            // 1 873-token sessions that caused the pressure kept theirs). A referent whose own
+            // inventory cannot drop alone refuses the whole compound - the drop is all-or-nothing.
+            const std::uint32_t refs = state_store->checkpoint_references(handle);
+            std::vector<std::pair<std::uint32_t, runtime::CheckpointRef>> partners;
+            if (refs > 1) {
+                partners = validate_partners(index, handle, refs - 1U);
+                if (partners.size() + 1U != refs) { ++skip_refs; return false; }
             }
             const std::optional<qwen3_6::TargetKVRequirement> retained =
                 retained_requirement_after_drop(continuation_summary(sequence), ref);
@@ -7488,11 +7502,10 @@ bool ProgramImplCore::degrade_idle_owner_host_state() {
             const std::uint32_t host_now = state_store->host_occupied();
             try {
                 publish_checkpoint_drop(sequence, ref);
-                if (partner) {
-                    // last reference: this second component drop releases the image itself,
-                    // which is what actually frees the Host slot (two drops, one gap).
-                    publish_checkpoint_drop(continuation_states[partner->first],
-                                            partner->second);
+                for (const auto& partner : partners) {
+                    // The remaining references: together they release the image itself, which is
+                    // what actually frees the Host slot (N drops, one gap).
+                    publish_checkpoint_drop(continuation_states[partner.first], partner.second);
                 }
             } catch (const std::exception&) {
                 ++skip_race; // inventory moved under the drop: next candidate
@@ -9420,6 +9433,15 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
     const std::size_t anchor_limit = context_cache.max_long_anchors_per_continuation.value_or(0);
     const bool anchor_replacement_required =
         group.long_anchor && anchor_limit != 0 && sequence.long_anchors.size() == anchor_limit;
+    // The anchor can be unpublishable while the SAME group carries a turn closure, and the closure
+    // is exactly what this conversation's next message resumes from (the client replays a different
+    // reply than the model generated, so only a closure at the content boundary matches). Dropping
+    // the whole group destroyed that closure: the follow-up then had no candidate at all and
+    // re-prefilled its whole 20 189-token prompt from root (rig important_session, 2026-09-27:
+    // `capture: assess frontier=20166 site=anchor-replacement-missing replacement=none` on the
+    // group whose plan line reads `rewrite=1 anchor=1`, followed by
+    // `reuse-diag: candidates=0 rejected=86` and `cache 0 (0.0%)`). So the anchor alone is dropped
+    // and the closure is published on its own - the shape a rewrite-only group already has.
     const LongAnchorCheckpoint* selected_anchor_replacement = nullptr;
     if (anchor_replacement_required) {
         assessment.private_replacement_candidates.reserve(sequence.long_anchors.size());
@@ -9434,34 +9456,44 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
                 selected_anchor_replacement = &anchor;
             }
         }
-        if (private_replacement && selected_anchor_replacement == nullptr) {
-            // The anchor the planner chose to replace is gone: it was retired or dropped by the
-            // release ladder between planning and reservation, which is routine once the pool is
-            // saturated. The anchor set is still full, so this group has nothing it can publish;
-            // report "not publishable" (the caller skips the capture) instead of failing the
-            // request and the whole engine with an invariant error.
-            assessment.publishes_private = false;
-            assessment.publishes_shared  = false;
-            return assessment;
-        }
-        if (!private_replacement) {
-            // The anchor set is full and no replacement was chosen (the uniform-spacing selector
-            // skipped this offered anchor as redundant), so this group cannot publish - the same
-            // treatment a vanished replacement gets above. Leaving publishes_private=true here
-            // made every consumer read the UN-ASSESSED default physically_feasible=false (the
-            // demand is not built yet, runtime.h default) as a capacity verdict: the reserve path
-            // ran the whole capture-reclaim ladder - state demotes and, on exhaustion, retiring an
-            // idle owner - and could never succeed, destroying cache before skipping anyway
-            // (reproduced on the small rig2026-09-24: retire at host26/48 device1/8, then
-            // static-infeasible with an empty axis detail).
-            assessment.publishes_private   = false;
-            assessment.publishes_shared    = false;
+        const bool anchor_unpublishable =
+            !private_replacement || selected_anchor_replacement == nullptr;
+        if (anchor_unpublishable) {
+            if (!group.rewrite) {
+                // Nothing else in this group would be published, so the capture is skipped. The
+                // anchor set is full, so this group has nothing it can publish; report "not
+                // publishable" (the caller skips the capture) instead of failing the request and
+                // the whole engine with an invariant error.
+                assessment.publishes_private = false;
+                assessment.publishes_shared  = false;
+                if (!private_replacement) {
+                    // The anchor set is full and no replacement was chosen (the uniform-spacing
+                    // selector skipped this offered anchor as redundant), so this group cannot
+                    // publish. Leaving publishes_private=true here made every consumer read the
+                    // UN-ASSESSED default physically_feasible=false (the demand is not built yet,
+                    // runtime.h default) as a capacity verdict: the reserve path ran the whole
+                    // capture-reclaim ladder - state demotes and, on exhaustion, retiring an idle
+                    // owner - and could never succeed, destroying cache before skipping anyway
+                    // (reproduced on the small rig 2026-09-24: retire at host 26/48 device 1/8,
+                    // then static-infeasible with an empty axis detail).
+                    std::fprintf(stderr,
+                                 "capture: assess frontier=%u site=anchor-replacement-missing"
+                                 " replacement=none -> unpublishable (not a capacity verdict)\n",
+                                 assessment.frontier);
+                    std::fflush(stderr);
+                }
+                return assessment;
+            }
+            // The group keeps its closure; only the anchor is dropped from it.
+            assessment.publishes_anchor = false;
+            assessment.publishes_shared = false;
+            private_replacement.reset();
             std::fprintf(stderr,
-                         "capture: assess frontier=%u site=anchor-replacement-missing"
-                         " replacement=none -> unpublishable (not a capacity verdict)\n",
-                         assessment.frontier);
+                         "capture: assess frontier=%u site=anchor-replacement-%s -> anchor dropped,"
+                         " closure kept (not a capacity verdict)\n",
+                         assessment.frontier,
+                         selected_anchor_replacement != nullptr ? "vanished" : "missing");
             std::fflush(stderr);
-            return assessment;
         }
     } else if (private_replacement) {
         throw std::invalid_argument("capture has no replaceable private anchor");
@@ -9951,6 +9983,7 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
     transaction.publish_private     = assessment.publishes_private;
     transaction.publish_shared      = assessment.publishes_shared;
     transaction.private_replacement = private_replacement;
+    transaction.publish_anchor      = assessment.publishes_anchor;
     transaction.resource_delta      = detail::PhysicalDelta{
              .removed = assessment.implementation->demand.final_removed,
              .added   = assessment.implementation->demand.final_added,
@@ -10058,7 +10091,9 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
                                  : "device-fork",
                              std::string("private=") +
                                  (assessment.publishes_private ? "1" : "0") + " shared=" +
-                                 (assessment.publishes_shared ? "1" : "0") + identities());
+                                 (assessment.publishes_shared ? "1" : "0") +
+                                 (assessment.publishes_anchor ? "" : " anchor-dropped") +
+                                 identities());
         return runtime::ContextTransactionReserveStatus::Reserved;
     } catch (...) {
         abort_active_capture(transaction);
@@ -10096,7 +10131,8 @@ ProgramImplCore::release_checkpoint_reference(StateImageHandle checkpoint) noexc
 detail::PhysicalResources
 ProgramImplCore::install_private_capture(SequenceState& sequence, const CaptureGroup& group,
                                          StateImageHandle checkpoint,
-                                         std::optional<runtime::CheckpointRef> replacement) {
+                                         std::optional<runtime::CheckpointRef> replacement,
+                                         bool publish_anchor) {
     detail::PhysicalResources removed;
     if (group.rewrite) {
         if (sequence.rewrite_state && *sequence.rewrite_state != checkpoint) {
@@ -10112,7 +10148,8 @@ ProgramImplCore::install_private_capture(SequenceState& sequence, const CaptureG
             .rebuild_work = validated_rebuild_work(group.identity->rebuild_work, group.frontier),
         };
     }
-    if (group.long_anchor && context_cache.max_long_anchors_per_continuation.value_or(0) != 0) {
+    if (publish_anchor && group.long_anchor &&
+        context_cache.max_long_anchors_per_continuation.value_or(0) != 0) {
         const std::size_t capacity_limit = context_cache.max_long_anchors_per_continuation.value();
         validate_long_anchor_ordinals(sequence.long_anchors, capacity_limit);
         std::uint32_t ordinal = 0;
@@ -10526,7 +10563,8 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
         }
         removed = checked_resource_sum(
             removed, install_private_capture(sequence, transaction.group, transaction.source_state,
-                                             transaction.private_replacement));
+                                             transaction.private_replacement,
+                                             transaction.publish_anchor));
     }
     if (transaction.replaces_shared) {
         if (!transaction.shared_index) {
