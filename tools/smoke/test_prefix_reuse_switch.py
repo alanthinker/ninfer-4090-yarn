@@ -85,6 +85,10 @@ def main():
     parser.add_argument("--conversations", type=int, default=9)
     parser.add_argument("--random-words", type=int, default=800)
     parser.add_argument("--active-rounds", type=int, default=12)
+    parser.add_argument("--warmup-turns", type=int, default=3,
+                        help="turns each conversation runs on ITSELF before the busy phase: self-reuse "
+                             "is what raises its value (evidence 1/8 -> ~0.5, live(x) 1 -> up to 8) "
+                             "without spending any pool space")
     parser.add_argument("--timeout", type=int, default=120)
     args = parser.parse_args()
 
@@ -99,8 +103,25 @@ def main():
     print(f"  Service: http://127.0.0.1:{args.port}")
     print()
 
-    # Phase 1: Create all conversations
-    print(f"--- Phase 1: Create {n_conv} conversations ---")
+    # Phase 1: Create all conversations, then READ each one once more.
+    #
+    # The second read is what makes each conversation "reused", and that is the whole difference in the
+    # engine's value formula (缓存模块v2.md §2.2):
+    #
+    #   score = rebuild_value(tokens) x retention_weight x live(x) x reuse_evidence
+    #   从未被复用  : live = 1, evidence = 1/8      -> score ∝ tokens, nothing else
+    #   被复用过的  : live 可达 8, evidence ≈ 0.5   -> 每 token 贵 4~24 倍
+    #
+    # A conversation that was only ever CREATED is a never-reused record, so the pool's cheapest thing
+    # is simply the smallest such record - and the value order correctly deletes it when the pool is
+    # full (measured 2026-09-27: this case's conversation was deleted at 3 011 tokens, at 16 525, and
+    # still at 20 553, because the fill's own never-reused sessions are the same size and marginally
+    # larger). Enlarging the conversation is the WRONG lever: it spends the pool (4 x 20.5K = 82K of
+    # the rig's 131K-token KV pool) and the next step then has nowhere to go (important_session got a
+    # 503 queue timeout in the same run). The right lever is evidence: one extra read per conversation
+    # costs one round trip and no pool space, and makes every conversation in this case more valuable
+    # per token than anything the pool may sacrifice.
+    print(f"--- Phase 1: Create {n_conv} conversations, then read each one once ---")
     conversations = {}
     for i in range(1, n_conv + 1):
         content = f"CONV{i}: " + random_text(args.random_words)
@@ -109,6 +130,22 @@ def main():
         conversations[i] = messages + [{"role": "assistant", "content": f"CONV{i} ack."}]
         status = "✓" if cached > 0 else " "
         print(f"  Conv{i}: prompt={prompt} cached={cached} time={elapsed:.1f}s {status}")
+        # Evidence turns: the conversation reuses ITSELF a few times. That is what raises its value,
+        # and it is the cheapest possible way to do so in the engine's formula (§2.2):
+        #   evidence: 1/8 (never reused, no timestamp) -> ~0.5 once it has a last-use time
+        #   live(x):  1  (never reused)               -> up to 8 while fresh
+        # i.e. ~32x more value per token, for a few round trips and NO extra pool space. Enlarging the
+        # conversation instead spends the pool (measured: 4 x 20.5K = 82K of the rig's 131K-token KV
+        # pool, which starved the next battery step into an HTTP 503).
+        for turn in range(1, args.warmup_turns + 1):
+            follow_up = conversations[i] + [
+                {"role": "user", "content": f"CONV{i} warm-up turn {turn}"}]
+            cached2, prompt2, elapsed2 = send_request(base_url, follow_up, max_tokens=8,
+                                                      timeout=args.timeout)
+            conversations[i] = follow_up + [{"role": "assistant", "content": f"CONV{i} ack {turn}."}]
+            pct2 = cached2 * 100 // max(prompt2, 1)
+            print(f"          evidence turn {turn}: prompt={prompt2} cached={cached2} "
+                  f"({pct2}%) time={elapsed2:.1f}s")
 
     # Phase 2: Make the active conversation very busy
     print(f"\n--- Phase 2: Conversation {active_conv} active ({args.active_rounds} rounds) ---")

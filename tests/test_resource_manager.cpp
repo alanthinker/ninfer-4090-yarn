@@ -3951,6 +3951,54 @@ void test_finished_conversations_images_are_reclaimable() {
             "a FINISHED conversation's fork point is cache");
 }
 
+// §2.2 in the form the acceptance cases depend on: `score = value x live x evidence`, where a
+// NEVER-REUSED owner has live = 1 and evidence = 1/8, so its score is its SIZE and nothing else,
+// while an owner with reuse evidence is worth several times more per token. This is why an idle
+// conversation may legitimately be sacrificed (its record is the cheapest) and why the fix for such
+// a case is to give its conversation EVIDENCE - one extra read - rather than to enlarge it: size
+// spends the pool, evidence does not (measured 2026-09-27: the switch-back case's conversation was
+// deleted at 3 011 tokens, at 16 525 and still at 20 553, and the 20.5K version cost 82K of the rig's
+// 131K-token KV pool and starved the next step into an HTTP 503).
+void test_reuse_evidence_outranks_size_among_never_reused_owners() {
+    const auto private_min_score = [](const FakeProgram& program) -> std::uint64_t {
+        std::uint64_t best = std::numeric_limits<std::uint64_t>::max();
+        for (const RetirePreferenceEntry& entry : program.retire_preference) {
+            if (!entry.shared_prefix) { best = std::min(best, entry.score_ns); }
+        }
+        return best;
+    };
+
+    FakeManager manager = make_manager(4, 8, 1);
+    FakeProgram program;
+    const auto never_key  = FakeCacheSessionKey{810};
+    const auto reused_key = FakeCacheSessionKey{811};
+
+    // Two conversations of the SAME size: one only ever created, one read once more.
+    const ActiveRequest never = start_active(
+        manager, program, 810, make_base(810, never_key, RetentionClass::RecentPrivate), 1);
+    (void)finish_active(manager, program, never, 4096);
+    const ActiveRequest reused = start_active(
+        manager, program, 811, make_base(811, reused_key, RetentionClass::RecentPrivate), 2);
+    (void)finish_active(manager, program, reused, 4096);
+    const ActiveRequest read_again = start_active(
+        manager, program, 811, make_base(811, reused_key, RetentionClass::RecentPrivate), 3);
+    const FakeFinishResult read_finish = finish_active(manager, program, read_again, 4096);
+    require(read_finish.status == ConsumeStatus::Consumed,
+            "the evidence read of the second conversation did not complete");
+
+    program.retire_preference.clear();
+    (void)manager.inspect(program, FakePreparedPrompt{812}, make_base(812), 4);
+    const std::uint64_t cheapest = private_min_score(program);
+    require(cheapest < std::numeric_limits<std::uint64_t>::max(),
+            "the retire order named no private owner");
+    // The never-reused owner's score is value x (1/8): with the fake cost model (100 ns/token) and the
+    // RecentPrivate weight (4) that is 4096 x 100 x 4 / 8 exactly, i.e. independent of ANY clock.
+    require(cheapest == 4096ULL * 100ULL * 4ULL / 8ULL,
+            ("the cheapest record must be the never-reused conversation sized 4096 (got " +
+             std::to_string(cheapest) + "): reuse evidence is what protects an idle conversation, so a "
+             "case that wants its conversation to survive must give it evidence, not size").c_str());
+}
+
 // R0 must be the LAST resort, not the first answer. When no plan exists because the pool is full,
 // the engine owes the request one unit of R2 relief first - the current request is the highest-value
 // thing in the pool (缓存模块v2.md §2.1: 正在执行的对话价值最高), so the least valuable CACHED entry
@@ -4204,6 +4252,8 @@ int main() {
              test_victim_score_prices_live_and_idle_owners_differently);
     run_test("owner score prices freshness for every consumer",
              test_owner_score_prices_freshness_for_every_consumer);
+    run_test("reuse evidence outranks size among never-reused owners",
+             test_reuse_evidence_outranks_size_among_never_reused_owners);
     run_test("retire order prices a just-read owner above a stale deeper one",
              test_retire_order_prices_a_just_read_owner_above_a_stale_deeper_one);
     run_test("unplannable request takes cached relief before parking",

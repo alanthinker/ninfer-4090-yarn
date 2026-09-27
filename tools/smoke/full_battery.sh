@@ -67,7 +67,31 @@ if [ "$MODE" = "--rig" ]; then
     # legitimately evicts it -> "No cache hit". fork_hit keeps its DEFAULTS: at --words100 the
     # fork-point coverage lands at 49.8% against a 50% threshold - scaling saved 5s on a10s
     # test and cost all of the margin.
-    SWITCH_ARGS=(--random-words 150 --active-rounds 6 --conversations 4)
+    # --random-words keeps the case's own default scale (~8K tokens per conversation, NOT the 150
+    # words/622 tokens this used to run): the switch-back target must be genuinely more valuable than
+    # the records the pool may sacrifice, or the value order correctly sacrifices IT and the case
+    # fails for doing the right thing (2026-09-27: at 150 words it was the pool's cheapest record and
+    # lost its closure; the engine may delete a finished conversation's cache by value, so the case's
+    # premise has to be that its own conversation is not the cheapest). 4 conversations still fit the
+    # rig's 4 fair-share buckets, which is what keeps the first-built (switch-back) target inside the
+    # protected set.
+    # This case's premise, derived from §2.2 instead of guessed (2026-09-27):
+    #
+    #   score = rebuild_value(tokens) x retention_weight x live(x) x reuse_evidence
+    #   从未被复用: live = 1, evidence = 1/8   -> score ∝ tokens and nothing else
+    #   被复用过的: live 可达 8, evidence ≈ 0.5 -> 每 token 贵 4~24 倍
+    #
+    # The switch-back target is an IDLE conversation, so the pool may sacrifice it unless it is worth
+    # more than the records competing with it. Two ways to be worth more: be BIGGER (wrong here - it
+    # spends the rig's pool: 4 x 20.5K was 82K of a 131K-token KV pool and starved the next step into a
+    # 503 queue timeout in the same run) or have REUSE EVIDENCE (right - one extra read per conversation
+    # costs no pool space and makes it 4..24x more valuable per token than any never-reused record).
+    # The case therefore runs each conversation on ITSELF a few turns in Phase 1 (--warmup-turns,
+    # self-reuse is what raises value: evidence 1/8 -> ~0.5 and live(x) 1 -> up to 8, ~32x per token),
+    # and keeps a size that leaves the pool room for the steps after it: 1 200 words ≈ 4.4K tokens each,
+    # 4 conversations ≈ 13% of the rig's KV pool. 4 conversations still fit the rig's 4 fair-share
+    # buckets, which keeps the first-built (switch-back) target inside the protected set.
+    SWITCH_ARGS=(--random-words 1200 --active-rounds 6 --conversations 4)
     MIXED_ARGS=(--max-rounds 4 --scale 2.0)
     FORK_ARGS=()
     # important_session stops at the FIRST record proving the flood retires owners, so its budget

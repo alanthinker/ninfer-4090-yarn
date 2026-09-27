@@ -7566,20 +7566,30 @@ bool ProgramImplCore::degrade_idle_owner_host_state() {
         if (summary.endpoint && sequence.endpoint_valid) {
             if (try_drop(sequence.state.read, summary.endpoint->ref)) { return true; }
         }
-        // The TURN CLOSURE is NOT on this list, and that is a MEASURED decision (2026-09-27), not an
-        // inherited comment: making it droppable turned `prefix_switch` red on the churned rig pool,
-        // because that case's conversation is ~622 tokens and the value chain therefore ranks it the
-        // cheapest thing in the pool - its closure was sacrificed and the client's switch-back found
-        // nothing to reuse. Sacrificing a closure costs a real conversation its next-turn reuse, so it
-        // is not a price this step may pay. A conversation's cheap components are its ANCHORS, which is
-        // why the walk above is anchor-first and depth-ascending.
+        // ... and the TURN CLOSURE last of all, because it is this owner's dearest component: it is
+        // the frontier the conversation's next message resumes from. Inside one owner the order is
+        // value-ascending - anchors (shallowest first), endpoint, closure - while BETWEEN owners it is
+        // the one value chain (§2.2), and the conversation being executed is not in this walk at all
+        // (§2.1).
         //
-        // The pool is still clearable without it: an idle owner's closure that holds a Host replica
-        // beside its Device one is released LOSSLESSLY by the EvictHostReplica step, which the binding
-        // predicate used to refuse for every non-executing owner (state_reclaim_policy.h). That is what
-        // fixed the measured defect - an IDLE Engine waiting out its whole admission deadline while the
-        // Host state pool was full of finished conversations' closures (`parallel-fresh`, real model:
-        // `blocked-in-idle … active=0, retire_order=6`).
+        // 2026-09-27 ruling (user): 只要不是正在被处理的请求占用的缓存,就一定可以被清空 - a finished
+        // conversation's closure is cache, and when the pool holds nothing but finished records the
+        // value order decides which conversation loses its reuse. Measured: without this the Host state
+        // pool could not be cleared at all in a below-working-set configuration - an IDLE Engine waited
+        // out its whole admission deadline (`blocked-in-idle … active=0`, Host state held by finished
+        // conversations' closures that no step could free, because the R2 component step accepts only
+        // HostOnly replicas, the lossless EvictHostReplica step finds no redundant replica for a
+        // HostOnly closure, and this list stopped at the endpoint).
+        //
+        // The same measurement is why the walk must reach it only when that owner is the least valuable
+        // thing left: a case whose conversation is the pool's CHEAPEST record loses its reuse here, and
+        // that is the rule working, not a defect - the acceptance case was sized (622 tokens against a
+        // pool of multi-thousand-token conversations) so that its switch-back target was exactly that
+        // cheapest record; it is now sized to the case's own default so the target is genuinely more
+        // valuable than what the pool may sacrifice.
+        if (summary.rewrite && sequence.rewrite_state) {
+            if (try_drop(*sequence.rewrite_state, summary.rewrite->ref)) { return true; }
+        }
         return false;
     };
     // The one chain first (§2.2): the ladder's preference order IS the policy's value order.

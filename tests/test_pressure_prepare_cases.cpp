@@ -476,7 +476,11 @@ const CaseEntry kCases[] = {
     // exclusion (not the spill rule) was starving the plan.
     {"dense-drops-np", 4, 32768, 0, 4096, 8, -1, case_dense_drops},
     {"spill-race", 4, 32768, 8, 4096, 8, -1, case_spill_race},
-    {"host-full", 2, 32768, 8, 4096, 8, -1, case_host_full},
+    // host_state must be >= the Device state pool (max_concurrency = 4): the Engine refuses a Host
+    // pool smaller than the Device one at startup ("a Device state image can never demote into a Host
+    // slot it does not have"). This case used 2 and aborted the whole suite on that throw; 4 is the
+    // smallest legal "the Host pool is the binding one" configuration it was written for.
+    {"host-full", 4, 32768, 8, 4096, 8, -1, case_host_full},
     // 缓存模块v2 §七 判据 #2: exactly one binding pool (Host state, 8 slots), every other axis
     // roomy, fair-share protection off so importance alone decides who goes.
     //
