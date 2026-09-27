@@ -3981,6 +3981,48 @@ void test_finished_conversations_images_are_reclaimable() {
             "a FINISHED conversation's fork point is cache");
 }
 
+// §四 invariant 1 as the CODE-LEVEL prohibition, not a measurement: the strict release asks this
+// table before it destroys anything, and every cache-policy intent must refuse an owner that still
+// holds Device data. The `[invariant1]` probe only made a violation visible after it had happened,
+// and only in the pool geometries a battery happened to run: the 2026-09-27 pressure cases destroyed
+// 13 Device state images through `site=transaction-victim` in 4-slot Host state pools while the rig's
+// 48-slot pool never reproduced it. With the guard in the release primitive, "显存里的数据只有两种
+// 归宿 - 正在用, 或搬到内存" holds for EVERY input: a victim that cannot be moved first is not
+// releasable (the step rolls back and the request waits, R0).
+void test_only_an_ownership_return_may_destroy_device_data() {
+    using state_reclaim::ReleaseIntent;
+    const ReleaseIntent policy_intents[] = {
+        ReleaseIntent::PolicyMaterializationVictim,
+        ReleaseIntent::PolicyCaptureVictim,
+        ReleaseIntent::PolicySharedPressureVictim,
+        ReleaseIntent::PolicyCaptureSharedPressureVictim,
+        ReleaseIntent::PolicyCaptureReplacement,
+        ReleaseIntent::PolicyLadderHostOnly,
+    };
+    for (const ReleaseIntent intent : policy_intents) {
+        require(!state_reclaim::release_may_destroy_device(intent),
+                "a cache-policy release may never destroy Device data (R1 says move it first)");
+        require(state_reclaim::release_admits_device_destruction(intent, false),
+                "a Device-free owner is always releasable on a policy path");
+        require(!state_reclaim::release_admits_device_destruction(intent, true),
+                "a policy release holding Device data must be REFUSED, not executed");
+    }
+    // The two releases that are not cache decisions: the client consumed the handle (the
+    // conversation ends by definition), and the process-exit teardown releases every replica.
+    require(state_reclaim::release_may_destroy_device(ReleaseIntent::OwnershipHandleRelease),
+            "a consumed handle ends that conversation - its Device data goes with it");
+    require(state_reclaim::release_may_destroy_device(ReleaseIntent::ShutdownTeardown),
+            "the shutdown teardown releases everything because the Program is going away");
+    require(state_reclaim::release_admits_device_destruction(
+                ReleaseIntent::OwnershipHandleRelease, true),
+            "the ownership return is admitted with Device data");
+    // Every intent has a name (the batteries grep these strings).
+    for (const ReleaseIntent intent : policy_intents) {
+        const std::string name = state_reclaim::release_intent_name(intent);
+        require(!name.empty() && name != "?", "every release intent must have a log name");
+    }
+}
+
 // §2.2 in the form the acceptance cases depend on: `score = value x live x evidence`, where a
 // NEVER-REUSED owner has live = 1 and evidence = 1/8, so its score is its SIZE and nothing else,
 // while an owner with reuse evidence is worth several times more per token. This is why an idle
@@ -4290,6 +4332,7 @@ int main() {
              test_unplannable_request_takes_cached_relief_before_parking);
     run_test("finished conversations' images are reclaimable",
              test_finished_conversations_images_are_reclaimable);
+    test_only_an_ownership_return_may_destroy_device_data();
     run_test("shared replacement skips a device-holding victim",
              test_shared_replacement_is_not_offered_for_a_device_holding_victim);
     run_test("executing conversation is absent from the retire order",

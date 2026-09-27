@@ -263,13 +263,13 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
     std::uint64_t rows_freed             = 0;
     std::uint64_t released_device_kv      = 0;
     std::uint64_t released_device_backend = 0;
-    std::uint64_t released_device_state   = 0;
     for (const Datum* datum : candidates) {
+        // Device STATE is deliberately absent here: a release cannot deliver it (see below), so the
+        // loop must not keep walking for it. The R1 loop and the simulation verdict own that axis.
         if (host_kv_freed >= host_kv_gap && host_state_freed >= host_state_gap &&
             rows_freed >= rows_gap &&
             released_device_kv >= device_kv_gap &&
-            released_device_backend >= device_backend_gap &&
-            released_device_state >= device_state_gap) {
+            released_device_backend >= device_backend_gap) {
             break;
         }
         const bool helps_kv =
@@ -277,22 +277,30 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
         const bool helps_state =
             host_state_freed < host_state_gap && datum->host_state > 0;
         const bool helps_rows = rows_freed < rows_gap && datum->catalog_row > 0;
-        // A PURE Device gap also enters here: when the Device pool is full of pages no spill
+        // A PURE Device KV gap also enters here: when the Device pool is full of pages no spill
         // may touch (orphan tails beyond every retained prefix) while Host has room, only a
         // whole-conversation release sheds Device pages - the spill loop below cannot. The
         // prelude moves what is moveable, the tail goes with its owner (rig req34: Device
         // free=0 with12.7 GB Host free, steps=0, device-not-closable).
+        //
+        // A Device STATE gap is different and is NOT answered here: `evict_device_state` is the
+        // footprint a whole-conversation teardown would DESTROY, and that teardown only runs after
+        // the move-first prelude has taken the owner's Device data to Host - a DeviceOnly state with
+        // no Host slot to land on cannot be moved at all (缓存模块v2.md §三 R1: 显存里的数据只有两种
+        // 归宿, 正在用, 或搬到内存). Crediting it answered a Device-state gap by evicting a
+        // conversation whose state had nowhere to go, and 13 `[invariant1] strict
+        // site=transaction-victim ... state=N slots` destructions followed in one pressure-suite run
+        // (2026-09-27, 4-slot Host state pools). The R1 loop below answers the gap through
+        // `datum.device_state`, which the Program fills only when the demotion can actually land
+        // (possibly after an R2 degrade); when nothing can move, the plan enqueues (R0).
         const bool helps_device_kv =
             !spill_capable_kv && released_device_kv < device_kv_gap &&
             (datum->evict_device_kv > 0 || datum->device_kv > 0);
         const bool helps_device_backend =
             !spill_capable_kv && released_device_backend < device_backend_gap &&
             (datum->evict_device_backend_kv > 0 || datum->device_backend_kv > 0);
-        const bool helps_device_state =
-            !spill_capable_state && released_device_state < device_state_gap &&
-            (datum->evict_device_state > 0 || datum->device_state > 0);
         if (!helps_kv && !helps_state && !helps_rows && !helps_device_kv &&
-            !helps_device_backend && !helps_device_state) {
+            !helps_device_backend) {
             continue;
         }
         dropped.push_back(datum->id);
@@ -308,9 +316,6 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
         released_device_backend += datum->evict_device_backend_kv > datum->device_backend_kv
                                        ? datum->evict_device_backend_kv
                                        : datum->device_backend_kv;
-        released_device_state += datum->evict_device_state > datum->device_state
-                                     ? datum->evict_device_state
-                                     : datum->device_state;
     }
 
     // R1: move Device-resident SURVIVORS to Host, least important first, until the Device gaps
@@ -325,9 +330,8 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
     // candidate set, and a shared page only returns when its LAST referent goes), then credit
     // the pages ONCE - the maximum single owner's joint claim is a sound lower bound for one
     // group and never double-counts a page listed by both referents.
-    if (device_kv_gap > released_device_kv || device_backend_gap > released_device_backend ||
-        device_state_gap > released_device_state) {
-        std::uint64_t joint_main_max = 0, joint_bkv_max = 0, joint_state_max = 0;
+    if (device_kv_gap > released_device_kv || device_backend_gap > released_device_backend) {
+        std::uint64_t joint_main_max = 0, joint_bkv_max = 0;
         std::size_t shells = 0;
         for (const Datum* datum : candidates) {
             if (std::find(dropped.begin(), dropped.end(), datum->id) != dropped.end()) {
@@ -341,8 +345,7 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
                 (datum->joint_device_kv > 0 || datum->joint_device_backend_kv > 0);
             if (!shell) { continue; }
             if (device_kv_gap <= released_device_kv &&
-                device_backend_gap <= released_device_backend &&
-                device_state_gap <= released_device_state) {
+                device_backend_gap <= released_device_backend) {
                 break;
             }
             dropped.push_back(datum->id);
@@ -356,7 +359,6 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
         if (shells > 0) {
             released_device_kv += std::min(joint_main_max, device_kv_gap - std::min(released_device_kv, device_kv_gap));
             released_device_backend += std::min(joint_bkv_max, device_backend_gap - std::min(released_device_backend, device_backend_gap));
-            released_device_state += joint_state_max;
         }
     }
 
@@ -366,8 +368,9 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
         device_backend_gap > released_device_backend
             ? device_backend_gap - released_device_backend
             : 0;
-    const std::uint64_t device_state_needed =
-        device_state_gap > released_device_state ? device_state_gap - released_device_state : 0;
+    // Device STATE is answered by the R1 loop alone: a release never delivers it, so the whole gap
+    // stands until a state is moved (or the simulation below enqueues the request).
+    const std::uint64_t device_state_needed = device_state_gap;
     std::vector<Step> spills;
     spills.reserve(candidates.size());
     std::uint64_t device_kv_moved      = 0;

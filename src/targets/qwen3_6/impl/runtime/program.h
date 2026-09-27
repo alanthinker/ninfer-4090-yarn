@@ -655,6 +655,12 @@ public:
     // only Host-side data. Returns true when the victim is Host-only afterwards (including "it held no
     // Device data to begin with"); false means it could not be moved and must not be replaced.
     [[nodiscard]] bool prepare_shared_replacement(const SharedPrefixHandle& shared);
+    // §四 invariant 1's one question, asked by every pressure step before it releases anything: does
+    // this owner still hold Device data (KV pages or state slots)? True means a release would DESTROY
+    // it, so the step must be refused and rolled back instead of executed. An unreadable owner counts
+    // as "still holds it" - refusing is always safe, destroying is not.
+    [[nodiscard]] bool continuation_holds_device_data(std::uint32_t index) const noexcept;
+    [[nodiscard]] bool shared_prefix_holds_device_data(std::uint32_t index) const noexcept;
     // Diagnostic for the R0 park line: how many owners the ladder may walk. An empty or tiny list
     // while the pool is full is the signature of "finished conversations hold the cache but are not
     // candidates" (2026-09-27).
@@ -1388,7 +1394,14 @@ private:
     // Device slot.
     [[nodiscard]] std::optional<StateImageHandle>
     reserve_logical_destination_with_release(bool allow_retire = true);
-    void release_continuation_slot_strict(std::uint32_t index) noexcept;
+    // §四 invariant 1, enforced here: `intent` says WHY the owner is being released, and a
+    // cache-policy intent may only release an owner whose Device footprint is already zero (i.e. the
+    // move-first prelude ran). A policy release that would destroy Device data is REFUSED - the owner
+    // is left completely intact and false is returned, so the caller treats it as "this victim is not
+    // releasable" (roll the step back and let the request wait, R0) instead of destroying cache.
+    [[nodiscard]] bool
+    release_continuation_slot_strict(std::uint32_t index,
+                                     detail::state_reclaim::ReleaseIntent intent) noexcept;
     void release_continuation_slot_best_effort(std::uint32_t index) noexcept;
     void retire_continuation_slot(std::uint32_t index) noexcept;
     // Free one Device StateImage slot for an incoming reservation, least destructive first: a
@@ -1439,13 +1452,13 @@ private:
     release_checkpoint_reference(StateImageHandle checkpoint) noexcept;
     [[nodiscard]] bool can_release_shared_prefix_state(std::uint32_t index,
                                                        SharedPrefixSlotRole expected_role) const;
-    // `site` names the caller so the [invariant1] probe can tell a POLICY-path destruction (a bug:
-    // R1 says move it, R2 may only delete Host) from the shutdown teardown, where releasing every
-    // replica is correct and unavoidable - mixing the two is why the counter could never reach zero
-    // and the hard assertion stayed off (§十.4).
+    // `intent` names the caller AND decides whether this release may destroy Device data (§四
+    // invariant 1): only the ownership return and the shutdown teardown may. A cache-policy intent
+    // releases a shared prefix only once its Device footprint is already zero (the R1 prelude ran);
+    // otherwise the release is refused (an empty footprint) and the caller rolls its step back.
     [[nodiscard]] detail::PhysicalResources
     release_shared_prefix_state_strict(std::uint32_t index, SharedPrefixSlotRole expected_role,
-                                       const char* site) noexcept;
+                                       detail::state_reclaim::ReleaseIntent intent) noexcept;
     [[nodiscard]] detail::PhysicalResources
     install_private_capture(SequenceState& sequence, const CaptureGroup& group,
                             StateImageHandle checkpoint,

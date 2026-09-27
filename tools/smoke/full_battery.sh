@@ -437,18 +437,21 @@ echo "transfer churn (this battery): D2H copies=$(scope 'state-store: D2H copy h
 # morning's stops while every step slice of this battery was0). Count only this battery's tail.
 echo -n "matching error lines in $S (this battery's window): "
 tail -n +"$((BAT_START_LINE + 1))" "$S" | grep -cE "$ERR_PAT" || true
-# §七判据 #3 (缓存模块v2.md §十.4): no POLICY path may destroy Device data - R1 says move it, R2 may
-# only delete Host. The [invariant1] probe now names its site; `site=shutdown` is the process-exit
-# teardown, where releasing every replica is correct. Any other site is the violation this battery
-# must fail on, which is what "turn the hard assertion on once the counter reaches zero" means.
+# §七判据 #3 (缓存模块v2.md §四 invariant 1): no POLICY path may destroy Device data - R1 says move it,
+# R2 may only delete Host. Since 2026-09-27 the release primitive REFUSES a policy release that still
+# holds Device data (`[invariant1-guard] refused …`), so a violation can no longer execute; this probe
+# is the second layer, and it now only fires for the two releases that ARE allowed to destroy: the
+# client consuming a handle (that conversation ends by definition) and the process-exit teardown.
 ALL_DEVICE_DESTRUCTION=$(tail -n +"$((BAT_START_LINE + 1))" "$S"     | grep -c '\[invariant1\]' || true)
-SHUTDOWN_DESTRUCTION=$(tail -n +"$((BAT_START_LINE + 1))" "$S"     | grep -c '\[invariant1\].*site=shutdown' || true)
-POLICY_ONLY=$((ALL_DEVICE_DESTRUCTION - SHUTDOWN_DESTRUCTION))
+ALLOWED_DESTRUCTION=$(tail -n +"$((BAT_START_LINE + 1))" "$S"     | grep -cE '\[invariant1\].*site=(shutdown|handle-release)' || true)
+POLICY_ONLY=$((ALL_DEVICE_DESTRUCTION - ALLOWED_DESTRUCTION))
+GUARD_REFUSALS=$(tail -n +"$((BAT_START_LINE + 1))" "$S"     | grep -c '\[invariant1-guard\] refused' || true)
 echo "device-data destruction (this battery's window): policy-path=$POLICY_ONLY" \
-     "shutdown=$SHUTDOWN_DESTRUCTION (only policy-path counts, §十.4)"
+     "allowed=$ALLOWED_DESTRUCTION (shutdown/handle-release, §四 invariant 1)"
+echo "guard refusals (a policy release that would have destroyed Device data): $GUARD_REFUSALS"
 if [ "$POLICY_ONLY" != "0" ]; then
     echo "BATTERY FAILED: $POLICY_ONLY policy-path [invariant1] event(s) destroyed Device data"
-    tail -n +"$((BAT_START_LINE + 1))" "$S" | grep '\[invariant1\]' | grep -v 'site=shutdown' | head -3
+    tail -n +"$((BAT_START_LINE + 1))" "$S" | grep '\[invariant1\]' | grep -vE 'site=(shutdown|handle-release)' | head -3
     FAILED_STEPS=$((FAILED_STEPS + 1))
 fi
 if [ "$FAILED_STEPS" != "0" ]; then

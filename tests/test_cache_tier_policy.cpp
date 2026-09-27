@@ -219,7 +219,7 @@ void case_soak_exact_numbers() {
         {.id = 2,
          .device_kv = 49,
          .evict_device_kv = 11,
-         .evict_device_state = 1, // production's ev_state=8: the ONLY route for the dstate gap
+         .evict_device_state = 1, // production's ev_state=8 - a DESTRUCTION footprint, not relief
          .host_state = 9,
          .importance = 30},
         {.id = 3, .device_kv = 11, .evict_device_kv = 11, .host_state = 2, .importance = 40},
@@ -228,8 +228,13 @@ void case_soak_exact_numbers() {
     if (outcome.steps.empty() && !outcome.enqueue) {
         std::printf("  (no steps, no enqueue)\n");
     }
-    check(outcome.steps.size() >= 1,
-          "the pool plainly allows a step (Host-state gap + droppable state) - steps>=1");
+    // NOTHING may be released for the Device-state slot: every owner reports `device_state == 0`,
+    // i.e. no state of theirs can be MOVED to Host, so a release would destroy the state it holds
+    // (§四 invariant 1). The simulation verdict then has to refuse the whole plan - deleting cache
+    // for a gap it cannot legally close is the failure this file exists to prevent (§三 R0).
+    check(outcome.enqueue, "a Device-state gap nothing can move must wait, not delete");
+    check(outcome.reason == EnqueueReason::DeviceNotClosable, "and name the Device axis");
+    check(outcome.steps.empty(), "nothing is applied when the plan cannot close every gap");
 }
 
 void case_device_short_host_roomy() {
@@ -427,6 +432,13 @@ void case_two_conversations_close_both_gaps() {
 // Host state 48/48 - the policy went blind exactly when it had to act. One release closes both
 // state gaps: the Host slots it frees and the Device state its teardown returns (invariant 3:
 // one action, its full footprint).
+// A state-only pressure snapshot: Host KV and Device KV are roomy, so the only gaps are the two
+// state pools. The Device-state slot a request needs comes from MOVING a state to Host - never from
+// releasing a conversation, because a release destroys what it could not move first (§四 invariant
+// 1, and the 13 `site=transaction-victim` destructions of 2026-09-27). Here BOTH owners hold a
+// moveable Device state, so the plan is: release the least important conversation to free the Host
+// slots the move needs (R2 first, in the same least-important-first order), then move the survivor's
+// Device state into that room (R1).
 void case_state_pressure_is_visible_without_a_kv_gap() {
     std::printf("case_state_pressure_is_visible_without_a_kv_gap\n");
     const std::vector<Datum> pool{
@@ -439,10 +451,17 @@ void case_state_pressure_is_visible_without_a_kv_gap() {
     check(!outcome.enqueue, "state pressure must be answerable, not reported as nothing to do");
     check(action_count(outcome, Action::DropFromHost) == 1,
           "the full Host state pool frees room by releasing one conversation");
-    check(action_count(outcome, Action::SpillToHost) == 0,
-          "its Device state relief counts in the same step - no second action");
     check(action_kv(outcome, Action::SpillToHost) == 0, "no KV moves at all");
     check(action_state(outcome, Action::DropFromHost) >= 1, "the Host state gap must close");
+    check(action_state(outcome, Action::SpillToHost) >= 1,
+          "the Device state slot comes from a MOVE - a release may not destroy Device state");
+    bool dropped_least_important = false, moved_the_survivor = false;
+    for (const auto& step : outcome.steps) {
+        if (step.id == 1 && step.action == Action::DropFromHost) { dropped_least_important = true; }
+        if (step.id == 2 && step.action == Action::SpillToHost) { moved_the_survivor = true; }
+    }
+    check(dropped_least_important, "R2 releases the least important conversation");
+    check(moved_the_survivor, "R1 then moves the survivor that stays in the pool");
 }
 
 // The other half of the same rule: if nothing carries Device state, the Device state gap cannot
@@ -577,6 +596,49 @@ void case_equal_importance_ranks_by_age_then_id() {
     }
 }
 
+// 2026-09-27, the pressure-case finding as a unit test (site=transaction-victim).
+//
+// `parallel-fresh`, `tiny-overlap`, `decode-vs-plan`, `fill-big`, `twins`, `same-session-race` and
+// `spill-race` all run a 4-slot Host state pool. On a saturated Device state pool the policy
+// answered the state gap by RELEASING a conversation, crediting the eviction option's Device-state
+// footprint (`evict_device_state`) as relief. At execution the move-first prelude could not move
+// that state (no Host slot to land on, and the R2 degrade declined), so the teardown destroyed it -
+// 13 `[invariant1] strict site=transaction-victim ... state=N slots` lines in one suite run. The rig
+// never reproduced it because its Host state pool is 48 slots.
+//
+// The decision layer must not promise that: 显存里的数据只有两种归宿 - 正在用, 或搬到内存 (§三 R1).
+// A Device-state gap may only be closed by a MOVE (`device_state > 0`, which the Program only fills
+// in when the demotion can actually land - possibly after an R2 degrade). An owner whose Device
+// state cannot move is not releasable, so nothing is dropped and the request waits (R0).
+void case_device_state_gap_is_never_closed_by_evicting_a_state_it_cannot_move() {
+    std::printf("case_device_state_gap_is_never_closed_by_evicting_a_state_it_cannot_move\n");
+    const std::vector<Datum> pool{
+        // The eviction option would free 2 Device state slots, but there is no move option: the
+        // demotion has nowhere to land (`host_state` is full, `device_state` is 0).
+        {.id = 1, .device_state = 0, .evict_device_state = 2, .host_state = 0, .importance = 1},
+    };
+    const Plan outcome = decide(Demand{.device_state = 1}, state_occupancy(4, 4, 4, 4), pool);
+
+    check(outcome.enqueue, "a Device-state gap nothing can MOVE must wait, not evict");
+    check(outcome.reason == EnqueueReason::DeviceNotClosable, "and name the Device axis");
+    check(outcome.steps.empty(),
+          "no release step: destroying the owner's Device state is what §四 invariant 1 forbids");
+}
+
+// The control: with a move option the same gap IS answered - by moving, never by destroying.
+void case_device_state_gap_closes_by_moving_a_state_that_can_move() {
+    std::printf("case_device_state_gap_closes_by_moving_a_state_that_can_move\n");
+    const std::vector<Datum> pool{
+        {.id = 1, .device_state = 1, .evict_device_state = 1, .host_state = 1, .importance = 1},
+    };
+    const Plan outcome =
+        decide(Demand{.device_state = 1, .host_state = 1}, state_occupancy(4, 4, 4, 3), pool);
+
+    check(!outcome.enqueue, "a moveable Device state closes the gap");
+    check(action_count(outcome, Action::SpillToHost) == 1, "by moving it to Host");
+    check(action_count(outcome, Action::DropFromHost) == 0, "and not by releasing the owner");
+}
+
 }  // namespace
 
 int main() {
@@ -596,6 +658,8 @@ int main() {
     case_two_conversations_close_both_gaps();
     case_state_pressure_is_visible_without_a_kv_gap();
     case_state_pressure_with_no_state_to_move_enqueues();
+    case_device_state_gap_is_never_closed_by_evicting_a_state_it_cannot_move();
+    case_device_state_gap_closes_by_moving_a_state_that_can_move();
     case_nothing_is_dropped_for_a_gap_it_cannot_close();
     case_deletions_stop_at_the_gap();
     case_release_never_gets_a_second_step();

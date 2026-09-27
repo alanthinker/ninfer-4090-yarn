@@ -6403,7 +6403,15 @@ ProgramImplCore::release_materialization_victim(MaterializationTransaction& tran
     std::fprintf(stderr, "[evict-cause] site=materialization-victim slot=%u gen=%llu pos=%zu\n",
                  index, static_cast<unsigned long long>(generation), position);
     std::fflush(stderr);
-    release_continuation_slot_strict(index);
+    if (!release_continuation_slot_strict(index,
+                                          state_reclaim::ReleaseIntent::PolicyMaterializationVictim)) {
+        // §四 invariant 1: the prelude could not move this owner's Device data (no Host slot to land
+        // on, and the R2 degrade had nothing droppable), so releasing it would DESTROY that data.
+        // The whole step is refused - the caller rolls it back, nothing is deleted, and the request
+        // goes back to admission (R0, §三 R0: 排队 is the answer when nothing may be destroyed).
+        out.status = runtime::ConsumeStatus::InvariantMismatch;
+        return out;
+    }
     if (transaction.root_waiting_for_victim && transaction.root_continuation_index == index) {
         continuation_slots[index].role      = ContinuationSlotRole::ReservedMaterialization;
         transaction.root_waiting_for_victim = false;
@@ -6544,6 +6552,55 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
             abort_transaction();
             return out;
         }
+        // §四 invariant 1 preflight, BEFORE anything is released: run the move-first prelude for
+        // every eviction victim and refuse the whole step when one of them still holds Device data.
+        // 显存里的数据只有两种归宿 - 正在用, 或搬到内存 (§三 R1) - so a victim that cannot be moved is
+        // not releasable at all: rolling the step back (nothing deleted, the request returns to
+        // admission and waits, R0) is the rule, and destroying it is the bug the 2026-09-27 pressure
+        // cases measured 13 times. The preludes only MOVE data, so refusing here leaves the pool
+        // consistent and every victim intact.
+        for (std::size_t position = 0; position < transaction.shared_victim_count; ++position) {
+            const MaterializationTransaction::PressureWork& work =
+                transaction.shared_pressure[position];
+            if (!work.option.evicts_continuation) { continue; }
+            const std::uint32_t index      = transaction.shared_victim_indices[position];
+            const std::uint64_t generation = transaction.shared_victim_generations[position];
+            if (index >= shared_prefix_capacity ||
+                shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued ||
+                shared_prefix_slots[index].generation != generation) {
+                continue; // the release loop below reports the real staleness
+            }
+            prepare_shared_victim_teardown(index);
+            if (!shared_prefix_holds_device_data(index)) { continue; }
+            std::fprintf(stderr,
+                         "[cache] pressure step refused: shared victim slot=%u cannot be moved to"
+                         " Host (R1), rolling the step back instead of destroying Device data"
+                         " (R0)\n",
+                         index);
+            std::fflush(stderr);
+            abort_transaction();
+            return out;
+        }
+        for (std::size_t position = 0; position < transaction.victim_count; ++position) {
+            const MaterializationTransaction::PressureWork& work = transaction.pressure[position];
+            if (!work.option.evicts_continuation) { continue; }
+            const std::uint32_t index      = transaction.victim_indices[position];
+            const std::uint64_t generation = transaction.victim_generations[position];
+            if (index >= continuation_capacity ||
+                continuation_slots[index].role != ContinuationSlotRole::Catalogued ||
+                continuation_slots[index].generation != generation) {
+                continue; // the release loop below reports the real staleness
+            }
+            prepare_victim_teardown(index);
+            if (!continuation_holds_device_data(index)) { continue; }
+            std::fprintf(stderr,
+                         "[cache] pressure step refused: victim slot=%u cannot be moved to Host"
+                         " (R1), rolling the step back instead of destroying Device data (R0)\n",
+                         index);
+            std::fflush(stderr);
+            abort_transaction();
+            return out;
+        }
         for (std::size_t position = 0; position < transaction.shared_victim_count; ++position) {
             MaterializationTransaction::PressureWork& work = transaction.shared_pressure[position];
             if (work.option.evicts_continuation) {
@@ -6565,7 +6622,8 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                     throw std::logic_error("shared pressure victim is not strictly releasable");
                 }
                 const detail::PhysicalResources released = release_shared_prefix_state_strict(
-                    index, SharedPrefixSlotRole::Catalogued, "shared-pressure-victim");
+                    index, SharedPrefixSlotRole::Catalogued,
+                    state_reclaim::ReleaseIntent::PolicySharedPressureVictim);
                 if (released != exclusive) {
                     throw std::logic_error("shared pressure eviction acknowledgement is invalid");
                 }
@@ -6587,8 +6645,24 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
             if (work.option.evicts_continuation) {
                 const PhysicalReleaseResult released =
                     release_materialization_victim(transaction, position);
-                if (released.status != runtime::ConsumeStatus::Consumed ||
-                    released.delta.added != detail::PhysicalResources{} ||
+                if (released.status != runtime::ConsumeStatus::Consumed) {
+                    // §四 invariant 1 / §三 R0: the victim still held Device data after its
+                    // move-first prelude, so the release was refused instead of destroying it. The
+                    // step closes nothing as a result, so it is rolled back whole - nothing deleted,
+                    // nothing moved by this transaction - and the request returns to admission,
+                    // where it either re-plans against another victim or waits (R0). Destroying the
+                    // Device data instead is what the 2026-09-27 pressure cases measured 13 times
+                    // (`[invariant1] strict site=transaction-victim`), so the wait is the rule.
+                    std::fprintf(stderr,
+                                 "[cache] pressure step refused: victim slot=%u cannot be moved to"
+                                 " Host (R1), rolling the step back instead of destroying Device"
+                                 " data (R0)\n",
+                                 transaction.victim_indices[position]);
+                    std::fflush(stderr);
+                    abort_transaction();
+                    return out;
+                }
+                if (released.delta.added != detail::PhysicalResources{} ||
                     work.option.effect.added != detail::PhysicalResources{}) {
                     throw std::logic_error("materialization eviction changed after reservation");
                 }
@@ -7689,8 +7763,10 @@ bool ProgramImplCore::release_idle_owner_host_side() {
                      " zero; Host KV + Host state + catalog row go together)\n",
                      index);
         std::fflush(stderr);
-        release_continuation_slot_strict(index);
-        return true;
+        // §四 invariant 1: this step proved Device-free above, so the release may proceed; if the
+        // proof and the release ever disagree the guard refuses and the step reports failure.
+        return release_continuation_slot_strict(
+            index, state_reclaim::ReleaseIntent::PolicyLadderHostOnly);
     };
     const auto release_shared = [&](std::uint32_t index) -> bool {
         const SharedPrefixSlotRole role = shared_prefix_slots[index].role;
@@ -7717,8 +7793,11 @@ bool ProgramImplCore::release_idle_owner_host_side() {
                      " zero)\n",
                      index);
         std::fflush(stderr);
-        (void)release_shared_prefix_state_strict(index, role, "ladder-host-only");
-        return true;
+        // §四 invariant 1: Device-free was proven above; a refusal here means the proof and the
+        // release disagree, and the step then reports failure instead of destroying cache.
+        const detail::PhysicalResources released = release_shared_prefix_state_strict(
+            index, role, state_reclaim::ReleaseIntent::PolicyLadderHostOnly);
+        return released != detail::PhysicalResources{};
     };
     // The one chain first (§2.2): the ladder's preference order IS the policy's value order.
     for (const runtime::RetirePreferenceEntry& entry : retire_preference_) {
@@ -8187,7 +8266,8 @@ bool ProgramImplCore::can_release_continuation_slot_strict(std::uint32_t index) 
     return true;
 }
 
-void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index) noexcept {
+bool ProgramImplCore::release_continuation_slot_strict(
+    std::uint32_t index, state_reclaim::ReleaseIntent intent) noexcept {
     try {
         if (!can_release_continuation_slot_strict(index)) {
             const auto& seq = continuation_states[index];
@@ -8207,26 +8287,36 @@ void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index) noex
         std::terminate();
     }
     SequenceState& sequence = continuation_states[index];
-    // §四 invariant 1 / §七判据 #3 (behavioral, no source scan): every cache-path teardown
-    // through this primitive reports the Device footprint it destroys, so acceptance is "this
-    // counter is 0 across the battery", not "the call does not exist". The line is UNCONDITIONAL
-    // (no NINFER_REUSE_DIAG gate): an invariant probe that can be silenced reads 0 while the
-    // rule is being broken. After the §三 R0 ruling the ladder never reaches here; the remaining
-    // hits are the transaction victims the policy still executes as full evictions
-    // (§六.1 #3/#4) - each
-    // one is exactly what has to go to zero.
+    // §四 invariant 1, ENFORCED (缓存模块v2.md): 显存侧不存在删除. A cache-policy release may only
+    // run on an owner whose Device footprint is already zero - the move-first prelude's job (§三 R1:
+    // 先搬后释). If Device data is still there, the release is REFUSED and the owner is left
+    // completely intact: the caller must treat it as "this victim is not releasable" and roll its
+    // step back (R0 waits), never destroy. The `[invariant1]` line below is now only the record of
+    // the releases that ARE allowed to destroy (client ownership return, process exit).
     try {
         const detail::PhysicalResources footprint = owner_exclusive_resources(sequence);
         const std::uint32_t device_kv =
             footprint.device.main_kv_pages + footprint.device.backend_kv_pages;
-        if (device_kv != 0 || footprint.device.state_slots != 0) {
-            // Tagged like the shared variant so §十.4's assertion can tell a POLICY destruction from
-            // the process-exit teardown (`site=shutdown`), which is correct where it happens.
+        const bool holds_device = device_kv != 0 || footprint.device.state_slots != 0;
+        if (!state_reclaim::release_admits_device_destruction(intent, holds_device)) {
             std::fprintf(stderr,
-                         "[invariant1] strict site=transaction-victim slot=%u destroys Device data:"
-                         " kv=%u pages "
-                         "state=%u slots (R1 says move it; R2 may only delete Host)\n",
-                         index, device_kv, footprint.device.state_slots);
+                         "[invariant1-guard] refused %s slot=%u: it still holds Device data"
+                         " (kv=%u pages state=%u slots) - R1 says move it, R2 may only delete Host;"
+                         " the step must roll back instead\n",
+                         state_reclaim::release_intent_name(intent), index, device_kv,
+                         footprint.device.state_slots);
+            std::fflush(stderr);
+            return false;
+        }
+        if (holds_device) {
+            // Only the ownership return and the shutdown teardown may reach this line, and both
+            // destroy by design - the shutdown teardown releases every replica because the Program
+            // is going away, and a consumed handle ends that conversation by definition (§六.5).
+            std::fprintf(stderr,
+                         "[invariant1] strict site=%s slot=%u destroys Device data: kv=%u pages "
+                         "state=%u slots (ownership return / teardown, not a cache decision)\n",
+                         state_reclaim::release_intent_name(intent), index, device_kv,
+                         footprint.device.state_slots);
             std::fflush(stderr);
         }
     } catch (...) {
@@ -8261,6 +8351,7 @@ void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index) noex
     release_sequence_kv_strict(sequence);
     release_sequence_state_strict(sequence);
     retire_continuation_slot(index);
+    return true;
 }
 
 void ProgramImplCore::release_continuation_slot_best_effort(std::uint32_t index) noexcept {
@@ -8523,6 +8614,27 @@ std::string ProgramImplCore::retire_order_debug() const {
     return out;
 }
 
+bool ProgramImplCore::continuation_holds_device_data(std::uint32_t index) const noexcept {
+    try {
+        if (index >= continuation_capacity) { return true; }
+        const detail::PhysicalResources footprint = owner_exclusive_resources(continuation_states[index]);
+        return footprint.device.main_kv_pages != 0 || footprint.device.backend_kv_pages != 0 ||
+               footprint.device.state_slots != 0;
+    } catch (...) {
+        // Unreadable owner: refuse (safe) rather than risk destroying what could not be measured.
+        return true;
+    }
+}
+
+bool ProgramImplCore::shared_prefix_holds_device_data(std::uint32_t index) const noexcept {
+    try {
+        if (index >= shared_prefix_capacity) { return true; }
+        const detail::PhysicalResources footprint = owner_exclusive_resources(shared_prefix_states[index]);
+        return footprint.device.main_kv_pages != 0 || footprint.device.backend_kv_pages != 0 ||
+               footprint.device.state_slots != 0;
+    } catch (...) { return true; }
+}
+
 bool ProgramImplCore::prepare_shared_replacement(const SharedPrefixHandle& shared) {
     const std::uint32_t index = ContractAccess::index(shared);
     if (index >= shared_prefix_capacity || !state_store) { return false; }
@@ -8533,17 +8645,12 @@ bool ProgramImplCore::prepare_shared_replacement(const SharedPrefixHandle& share
     const SharedPrefixState& state = shared_prefix_states[index];
     if (!state.kv) { return false; }
     // Nothing on Device means the teardown already destroys Host data only - ready as is.
-    const auto holds_device_data = [&]() {
-        const detail::PhysicalResources exclusive = owner_exclusive_resources(state);
-        return exclusive.device.main_kv_pages != 0 || exclusive.device.backend_kv_pages != 0 ||
-               exclusive.device.state_slots != 0;
-    };
-    if (!holds_device_data()) { return true; }
+    if (!shared_prefix_holds_device_data(index)) { return true; }
     // §三 R1: move first. This is the very prelude the pressure paths already run
     // (`prepare_shared_victim_teardown`): spill the Device KV to Host and give the state image a Host
     // replica, so the later strict release can only destroy Host-side data.
     prepare_shared_victim_teardown(index);
-    return !holds_device_data();
+    return !shared_prefix_holds_device_data(index);
 }
 
 bool ProgramImplCore::release_one_cached_unit() {
@@ -10337,7 +10444,7 @@ bool ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
             }
             const detail::PhysicalResources removed = release_shared_prefix_state_strict(
                 *transaction.shared_index, SharedPrefixSlotRole::ReservedReplacement,
-                "capture-replacement");
+                state_reclaim::ReleaseIntent::PolicyCaptureReplacement);
             if (removed != transaction.capacity_preparation_removed) {
                 throw std::logic_error("shared capture preparation release changed");
             }
@@ -10811,6 +10918,46 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
 
     if (has_pressure() && pressure_transition.phase == PressureTransitionPhase::HostReleases) {
         if (cancellation.requested()) { return abort(); }
+        // §四 invariant 1 preflight, BEFORE anything is released (the same rule the materialization
+        // transaction runs): move every eviction victim's Device data to Host first, and if one of
+        // them cannot be moved, skip this optional capture instead of destroying it. 显存里的数据只有
+        // 两种归宿 - 正在用, 或搬到内存 (§三 R1).
+        for (std::size_t position = 0; position < transaction.shared_pressure.size(); ++position) {
+            if (!transaction.shared_pressure[position].option.evicts_continuation) { continue; }
+            const std::uint32_t index      = transaction.shared_victim_indices[position];
+            const std::uint64_t generation = transaction.shared_victim_generations[position];
+            if (index >= shared_prefix_capacity ||
+                shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued ||
+                shared_prefix_slots[index].generation != generation) {
+                continue; // the release loop below reports the real staleness
+            }
+            prepare_shared_victim_teardown(index);
+            if (!shared_prefix_holds_device_data(index)) { continue; }
+            std::fprintf(stderr,
+                         "[cache] capture pressure refused: shared victim slot=%u cannot be moved"
+                         " to Host (R1), skipping the capture instead of destroying Device data\n",
+                         index);
+            std::fflush(stderr);
+            return abort();
+        }
+        for (std::size_t position = 0; position < transaction.pressure.size(); ++position) {
+            if (!transaction.pressure[position].option.evicts_continuation) { continue; }
+            const std::uint32_t index      = transaction.victim_indices[position];
+            const std::uint64_t generation = transaction.victim_generations[position];
+            if (index >= continuation_capacity ||
+                continuation_slots[index].role != ContinuationSlotRole::Catalogued ||
+                continuation_slots[index].generation != generation) {
+                continue; // the release loop below reports the real staleness
+            }
+            prepare_victim_teardown(index);
+            if (!continuation_holds_device_data(index)) { continue; }
+            std::fprintf(stderr,
+                         "[cache] capture pressure refused: victim slot=%u cannot be moved to Host"
+                         " (R1), skipping the capture instead of destroying Device data\n",
+                         index);
+            std::fflush(stderr);
+            return abort();
+        }
         for (std::size_t position = 0; position < transaction.shared_pressure.size(); ++position) {
             auto& work                     = transaction.shared_pressure[position];
             const std::uint32_t index      = transaction.shared_victim_indices[position];
@@ -10830,7 +10977,8 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                         "capture shared pressure victim is not strictly releasable");
                 }
                 const detail::PhysicalResources released = release_shared_prefix_state_strict(
-                    index, SharedPrefixSlotRole::Catalogued, "capture-shared-pressure-victim");
+                    index, SharedPrefixSlotRole::Catalogued,
+                    state_reclaim::ReleaseIntent::PolicyCaptureSharedPressureVictim);
                 if (released != exclusive ||
                     work.option.effect.added != detail::PhysicalResources{}) {
                     throw std::logic_error("capture shared pressure eviction changed");
@@ -10874,7 +11022,18 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                 prepare_victim_teardown(index); // §三 R1: move first
                 const detail::PhysicalResources exclusive =
                     owner_exclusive_resources(continuation_states[index]);
-                release_continuation_slot_strict(index);
+                if (!release_continuation_slot_strict(
+                        index, state_reclaim::ReleaseIntent::PolicyCaptureVictim)) {
+                    // §四 invariant 1: the prelude could not move this victim's Device data, so
+                    // releasing it would destroy it. The preflight above should have caught this;
+                    // if it did not, skip the optional capture rather than destroy cache.
+                    std::fprintf(stderr,
+                                 "[cache] capture pressure refused: victim slot=%u cannot be moved"
+                                 " to Host (R1), skipping the capture\n",
+                                 index);
+                    std::fflush(stderr);
+                    return abort();
+                }
                 work.committed_delta    = detail::PhysicalDelta{.removed = exclusive};
                 work.completed          = true;
                 work.mutation_published = true;
@@ -11808,7 +11967,12 @@ ReleaseResult ProgramImplCore::release_continuation(ContinuationHandle&& continu
     std::fprintf(stderr, "[evict-cause] site=handle-release slot=%u gen=%llu\n", index,
                  static_cast<unsigned long long>(generation));
     std::fflush(stderr);
-    release_continuation_slot_strict(index);
+    // §四 invariant 1's two permitted exceptions: a consumed handle ends that conversation by
+    // definition (§六.5 ownership return, not a cache decision), and the process-exit teardown
+    // releases every replica because the Program is going away.
+    (void)release_continuation_slot_strict(
+        index, shutting_down_ ? state_reclaim::ReleaseIntent::ShutdownTeardown
+                              : state_reclaim::ReleaseIntent::OwnershipHandleRelease);
     ContractAccess::consume(continuation);
     advance_resource_revision();
     out.status = runtime::ConsumeStatus::Consumed;
@@ -11835,9 +11999,9 @@ bool ProgramImplCore::can_release_shared_prefix_state(std::uint32_t index,
 }
 
 detail::PhysicalResources
-ProgramImplCore::release_shared_prefix_state_strict(std::uint32_t index,
-                                                    SharedPrefixSlotRole expected_role,
-                                                    const char* site) noexcept {
+ProgramImplCore::release_shared_prefix_state_strict(
+    std::uint32_t index, SharedPrefixSlotRole expected_role,
+    state_reclaim::ReleaseIntent intent) noexcept {
     try {
         if (!can_release_shared_prefix_state(index, expected_role)) {
             std::fprintf(stderr, "[FATAL] shared_prefix_strict slot=%u role=%d: cannot release\n",
@@ -11848,21 +12012,32 @@ ProgramImplCore::release_shared_prefix_state_strict(std::uint32_t index,
         SharedPrefixState& shared               = shared_prefix_states[index];
         SharedPrefixSlot& slot                  = shared_prefix_slots[index];
         const detail::PhysicalResources removed = owner_exclusive_resources(shared);
-        // §四 invariant 1 / §七判据 #3: the shared teardown reports its Device footprint too, so
-        // the counter sees every cache-path Device destruction - private or shared.
+        // §四 invariant 1, ENFORCED: a cache-policy release may only run once the move-first prelude
+        // has taken this owner's Device data to Host (缓存模块v2.md §三 R1). If it is still there the
+        // release is REFUSED - an empty footprint and an intact owner - so the caller rolls its step
+        // back instead of destroying cache. Only the client's ownership return and the process-exit
+        // teardown may destroy Device data.
         {
             const std::uint32_t device_kv =
                 removed.device.main_kv_pages + removed.device.backend_kv_pages;
-            if (device_kv != 0 || removed.device.state_slots != 0) {
-                // `site=shutdown` is the process-exit teardown: every replica is released because
-                // the Program is going away, so it is NOT the violation this probe exists for.
-                // Every other site is a policy path and must reach zero before §七判据 #3 can
-                // become an assertion (§十.4).
+            const bool holds_device = device_kv != 0 || removed.device.state_slots != 0;
+            if (!state_reclaim::release_admits_device_destruction(intent, holds_device)) {
+                std::fprintf(stderr,
+                             "[invariant1-guard] refused %s slot=%u: it still holds Device data"
+                             " (kv=%u pages state=%u slots) - R1 says move it, R2 may only delete"
+                             " Host; the step must roll back instead\n",
+                             state_reclaim::release_intent_name(intent), index, device_kv,
+                             removed.device.state_slots);
+                std::fflush(stderr);
+                return {};
+            }
+            if (holds_device) {
                 std::fprintf(stderr,
                              "[invariant1] strict-shared site=%s slot=%u destroys Device data:"
-                             " kv=%u pages state=%u slots (R1 says move it; R2 may only"
-                             " delete Host)\n",
-                             site, index, device_kv, removed.device.state_slots);
+                             " kv=%u pages state=%u slots (ownership return / teardown, not a"
+                             " cache decision)\n",
+                             state_reclaim::release_intent_name(intent), index, device_kv,
+                             removed.device.state_slots);
                 std::fflush(stderr);
             }
         }
@@ -11912,8 +12087,10 @@ ReleaseResult ProgramImplCore::release_shared_prefix(SharedPrefixHandle&& handle
             return out;
         }
     } catch (...) { return out; }
-    (void)release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued,
-                                             shutting_down_ ? "shutdown" : "handle-release");
+    (void)release_shared_prefix_state_strict(
+        index, SharedPrefixSlotRole::Catalogued,
+        shutting_down_ ? state_reclaim::ReleaseIntent::ShutdownTeardown
+                       : state_reclaim::ReleaseIntent::OwnershipHandleRelease);
     ContractAccess::consume(handle);
     advance_resource_revision();
     out.status = runtime::ConsumeStatus::Consumed;
