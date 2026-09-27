@@ -8450,6 +8450,17 @@ ProgramImplCore::owner_exclusive_resources(const SharedPrefixState& shared) cons
     return out;
 }
 
+bool ProgramImplCore::release_one_cached_unit() {
+    // The ladder the capture/materialization paths already use when they need capacity, exposed for
+    // the one case that had no way to ask: a request whose planning produced NO plan at all. It
+    // frees exactly one unit - a redundant state replica, a demoted or evicted host replica,
+    // garbage, or (allow_degrade) the shallowest checkpoint of the least valuable idle owner - and
+    // never touches the executing conversation, an in-flight reservation, or Device data without
+    // spilling it first. Returns false when nothing is releasable, which is the only state in which
+    // waiting (R0) is the honest answer.
+    return release_one_device_state_slot(/*allow_degrade=*/true, nullptr);
+}
+
 bool ProgramImplCore::release_one_device_state_slot(bool allow_degrade, bool* did_degrade) {
     if (did_degrade != nullptr) { *did_degrade = false; }
     if (!state_store) { return false; }

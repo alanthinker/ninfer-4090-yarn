@@ -1030,6 +1030,11 @@ public:
     isolated_request_feasible(const RequestBasePlan<Variant>& base) const noexcept;
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
+    // R2 relief for an admission with NO plan at all: release ONE unit of the least valuable
+    // cached data (the Program's release ladder, value-ordered, never the executing
+    // conversation) and report whether the pool moved. The caller re-plans against the pool this
+    // produces; false means nothing is releasable and the request waits (R0).
+    [[nodiscard]] bool release_one_cached_unit();
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
 

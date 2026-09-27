@@ -650,6 +650,9 @@ public:
     }
 
     [[nodiscard]] qwen3_6::PhysicalUsageSnapshot physical_usage() const noexcept;
+    // Release ONE unit of the least valuable cached data for an admission that has no plan at
+    // all (缓存模块v2.md §三 R0/§2.1). False = nothing left to release, the request parks.
+    [[nodiscard]] bool release_one_cached_unit();
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 

@@ -317,6 +317,10 @@ public:
         // the next boundary. Early blocked returns (open transaction, no free lane) leave it
         // false: they are cheap to re-evaluate and are not search verdicts at all.
         bool negative_sound = false;
+        // Set when this inspection took one unit of R2 relief instead of accepting "no plan": the
+        // pool moved, so the caller must re-inspect now rather than park on a verdict about a pool
+        // that no longer exists.
+        bool relief_taken = false;
     };
 
     ResourceManager(std::uint32_t lane_count, std::uint32_t private_catalog_capacity,
@@ -596,6 +600,27 @@ public:
             plan_materialization(program, prompt, base, *destination, candidates, publication_order,
                                  planning_started, provisional_demand, &negative_sound);
         if (!selected) {
+            // R0 is the LAST resort (缓存模块v2.md §三 R0/§2.1): the request being admitted is the
+            // highest-value thing in the pool, so before answering "not now" the engine owes it one
+            // unit of R2 - delete the least valuable CACHED entry and let the next inspection plan
+            // against the pool that produced. The verdict is then no longer PROVEN, so it is not
+            // memoized and the head is re-inspected instead of waiting out its queue deadline.
+            //
+            // Measured 2026-09-27 in production, with every axis at its cap (`device.main_kv
+            // used=10282/10284`, `host.state 320/320`, 321 candidates): the search and the cache
+            // policy both came up one unit short, so no plan existed, and the head parked
+            // (`[engine] blocked-in-idle: head=714`) until an unrelated cancelled request happened
+            // to free capacity seven minutes later. The ladder was releasing other owners'
+            // checkpoints in that very window, so the unit was there for the taking - and the
+            // request that needed it was the one paying for the pool.
+            if (program.release_one_cached_unit()) {
+                std::fprintf(stderr,
+                             "[cache] R0 relief: no plan fit, released one unit of the least "
+                             "valuable cached data and re-planning (the admitted request is the "
+                             "highest-value thing in the pool, §2.1)\n");
+                std::fflush(stderr);
+                return {.readiness = Readiness::TemporarilyBlocked, .relief_taken = true};
+            }
             return {.readiness = Readiness::TemporarilyBlocked, .negative_sound = negative_sound};
         }
         return {

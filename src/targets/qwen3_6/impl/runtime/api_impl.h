@@ -588,6 +588,11 @@ PhysicalUsageSnapshot Program<Variant>::physical_usage() const noexcept {
 }
 
 template <>
+bool Program<Variant>::release_one_cached_unit() {
+    return impl_->release_one_cached_unit();
+}
+
+template <>
 MemorySummary Program<Variant>::memory_summary() const noexcept {
     return impl_->memory_summary();
 }

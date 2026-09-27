@@ -1194,8 +1194,25 @@ public:
 
     [[nodiscard]] FakePhysicalUsage physical_usage() const noexcept { return usage; }
 
+    // One unit of the least valuable cached data is gone: the deficit it was holding down is now
+    // smaller (the fake lowers the requirement a target has to satisfy) and the pool revision moves,
+    // so the caller must re-plan instead of trusting its previous verdict.
+    [[nodiscard]] bool release_one_cached_unit() {
+        ++cached_relief_requests;
+        if (!cached_relief_available) { return false; }
+        cached_relief_available   = false;
+        required_pressure_actions = 0;
+        advance_revision();
+        return true;
+    }
+
     void invalidate_resources() noexcept { advance_revision(); }
 
+    // Cached-relief model for the R0/R2 contract: `release_one_cached_unit` stands for the
+    // Program's release ladder - it deletes one unit of the least valuable CACHED data and reports
+    // whether the pool moved.
+    bool cached_relief_available       = false;
+    std::size_t cached_relief_requests = 0;
     std::size_t required_pressure_actions       = 0;
     std::size_t eviction_pressure_action_units  = 1;
     std::uint32_t private_pressure_alternatives = 1;
@@ -3816,6 +3833,59 @@ void test_retire_order_prices_a_just_read_owner_above_a_stale_deeper_one() {
              std::to_string(*after)).c_str());
 }
 
+// R0 must be the LAST resort, not the first answer. When no plan exists because the pool is full,
+// the engine owes the request one unit of R2 relief first - the current request is the highest-value
+// thing in the pool (缓存模块v2.md §2.1: 正在执行的对话价值最高), so the least valuable CACHED entry
+// gives way and the request is re-inspected against the pool the ladder just produced. Only when the
+// ladder has nothing left to release may the verdict stand and the request park to its deadline.
+//
+// Measured 2026-09-27 in production: `[search] target infeasible: choices=321 | device.main_kv
+// used=10282 peak=81 cap=10284 | host.state used=320 peak=0 cap=320` followed by
+// `[cache] policy target rejected reason=assessment candidate=root` and
+// `[engine] blocked-in-idle: head=714 waits for its queue deadline (R0)` - the head was served
+// seven minutes later only because an unrelated cancelled request released capacity. The release
+// set was one unit short and the ladder could have paid it immediately (it was degrading other
+// owners' checkpoints in the same window).
+void test_unplannable_request_takes_cached_relief_before_parking() {
+    FakeManager manager = make_manager(4, 8, 1);
+    FakeProgram program;
+    const ActiveRequest seed = start_active(
+        manager, program, 801, make_base(801, FakeCacheSessionKey{801}, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, seed, 4096);
+
+    // The pool is full enough that no target can pay for this request's claim...
+    program.required_pressure_actions = 4;
+    // ...and the ladder CAN release one unit of cached data. The fake models that release the way a
+    // dropped checkpoint lowers the deficit: the requirement the plan must satisfy gets smaller.
+    program.cached_relief_available = true;
+
+    const FakeManager::Inspection relieved =
+        manager.inspect(program, FakePreparedPrompt{802}, make_base(802), 2);
+    require(program.cached_relief_requests == 1,
+            "an unplannable request must ask the ladder for one unit of cached relief before parking");
+    require(relieved.readiness == Readiness::TemporarilyBlocked && relieved.relief_taken,
+            "taking relief must be reported: the engine has to re-inspect now instead of waiting "
+            "for an event that may never come");
+
+    // ...and the re-inspection is served, which is the whole point of taking the relief.
+    const FakeManager::Inspection served =
+        manager.inspect(program, FakePreparedPrompt{802}, make_base(802), 3);
+    require(served.readiness == Readiness::Ready || served.readiness == Readiness::NeedsTransfer,
+            "after the ladder released one unit the request must be planned, not parked again");
+    require(program.cached_relief_requests == 1,
+            "a served request must not keep taking relief");
+
+    // With nothing left to release the request parks (R0), and it does not spin: the ladder is asked
+    // once more and the verdict stands.
+    program.cached_relief_available  = false;
+    program.required_pressure_actions = 4;
+    const FakeManager::Inspection parked = manager.inspect(program, FakePreparedPrompt{803}, make_base(803), 4);
+    require(parked.readiness == Readiness::TemporarilyBlocked && !parked.relief_taken,
+            "with nothing releasable the head parks (R0) and must not report progress");
+    require(program.cached_relief_requests == 2,
+            "the second request must have asked the ladder too (once per unplannable plan)");
+}
+
 // Fair-share protection is a VALUE, not an exclusion (缓存模块v2.md §六.4): a shared-capture
 // offer whose only feasible target needs pressure no longer refuses the bucket outright - it
 // RESERVES, and the one importance chain prices the protected session (K + age ranks it
@@ -4018,6 +4088,8 @@ int main() {
              test_owner_score_prices_freshness_for_every_consumer);
     run_test("retire order prices a just-read owner above a stale deeper one",
              test_retire_order_prices_a_just_read_owner_above_a_stale_deeper_one);
+    run_test("unplannable request takes cached relief before parking",
+             test_unplannable_request_takes_cached_relief_before_parking);
     run_test("executing conversation is absent from the retire order",
              test_executing_conversation_is_absent_from_the_retire_order);
     if (failures != 0) { return 1; }

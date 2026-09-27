@@ -2213,6 +2213,16 @@ private:
                 // was running, the fifth only because the Engine happened to be idle). The
                 // deadline check at the top of this loop is what rejects: R0 says only the queue
                 // timeout rejects, never "tried N times" and never a mid-wait wipe.
+                // R2 before R0: the inspection above already took one unit of the least valuable
+                // cached data (缓存模块v2.md §三 R0/§2.1 - the request being admitted is the
+                // highest-value thing in the pool), so re-inspect against the pool that produced
+                // instead of waiting out the queue deadline for an event that may never come. Each
+                // pass releases one unit and cache only shrinks, so this terminates; the head parks
+                // for real once the ladder has nothing left to give.
+                if (head_inspection.relief_taken) {
+                    request_admission_check();
+                    return AdmissionProgress::ControlProgress;
+                }
                 if (!head_memo_hit) {
                     std::fprintf(stderr,
                                  "[engine] blocked-in-idle: head=%llu waits for its queue "
