@@ -6564,8 +6564,8 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                 if (!can_release_shared_prefix_state(index, SharedPrefixSlotRole::Catalogued)) {
                     throw std::logic_error("shared pressure victim is not strictly releasable");
                 }
-                const detail::PhysicalResources released =
-                    release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
+                const detail::PhysicalResources released = release_shared_prefix_state_strict(
+                    index, SharedPrefixSlotRole::Catalogued, "shared-pressure-victim");
                 if (released != exclusive) {
                     throw std::logic_error("shared pressure eviction acknowledgement is invalid");
                 }
@@ -7680,7 +7680,7 @@ bool ProgramImplCore::release_idle_owner_host_side() {
                      " zero)\n",
                      index);
         std::fflush(stderr);
-        (void)release_shared_prefix_state_strict(index, role);
+        (void)release_shared_prefix_state_strict(index, role, "ladder-host-only");
         return true;
     };
     // The one chain first (§2.2): the ladder's preference order IS the policy's value order.
@@ -8183,8 +8183,11 @@ void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index) noex
         const std::uint32_t device_kv =
             footprint.device.main_kv_pages + footprint.device.backend_kv_pages;
         if (device_kv != 0 || footprint.device.state_slots != 0) {
+            // Tagged like the shared variant so §十.4's assertion can tell a POLICY destruction from
+            // the process-exit teardown (`site=shutdown`), which is correct where it happens.
             std::fprintf(stderr,
-                         "[invariant1] strict slot=%u destroys Device data: kv=%u pages "
+                         "[invariant1] strict site=transaction-victim slot=%u destroys Device data:"
+                         " kv=%u pages "
                          "state=%u slots (R1 says move it; R2 may only delete Host)\n",
                          index, device_kv, footprint.device.state_slots);
             std::fflush(stderr);
@@ -8448,6 +8451,25 @@ ProgramImplCore::owner_exclusive_resources(const SharedPrefixState& shared) cons
         }
     }
     return out;
+}
+
+std::uint32_t ProgramImplCore::retire_order_size() const noexcept {
+    return static_cast<std::uint32_t>(retire_preference_.size());
+}
+
+bool ProgramImplCore::shared_owner_teardown_would_destroy_device(
+    const SharedPrefixHandle& shared) const noexcept {
+    const std::uint32_t index = ContractAccess::index(shared);
+    if (index >= shared_prefix_capacity) { return false; }
+    if (shared_prefix_slots[index].generation != ContractAccess::epoch(shared) ||
+        shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued) {
+        return false;
+    }
+    const SharedPrefixState& state = shared_prefix_states[index];
+    if (!state.kv) { return false; }
+    const detail::PhysicalResources exclusive = owner_exclusive_resources(state);
+    return exclusive.device.main_kv_pages != 0 || exclusive.device.backend_kv_pages != 0 ||
+           exclusive.device.state_slots != 0;
 }
 
 bool ProgramImplCore::release_one_cached_unit() {
@@ -10240,7 +10262,8 @@ bool ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
                 throw std::logic_error("shared capture replacement is not strictly releasable");
             }
             const detail::PhysicalResources removed = release_shared_prefix_state_strict(
-                *transaction.shared_index, SharedPrefixSlotRole::ReservedReplacement);
+                *transaction.shared_index, SharedPrefixSlotRole::ReservedReplacement,
+                "capture-replacement");
             if (removed != transaction.capacity_preparation_removed) {
                 throw std::logic_error("shared capture preparation release changed");
             }
@@ -10732,8 +10755,8 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                     throw std::logic_error(
                         "capture shared pressure victim is not strictly releasable");
                 }
-                const detail::PhysicalResources released =
-                    release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
+                const detail::PhysicalResources released = release_shared_prefix_state_strict(
+                    index, SharedPrefixSlotRole::Catalogued, "capture-shared-pressure-victim");
                 if (released != exclusive ||
                     work.option.effect.added != detail::PhysicalResources{}) {
                     throw std::logic_error("capture shared pressure eviction changed");
@@ -11739,7 +11762,8 @@ bool ProgramImplCore::can_release_shared_prefix_state(std::uint32_t index,
 
 detail::PhysicalResources
 ProgramImplCore::release_shared_prefix_state_strict(std::uint32_t index,
-                                                    SharedPrefixSlotRole expected_role) noexcept {
+                                                    SharedPrefixSlotRole expected_role,
+                                                    const char* site) noexcept {
     try {
         if (!can_release_shared_prefix_state(index, expected_role)) {
             std::fprintf(stderr, "[FATAL] shared_prefix_strict slot=%u role=%d: cannot release\n",
@@ -11756,11 +11780,15 @@ ProgramImplCore::release_shared_prefix_state_strict(std::uint32_t index,
             const std::uint32_t device_kv =
                 removed.device.main_kv_pages + removed.device.backend_kv_pages;
             if (device_kv != 0 || removed.device.state_slots != 0) {
+                // `site=shutdown` is the process-exit teardown: every replica is released because
+                // the Program is going away, so it is NOT the violation this probe exists for.
+                // Every other site is a policy path and must reach zero before §七判据 #3 can
+                // become an assertion (§十.4).
                 std::fprintf(stderr,
-                             "[invariant1] strict-shared slot=%u destroys Device data:"
+                             "[invariant1] strict-shared site=%s slot=%u destroys Device data:"
                              " kv=%u pages state=%u slots (R1 says move it; R2 may only"
                              " delete Host)\n",
-                             index, device_kv, removed.device.state_slots);
+                             site, index, device_kv, removed.device.state_slots);
                 std::fflush(stderr);
             }
         }
@@ -11810,7 +11838,8 @@ ReleaseResult ProgramImplCore::release_shared_prefix(SharedPrefixHandle&& handle
             return out;
         }
     } catch (...) { return out; }
-    (void)release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
+    (void)release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued,
+                                             shutting_down_ ? "shutdown" : "handle-release");
     ContractAccess::consume(handle);
     advance_resource_revision();
     out.status = runtime::ConsumeStatus::Consumed;
@@ -11843,6 +11872,9 @@ void ProgramImplCore::fail_all_cleanup() noexcept {
             release_continuation_slot_best_effort(index);
         }
     }
+    // §十.1: this teardown is the process going away, so releasing Device replicas here is correct
+    // - the [invariant1] probe must not count it as the policy violation it exists for.
+    shutting_down_ = true;
     for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
         if (shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued) { continue; }
         shared_prefix_states[index].active_references = 0;

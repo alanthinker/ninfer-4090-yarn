@@ -413,6 +413,20 @@ echo "transfer churn (this battery): D2H copies=$(scope 'state-store: D2H copy h
 # morning's stops while every step slice of this battery was0). Count only this battery's tail.
 echo -n "matching error lines in $S (this battery's window): "
 tail -n +"$((BAT_START_LINE + 1))" "$S" | grep -cE "$ERR_PAT" || true
+# §七判据 #3 (缓存模块v2.md §十.4): no POLICY path may destroy Device data - R1 says move it, R2 may
+# only delete Host. The [invariant1] probe now names its site; `site=shutdown` is the process-exit
+# teardown, where releasing every replica is correct. Any other site is the violation this battery
+# must fail on, which is what "turn the hard assertion on once the counter reaches zero" means.
+ALL_DEVICE_DESTRUCTION=$(tail -n +"$((BAT_START_LINE + 1))" "$S"     | grep -c '\[invariant1\]' || true)
+SHUTDOWN_DESTRUCTION=$(tail -n +"$((BAT_START_LINE + 1))" "$S"     | grep -c '\[invariant1\].*site=shutdown' || true)
+POLICY_ONLY=$((ALL_DEVICE_DESTRUCTION - SHUTDOWN_DESTRUCTION))
+echo "device-data destruction (this battery's window): policy-path=$POLICY_ONLY" \
+     "shutdown=$SHUTDOWN_DESTRUCTION (only policy-path counts, §十.4)"
+if [ "$POLICY_ONLY" != "0" ]; then
+    echo "BATTERY FAILED: $POLICY_ONLY policy-path [invariant1] event(s) destroyed Device data"
+    tail -n +"$((BAT_START_LINE + 1))" "$S" | grep '\[invariant1\]' | grep -v 'site=shutdown' | head -3
+    FAILED_STEPS=$((FAILED_STEPS + 1))
+fi
 if [ "$FAILED_STEPS" != "0" ]; then
     echo "BATTERY FAILED: $FAILED_STEPS step(s) reported a failure"
     exit 1

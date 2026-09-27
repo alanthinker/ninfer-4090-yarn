@@ -2224,12 +2224,18 @@ private:
                     return AdmissionProgress::ControlProgress;
                 }
                 if (!head_memo_hit) {
+                    // Who the wait is FOR decides whether it is legitimate: queueing behind work in
+                    // progress is normal, but waiting while FINISHED conversations hold the pool is a
+                    // policy failure (2026-09-27 ruling). `active=%u` counts the lanes that are
+                    // running right now, so the two are distinguishable from the log.
                     std::fprintf(stderr,
                                  "[engine] blocked-in-idle: head=%llu waits for its queue "
-                                 "deadline (R0; revision=%llu, active=0)\n",
+                                 "deadline (R0; revision=%llu, active=%u, retire_order=%u)\n",
                                  static_cast<unsigned long long>(head->id),
                                  static_cast<unsigned long long>(
-                                     instance_.program->resource_revision().value));
+                                     instance_.program->resource_revision().value),
+                                 static_cast<unsigned>(active.size),
+                                 static_cast<unsigned>(instance_.program->retire_order_size()));
                     std::fflush(stderr);
                 }
                 return control_progress ? AdmissionProgress::ControlProgress

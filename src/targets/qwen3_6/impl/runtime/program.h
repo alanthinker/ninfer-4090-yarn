@@ -650,6 +650,14 @@ public:
     }
 
     [[nodiscard]] qwen3_6::PhysicalUsageSnapshot physical_usage() const noexcept;
+    // §三 R1 / §四 invariant 1: true when releasing this shared owner would destroy Device data
+    // (its exclusive footprint still holds Device KV pages or Device state slots).
+    [[nodiscard]] bool
+    shared_owner_teardown_would_destroy_device(const SharedPrefixHandle& shared) const noexcept;
+    // Diagnostic for the R0 park line: how many owners the ladder may walk. An empty or tiny list
+    // while the pool is full is the signature of "finished conversations hold the cache but are not
+    // candidates" (2026-09-27).
+    [[nodiscard]] std::uint32_t retire_order_size() const noexcept;
     // Release ONE unit of the least valuable cached data for an admission that has no plan at
     // all (缓存模块v2.md §三 R0/§2.1). False = nothing left to release, the request parks.
     [[nodiscard]] bool release_one_cached_unit();
@@ -1300,6 +1308,10 @@ private:
     // owner can be degraded this way - the caller then fails the step and the request waits (R0),
     // because the old fallback (retiring the owner, both tiers at once) violated invariant 1 in
     // 280 of 557 production retirements (§七判据 #3).
+    // §十.1: true while the Program is tearing its own pool down at process exit, where releasing
+    // Device replicas is correct rather than the policy violation the [invariant1] probe reports.
+    bool shutting_down_ = false;
+
     // R2 component eviction for a Host state slot: ONE value ordering decides who gives way,
     // and the conversation being executed is not in that ordering at all (§2.1/§2.2).
     [[nodiscard]] bool degrade_idle_owner_host_state();
@@ -1420,9 +1432,13 @@ private:
     release_checkpoint_reference(StateImageHandle checkpoint) noexcept;
     [[nodiscard]] bool can_release_shared_prefix_state(std::uint32_t index,
                                                        SharedPrefixSlotRole expected_role) const;
+    // `site` names the caller so the [invariant1] probe can tell a POLICY-path destruction (a bug:
+    // R1 says move it, R2 may only delete Host) from the shutdown teardown, where releasing every
+    // replica is correct and unavoidable - mixing the two is why the counter could never reach zero
+    // and the hard assertion stayed off (§十.4).
     [[nodiscard]] detail::PhysicalResources
-    release_shared_prefix_state_strict(std::uint32_t index,
-                                       SharedPrefixSlotRole expected_role) noexcept;
+    release_shared_prefix_state_strict(std::uint32_t index, SharedPrefixSlotRole expected_role,
+                                       const char* site) noexcept;
     [[nodiscard]] detail::PhysicalResources
     install_private_capture(SequenceState& sequence, const CaptureGroup& group,
                             StateImageHandle checkpoint,

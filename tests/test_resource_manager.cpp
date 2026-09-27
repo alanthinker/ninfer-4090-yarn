@@ -1028,9 +1028,10 @@ public:
 
     [[nodiscard]] FakeCaptureAssessment inspect_capture(const FakeCaptureOffer&,
                                                         const FakeSharedPrefixHandle*,
-                                                        const FakeSharedPrefixHandle*,
+                                                        const FakeSharedPrefixHandle* replacement,
                                                         std::optional<CheckpointRef>,
                                                         bool permit_shared_publication) const {
+        if (replacement != nullptr) { ++shared_replacement_inspections; }
         FakeCaptureAssessment assessment = capture_assessment;
         if (!permit_shared_publication) { assessment.publishes_shared = false; }
         return assessment;
@@ -1213,6 +1214,16 @@ public:
     // whether the pool moved.
     bool cached_relief_available       = false;
     std::size_t cached_relief_requests = 0;
+    // Shared-replacement model for the §三 R1 invariant: `shared_victim_device_data` says the
+    // catalogued shared owner still holds Device replicas, and `shared_replacement_inspections`
+    // counts how often the manager OFFERED an owner as a replacement victim (the moment that leads
+    // to `[invariant1] strict-shared site=capture-replacement`).
+    bool shared_victim_device_data                    = false;
+    mutable std::size_t shared_replacement_inspections = 0;
+    [[nodiscard]] bool shared_owner_teardown_would_destroy_device(
+        const FakeSharedPrefixHandle&) const noexcept {
+        return shared_victim_device_data;
+    }
     std::size_t required_pressure_actions       = 0;
     std::size_t eviction_pressure_action_units  = 1;
     std::uint32_t private_pressure_alternatives = 1;
@@ -3833,6 +3844,80 @@ void test_retire_order_prices_a_just_read_owner_above_a_stale_deeper_one() {
              std::to_string(*after)).c_str());
 }
 
+// §三 R1 / §四 invariant 1: replacing a shared owner DESTROYS its replicas, and R2 may only delete
+// Host-side data. A shared owner that still holds Device data may therefore not be offered as a
+// replacement victim at all - the replacement path cannot move the data first without contradicting
+// the capacity equation it already committed to. The promotion is optional (§7.2: only spare
+// capacity that does not degrade an existing owner), so skipping such a victim costs the contract
+// nothing: the request still gets its own private checkpoint.
+//
+// Measured 2026-09-27: this is the only POLICY path that destroyed Device data in either tier
+// (`[invariant1] strict-shared site=capture-replacement`); every other occurrence was the shutdown
+// teardown, which is tagged `site=shutdown` and is correct there.
+void test_shared_replacement_is_not_offered_for_a_device_holding_victim() {
+    // Fixture: publish one shared owner, then offer a second capture with shared evidence strong
+    // enough for the manager to consider replacing it.
+    const auto publish_seed = [](FakeManager& manager, FakeProgram& program) {
+        FakeRequestBasePlan seed_base = make_base(91);
+        seed_base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .frontier = 64,
+        });
+        const ActiveRequest seed = start_active(manager, program, 91, seed_base, 1);
+        program.capture_assessment = FakeCaptureAssessment{
+            .shortlist_key          = FakeShortlistKey{.digest = 91, .frontier = 64},
+            .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .protected_rebuild_work = PrefillWork{.tokens = 64},
+            .publishes_shared       = true,
+            .physically_feasible    = true,
+        };
+        require(manager.reserve_active_capture(program, seed.lane, FakeCaptureOffer{.id = 31}, 0,
+                                               {}) == FakeManager::ActiveCaptureReserveResult::Reserved,
+                "shared fixture could not reserve its source capture");
+        auto progress = manager.progress_context_transaction(program, {});
+        const auto capture = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+        require(capture.status == ContextTransactionStatus::Published,
+                "shared fixture did not publish its source");
+        (void)finish_active(manager, program, seed);
+    };
+
+    const auto offer_replacement = [](FakeManager& manager, FakeProgram& program,
+                                      std::uint32_t id) {
+        FakeRequestBasePlan base = make_base(id);
+        base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .frontier = 32,
+        });
+        const ActiveRequest request = start_active(manager, program, id, base, 1);
+        (void)manager.reserve_active_capture(program, request.lane, FakeCaptureOffer{.id = id}, 0,
+                                             {});
+    };
+
+    // (A) The victim still holds Device data: it must not be offered as a replacement.
+    {
+        FakeManager manager = make_manager(2, 3, 1);
+        FakeProgram program;
+        publish_seed(manager, program);
+        program.shared_victim_device_data = true;
+        offer_replacement(manager, program, 93);
+        require(program.shared_replacement_inspections == 0,
+                "a shared owner that still holds Device data was offered as a replacement victim "
+                "(releasing it would destroy Device data; R2 may only delete Host)");
+    }
+    // (B) Control: a host-only victim is still replaceable, so the rule does not disable the path.
+    {
+        FakeManager manager = make_manager(2, 3, 1);
+        FakeProgram program;
+        publish_seed(manager, program);
+        program.shared_victim_device_data = false;
+        offer_replacement(manager, program, 95);
+        require(program.shared_replacement_inspections == 1,
+                "a host-only shared owner must still be considered as a replacement victim");
+    }
+}
+
 // R0 must be the LAST resort, not the first answer. When no plan exists because the pool is full,
 // the engine owes the request one unit of R2 relief first - the current request is the highest-value
 // thing in the pool (缓存模块v2.md §2.1: 正在执行的对话价值最高), so the least valuable CACHED entry
@@ -4090,6 +4175,8 @@ int main() {
              test_retire_order_prices_a_just_read_owner_above_a_stale_deeper_one);
     run_test("unplannable request takes cached relief before parking",
              test_unplannable_request_takes_cached_relief_before_parking);
+    run_test("shared replacement skips a device-holding victim",
+             test_shared_replacement_is_not_offered_for_a_device_holding_victim);
     run_test("executing conversation is absent from the retire order",
              test_executing_conversation_is_absent_from_the_retire_order);
     if (failures != 0) { return 1; }

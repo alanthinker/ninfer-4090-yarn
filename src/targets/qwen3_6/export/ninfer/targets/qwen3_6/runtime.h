@@ -1030,6 +1030,14 @@ public:
     isolated_request_feasible(const RequestBasePlan<Variant>& base) const noexcept;
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
+    // §三 R1 / §四 invariant 1: would releasing this shared owner destroy Device data? Replacing a
+    // shared owner is optional (§7.2), so a victim that still holds Device replicas is simply not a
+    // replacement candidate: R2 may only delete Host-side data, and the replacement path cannot
+    // move the data first without breaking the capacity equation it already committed to.
+    [[nodiscard]] bool
+    shared_owner_teardown_would_destroy_device(const SharedPrefixHandle<Variant>& shared) const
+        noexcept;
+    [[nodiscard]] std::uint32_t retire_order_size() const noexcept;
     // R2 relief for an admission with NO plan at all: release ONE unit of the least valuable
     // cached data (the Program's release ladder, value-ordered, never the executing
     // conversation) and report whether the pool moved. The caller re-plans against the pool this

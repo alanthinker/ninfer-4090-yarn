@@ -880,6 +880,19 @@ public:
                         entry.transaction_pins != 0 || shared_active_edge_count(slot) != 0) {
                         continue;
                     }
+                    // §三 R1 / §四 invariant 1: replacing a shared owner DESTROYS its replicas, and
+                    // R2 may only delete Host-side data. A victim that still holds Device data can
+                    // only be replaced after that data has moved, which this path cannot do inside
+                    // the capacity equation (the equation committed to the removal before the move
+                    // would run) - so such an owner is not a replacement candidate at all. Leaving
+                    // it out costs nothing that the contract promises: the promotion is optional
+                    // (§7.2, "only spare capacity that does not degrade an existing owner"), and
+                    // the request still gets its own private checkpoint plus a vacant shared slot if
+                    // one exists. Measured 2026-09-27: this is the only policy path that destroyed
+                    // Device data (`[invariant1] strict-shared site=capture-replacement`).
+                    if (program.shared_owner_teardown_would_destroy_device(*entry.handle)) {
+                        continue;
+                    }
                     CaptureAssessment assessment = program.inspect_capture(
                         offer, nullptr, &*entry.handle, private_replacement, true);
                     if (!assessment.publishes_shared) { continue; }

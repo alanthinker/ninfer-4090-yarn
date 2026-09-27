@@ -588,6 +588,17 @@ PhysicalUsageSnapshot Program<Variant>::physical_usage() const noexcept {
 }
 
 template <>
+std::uint32_t Program<Variant>::retire_order_size() const noexcept {
+    return impl_->retire_order_size();
+}
+
+template <>
+bool Program<Variant>::shared_owner_teardown_would_destroy_device(
+    const SharedPrefixHandle<Variant>& shared) const noexcept {
+    return impl_->shared_owner_teardown_would_destroy_device(shared);
+}
+
+template <>
 bool Program<Variant>::release_one_cached_unit() {
     return impl_->release_one_cached_unit();
 }
