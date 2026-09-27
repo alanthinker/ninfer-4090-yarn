@@ -101,13 +101,20 @@ def main() -> int:
     parser.add_argument("--turns", type=int, default=8, help="turns that make the context deep")
     parser.add_argument("--turn-tokens", type=int, default=2500, help="filler tokens per turn")
     parser.add_argument("--flood", type=int, default=40, help="disposable sessions to send")
+    parser.add_argument("--flood-turns", type=int, default=1,
+                        help="user turns per disposable session; each turn boundary publishes a "
+                             "long anchor, so this sets how many Host state slots one disposable "
+                             "session costs (production's 320 slots absorb a 120-session flood of "
+                             "3-message sessions by degrading anchors alone, and the step then "
+                             "reports INCONCLUSIVE)")
     parser.add_argument("--keep", type=int, default=0,
                         help="leave N disposable sessions after the check (0 = none)")
     args = parser.parse_args()
 
     base = f"http://127.0.0.1:{args.port}"
     print("=== Important session survival ===")
-    print(f"turns={args.turns} x ~{args.turn_tokens} tokens, flood={args.flood} sessions")
+    print(f"turns={args.turns} x ~{args.turn_tokens} tokens, flood={args.flood} sessions x "
+          f"{2 * args.flood_turns + 1} messages")
     print(f"occupancy before: host_state_slots={occupancy()}")
 
     log_before = read_log()
@@ -133,9 +140,15 @@ def main() -> int:
     print(f"\n--- flooding with {args.flood} disposable sessions ---")
     retirements = 0
     for index in range(args.flood):
-        disposable = [{"role": "user", "content": filler(1200, f"disposable {index}")},
-                      {"role": "assistant", "content": "ack"},
-                      {"role": "user", "content": filler(600, f"disposable {index} more")}]
+        # Turn 0 keeps the original single-turn text verbatim, so --flood-turns 1 is exactly the
+        # workload this step has always sent.
+        disposable = [{"role": "user", "content": filler(1200, f"disposable {index}")}]
+        for turn in range(1, args.flood_turns):
+            disposable.append({"role": "assistant", "content": "ack"})
+            disposable.append({"role": "user",
+                               "content": filler(1200, f"disposable {index} turn {turn}")})
+        disposable.append({"role": "assistant", "content": "ack"})
+        disposable.append({"role": "user", "content": filler(600, f"disposable {index} more")})
         try:
             post(base, disposable, max_tokens=1)
         except urllib.error.HTTPError as error:
