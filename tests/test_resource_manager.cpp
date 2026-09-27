@@ -1,4 +1,5 @@
 #include "core/site_bad_alloc.h"
+#include "targets/qwen3_6/impl/runtime/state_reclaim_policy.h"
 #include "runtime/cache/cache_tier_policy.h"
 #include "runtime/engine/resource_manager.h"
 
@@ -22,6 +23,7 @@ namespace {
 
 using ninfer::PrefixReusePath;
 using ninfer::RuntimeStats;
+namespace state_reclaim = ninfer::targets::qwen3_6::detail::state_reclaim;
 using ninfer::runtime::CancellationFlagView;
 using ninfer::runtime::CheckpointKind;
 using ninfer::runtime::CheckpointRecoveryAlternativeWork;
@@ -3918,6 +3920,37 @@ void test_shared_replacement_is_not_offered_for_a_device_holding_victim() {
     }
 }
 
+// 缓存模块v2.md §2.1 / §三 R0: the ladder may only refuse to reclaim what is being EXECUTED (or what
+// an in-flight reservation is about to write). A FINISHED conversation's images - its turn closure
+// included, dearest of them - are cache and must be reclaimable; the value order decides that they go
+// last, not that they can never go.
+//
+// Measured 2026-09-27 (`parallel-fresh`, real model, and the doc's §十.1): an IDLE Engine waited its
+// entire admission deadline (`blocked-in-idle … active=0`) because the Host state pool held the turn
+// closures of FINISHED conversations, the R2 component step accepts only HostOnly replicas, and the
+// lossless EvictHostReplica step refused every closure - the predicate bound the closure of every
+// non-Free row, whether or not that conversation was being executed.
+void test_finished_conversations_images_are_reclaimable() {
+    // Executed work is the working set: never reclaimable.
+    require(state_reclaim::state_is_live_binding(state_reclaim::StateOwnerUse::InflightDestination),
+            "an in-flight reservation's destination must stay bound");
+    require(state_reclaim::state_is_live_binding(state_reclaim::StateOwnerUse::ExecutingActiveState),
+            "the executed conversation's live state must stay bound");
+    require(state_reclaim::state_is_live_binding(state_reclaim::StateOwnerUse::ExecutingClosure),
+            "the executed conversation's turn closure must stay bound");
+    require(state_reclaim::state_is_live_binding(state_reclaim::StateOwnerUse::ExecutingAnchor),
+            "the executed conversation's fork points must stay bound");
+
+    // A finished conversation is cache, whatever the image is.
+    require(!state_reclaim::state_is_live_binding(state_reclaim::StateOwnerUse::IdleClosure),
+            "a FINISHED conversation's turn closure is cache: the pool must be able to sacrifice it "
+            "(value-ordered last) instead of waiting out the queue deadline");
+    require(!state_reclaim::state_is_live_binding(state_reclaim::StateOwnerUse::IdleActiveState),
+            "a FINISHED conversation's retained state is cache");
+    require(!state_reclaim::state_is_live_binding(state_reclaim::StateOwnerUse::IdleAnchor),
+            "a FINISHED conversation's fork point is cache");
+}
+
 // R0 must be the LAST resort, not the first answer. When no plan exists because the pool is full,
 // the engine owes the request one unit of R2 relief first - the current request is the highest-value
 // thing in the pool (缓存模块v2.md §2.1: 正在执行的对话价值最高), so the least valuable CACHED entry
@@ -4175,6 +4208,8 @@ int main() {
              test_retire_order_prices_a_just_read_owner_above_a_stale_deeper_one);
     run_test("unplannable request takes cached relief before parking",
              test_unplannable_request_takes_cached_relief_before_parking);
+    run_test("finished conversations' images are reclaimable",
+             test_finished_conversations_images_are_reclaimable);
     run_test("shared replacement skips a device-holding victim",
              test_shared_replacement_is_not_offered_for_a_device_holding_victim);
     run_test("executing conversation is absent from the retire order",

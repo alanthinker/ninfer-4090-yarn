@@ -17,6 +17,7 @@
 #include "targets/qwen3_6/impl/runtime/state_image_store.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/resource_projection.h"
+#include "targets/qwen3_6/impl/runtime/state_reclaim_policy.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -658,6 +659,12 @@ public:
     // while the pool is full is the signature of "finished conversations hold the cache but are not
     // candidates" (2026-09-27).
     [[nodiscard]] std::uint32_t retire_order_size() const noexcept;
+    // Why the ladder can or cannot walk each entry it was handed: slot, role (0=Free
+    // 1=ReservedMaterialization 2=Active 3=Catalogued), that owner's Host and Device state slots, and
+    // whether it is release-protected / pinned. Printed when an idle Engine parks, because "the pool
+    // is full of FINISHED conversations and the ladder still cannot free one" is exactly the defect
+    // the park line has to be able to show (2026-09-27).
+    [[nodiscard]] std::string retire_order_debug() const;
     // Release ONE unit of the least valuable cached data for an admission that has no plan at
     // all (缓存模块v2.md §三 R0/§2.1). False = nothing left to release, the request parks.
     [[nodiscard]] bool release_one_cached_unit();

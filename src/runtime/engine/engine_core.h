@@ -2236,6 +2236,8 @@ private:
                                      instance_.program->resource_revision().value),
                                  static_cast<unsigned>(active.size),
                                  static_cast<unsigned>(instance_.program->retire_order_size()));
+                    std::fprintf(stderr, "[engine]   retire order:%s\n",
+                                 instance_.program->retire_order_debug().c_str());
                     std::fflush(stderr);
                 }
                 return control_progress ? AdmissionProgress::ControlProgress

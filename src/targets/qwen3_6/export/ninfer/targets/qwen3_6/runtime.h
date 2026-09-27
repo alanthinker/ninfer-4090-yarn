@@ -1038,6 +1038,7 @@ public:
     shared_owner_teardown_would_destroy_device(const SharedPrefixHandle<Variant>& shared) const
         noexcept;
     [[nodiscard]] std::uint32_t retire_order_size() const noexcept;
+    [[nodiscard]] std::string retire_order_debug() const;
     // R2 relief for an admission with NO plan at all: release ONE unit of the least valuable
     // cached data (the Program's release ladder, value-ordered, never the executing
     // conversation) and report whether the pool moved. The caller re-plans against the pool this

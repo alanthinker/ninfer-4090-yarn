@@ -7071,15 +7071,34 @@ bool ProgramImplCore::state_bound_by_active_sequence(StateImageHandle state) con
         const ContinuationSlotRole role = continuation_slots[index].role;
         if (role == ContinuationSlotRole::Free) { continue; }
         const SequenceState& sequence = continuation_states[index];
-        if (sequence.reserved_state && *sequence.reserved_state == state) { return true; }
-        if (sequence.rewrite_state && *sequence.rewrite_state == state) { return true; }
-        if (role != ContinuationSlotRole::Active) { continue; }
-        if (sequence.state.read == state || sequence.state.write == state) { return true; }
+        const bool executing = role == ContinuationSlotRole::Active;
+        // Classify what this reference IS, then ask the one table whether that is a live binding:
+        // executed work is the working set, a finished conversation's images are cache
+        // (缓存模块v2.md §2.1). The classification is deliberately explicit so the table's unit test
+        // pins every case.
+        if (sequence.reserved_state && *sequence.reserved_state == state) {
+            if (state_reclaim::state_is_live_binding(state_reclaim::StateOwnerUse::InflightDestination)) { return true; }
+        }
+        if (sequence.rewrite_state && *sequence.rewrite_state == state) {
+            const state_reclaim::StateOwnerUse use =
+                executing ? state_reclaim::StateOwnerUse::ExecutingClosure
+                          : state_reclaim::StateOwnerUse::IdleClosure;
+            if (state_reclaim::state_is_live_binding(use)) { return true; }
+        }
+        if (sequence.state.read == state || sequence.state.write == state) {
+            const state_reclaim::StateOwnerUse use =
+                executing ? state_reclaim::StateOwnerUse::ExecutingActiveState
+                          : state_reclaim::StateOwnerUse::IdleActiveState;
+            if (state_reclaim::state_is_live_binding(use)) { return true; }
+        }
         if (std::any_of(sequence.long_anchors.begin(), sequence.long_anchors.end(),
                         [state](const LongAnchorCheckpoint& anchor) {
                             return anchor.state == state;
                         })) {
-            return true;
+            const state_reclaim::StateOwnerUse use =
+                executing ? state_reclaim::StateOwnerUse::ExecutingAnchor
+                          : state_reclaim::StateOwnerUse::IdleAnchor;
+            if (state_reclaim::state_is_live_binding(use)) { return true; }
         }
     }
     return false;
@@ -7543,16 +7562,24 @@ bool ProgramImplCore::degrade_idle_owner_host_state() {
         // The endpoint last (largest truncation window): legal exactly when another checkpoint
         // survives it - the primitive reports "no retained requirement" otherwise, so an
         // endpoint-only owner is never reduced to nothing here.
-        // The owner's TURN CLOSURE is deliberately NOT on this list. It is the frontier a later
-        // request of the same conversation resumes from, so dropping it destroys exactly the reuse
-        // this step is supposed to protect: adding it made `prefix_switch` / `prefix_mixed` fail in
-        // the battery's churned pool (rig 2026-09-26: both red with the closure droppable, both
-        // green without it, same build otherwise). A conversation's cheap components are its
-        // ANCHORS, which is why the walk above is anchor-first and depth-ascending.
         const qwen3_6::ContinuationSummary summary = continuation_summary(sequence);
         if (summary.endpoint && sequence.endpoint_valid) {
             if (try_drop(sequence.state.read, summary.endpoint->ref)) { return true; }
         }
+        // The TURN CLOSURE is NOT on this list, and that is a MEASURED decision (2026-09-27), not an
+        // inherited comment: making it droppable turned `prefix_switch` red on the churned rig pool,
+        // because that case's conversation is ~622 tokens and the value chain therefore ranks it the
+        // cheapest thing in the pool - its closure was sacrificed and the client's switch-back found
+        // nothing to reuse. Sacrificing a closure costs a real conversation its next-turn reuse, so it
+        // is not a price this step may pay. A conversation's cheap components are its ANCHORS, which is
+        // why the walk above is anchor-first and depth-ascending.
+        //
+        // The pool is still clearable without it: an idle owner's closure that holds a Host replica
+        // beside its Device one is released LOSSLESSLY by the EvictHostReplica step, which the binding
+        // predicate used to refuse for every non-executing owner (state_reclaim_policy.h). That is what
+        // fixed the measured defect - an IDLE Engine waiting out its whole admission deadline while the
+        // Host state pool was full of finished conversations' closures (`parallel-fresh`, real model:
+        // `blocked-in-idle … active=0, retire_order=6`).
         return false;
     };
     // The one chain first (§2.2): the ladder's preference order IS the policy's value order.
@@ -8455,6 +8482,35 @@ ProgramImplCore::owner_exclusive_resources(const SharedPrefixState& shared) cons
 
 std::uint32_t ProgramImplCore::retire_order_size() const noexcept {
     return static_cast<std::uint32_t>(retire_preference_.size());
+}
+
+std::string ProgramImplCore::retire_order_debug() const {
+    std::string out;
+    for (const runtime::RetirePreferenceEntry& entry : retire_preference_) {
+        if (entry.shared_prefix) { continue; }
+        const bool in_range = entry.slot < continuation_capacity;
+        const ContinuationSlotRole role =
+            in_range ? continuation_slots[entry.slot].role : ContinuationSlotRole::Free;
+        std::uint32_t host_states = 0;
+        std::uint32_t device_states = 0;
+        bool protected_state = false;
+        bool pinned = false;
+        if (in_range) {
+            const SequenceState& sequence = continuation_states[entry.slot];
+            if (sequence.kv) {
+                const detail::PhysicalResources footprint = owner_exclusive_resources(sequence);
+                host_states   = footprint.host.state_slots;
+                device_states = footprint.device.state_slots;
+            }
+            protected_state = owner_holds_release_protected_state(entry.slot);
+            pinned          = materialization_pins(entry.slot, continuation_slots[entry.slot].generation);
+        }
+        out += " slot=" + std::to_string(entry.slot) + " role=" + std::to_string(int(role)) +
+               " host=" + std::to_string(host_states) + " dev=" + std::to_string(device_states) +
+               " prot=" + std::to_string(protected_state ? 1 : 0) +
+               " pin=" + std::to_string(pinned ? 1 : 0) + ";";
+    }
+    return out;
 }
 
 bool ProgramImplCore::shared_owner_teardown_would_destroy_device(
