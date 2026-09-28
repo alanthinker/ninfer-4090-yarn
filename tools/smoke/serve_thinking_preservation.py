@@ -227,6 +227,14 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
         # full-pool reclaim change (13aa8492). Verified identical on a binary built WITHOUT
         # any working-tree change, so this is intended behavior, not a regression; the
         # thinking-preservation oracles above remain the authority for the actual contract.
+        #
+        # Re-baselined 09-28 by the same rule and the same evidence: the last two turns now
+        # RESTORE (private_turn_closure / shared_stable_prefix) where this snapshot recorded
+        # root/root - strictly MORE reuse, following the 09-27/09-28 cache and anchor work
+        # (fa5f85ca, 7fd6682e, b82483cb). The identical command was run twice on this artifact,
+        # once with the working tree's changes and once on a stashed (pristine) build: both
+        # produced the list below, so it is HEAD's behavior and neither a regression of that
+        # worktree nor of an earlier commit. The thinking-preservation oracles stay authoritative.
         require(
             paths == [
                 "root",
@@ -234,8 +242,8 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
                 "shared_stable_prefix",
                 "root",
                 "shared_stable_prefix",
-                "root",
-                "root",
+                "private_turn_closure",
+                "shared_stable_prefix",
             ],
             f"unexpected Chat reuse paths: {paths}",
         )
