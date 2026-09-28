@@ -108,4 +108,47 @@ enum class ReleaseIntent : std::uint8_t {
     return !holds_device_data || release_may_destroy_device(intent);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Which state image may answer a DEVICE-slot gap.
+//
+// 缓存模块v2.md §三 R1: 显存满了 → 把显存里最不重要的数据搬到内存. For a state image the move is
+// one of two things, and BOTH free the Device slot:
+//   * DeviceOnly  -> copy it to Host, keeping the only replica it has (the "demote" step);
+//   * Both        -> drop the Device replica, the Host replica it already holds staying current
+//                    (the "drop duplicate" step).
+// So a Device-slot gap is answerable by ANY checkpoint that still holds a Device replica - the
+// replica layout decides WHICH step runs, never WHETHER the image is a candidate.
+//
+// The two steps used to be partitioned the other way round: `CopyToHost` accepted only DeviceOnly
+// images, and `DropDeviceReplica` ran under a different (more conservative) veto than the demote
+// step. An image that was Both-resident AND vetoed for the drop step was therefore invisible to
+// BOTH - the ladder reported `mv_state=0` (no victim can move a state) while finished
+// conversations held every Device slot with a current Host copy sitting right next to it, and the
+// request waited out its queue deadline (2026-09-28 14:4x: `gaps dstate=1 ... mv_state=0
+// ev_state=8`, the exact shape §一 calls a defect rather than R0).
+//
+// `residency` is the image's replica layout, `vetoed` whatever ownership rule the caller applies.
+// A slot with no Device replica cannot free one; `vetoed` is what the caller may refuse.
+enum class StateReplicaLayout : std::uint8_t {
+    None,
+    DeviceOnly,
+    HostOnly,
+    Both,
+};
+
+[[nodiscard]] constexpr bool state_can_answer_device_slot_gap(StateReplicaLayout residency,
+                                                              bool vetoed) noexcept {
+    if (vetoed) { return false; }
+    return residency == StateReplicaLayout::DeviceOnly || residency == StateReplicaLayout::Both;
+}
+
+// And which state image may answer a HOST-slot gap: one that already holds a Host replica and can
+// give it up without ending up with no published replica at all (§2.1: a HostOnly checkpoint's
+// only replica is not evictable here - its owner goes with it, or nothing does).
+[[nodiscard]] constexpr bool state_can_answer_host_slot_gap(StateReplicaLayout residency,
+                                                            bool vetoed) noexcept {
+    if (vetoed) { return false; }
+    return residency == StateReplicaLayout::Both;
+}
+
 } // namespace ninfer::targets::qwen3_6::detail::state_reclaim

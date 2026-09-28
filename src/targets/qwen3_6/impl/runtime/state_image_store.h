@@ -225,11 +225,18 @@ public:
     }
 
     // How a retained checkpoint gives up one Device StateImage slot. Retention keeps a checkpoint
-    // DeviceOnly (fast reuse) or HostOnly (slow reuse); an object holding both replicas exists only
-    // while a transfer is in flight and is excluded as a victim, because its Device slot is already
-    // committed to that transfer. A DeviceOnly checkpoint must therefore be copied to Host before
-    // its slot can be reused, which the caller performs with begin_device_to_host and
+    // DeviceOnly (fast reuse) or HostOnly (slow reuse); a checkpoint holding BOTH replicas (a
+    // redundant Device copy beside a current Host one) gives its Device slot back by dropping that
+    // replica, which is the cheaper move. A DeviceOnly checkpoint must be copied to Host before its
+    // slot can be reused, which the caller performs with begin_device_to_host and
     // publish_transfer.
+    //
+    // The two kinds partition the candidates with no gap: CopyToHost takes exactly the DeviceOnly
+    // images and DropDeviceReplica exactly the Both-resident ones, and both share the same
+    // pin/pending and veto gates, so every checkpoint that holds a Device slot is reachable by one
+    // of them (verified by enumeration; the 2026-09-28 14:4x `mv_state=0` case is therefore a
+    // candidate that was PINNED - source pins, destination pin or a pending replica - not one that
+    // fell between the two kinds).
     enum class SlotReleaseKind {
         DropDeviceReplica,  // victim already holds a Host replica: only the Device slot is freed
         CopyToHost,         // victim is DeviceOnly: copy to Host, then free the Device slot

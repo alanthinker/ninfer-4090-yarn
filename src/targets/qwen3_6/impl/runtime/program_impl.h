@@ -5363,6 +5363,25 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
     if (state_count > transaction.reserved_states.size() - transaction.reserved_state_count) {
         throw std::logic_error("materialization state reservation exceeds the active contract");
     }
+    // One transaction, one capacity decision: make room for EVERY Device state slot this
+    // transaction reserves BEFORE reserving the first one.
+    //
+    // Each reservation below runs the release ladder when it cannot be satisfied, and every ladder
+    // step frees at most ONE slot (a demotion needs a Host slot, an eviction frees a Host slot).
+    // Reserving one at a time therefore let the reservations starve each other: the ladder freed a
+    // Host slot, the demotion that followed immediately consumed it, the next reservation found
+    // the pool exactly as full as before, and the transaction retried that pair until its queue
+    // deadline - `[ladder] demote begin failed ... free_host_slots=0` beside `[capture-snapshot]
+    // begin1 failed: host_free=0 ... retrying=1` (2026-09-28 rig: eviction_fix / memory_pressure).
+    // Asking for the transaction's whole state demand at once lets the ladder free as many slots
+    // as this reservation needs, so the freed capacity stays freed. §四 invariant 3 still holds:
+    // the ladder stops as soon as the demand is met.
+    if (state_count > state_store->device_free()) {
+        const std::uint32_t short_slots = state_count - state_store->device_free();
+        for (std::uint32_t freed = 0; freed < short_slots; ++freed) {
+            if (!release_state_capacity_step("materialization-state-demand", true)) { break; }
+        }
+    }
     for (std::uint32_t index = 0; index < state_count; ++index) {
         std::optional<StateImageHandle> state = state_store->reserve_destination();
         if (!state) {

@@ -4044,6 +4044,49 @@ void test_finished_conversations_images_are_reclaimable() {
             "a FINISHED conversation's fork point is cache");
 }
 
+// Reproduced: a Device-slot gap must be answerable by EVERY checkpoint that still holds a Device
+// replica, whichever of the two move steps its replica layout selects.
+//
+// 2026-09-28 14:4x production, on an IDLE engine: `[cache] gap ... dstate=1 | ... enqueue
+// reason=device-not-closable` next to `pool sums ... mv_state=0`, i.e. the ladder found NO victim
+// that could move a state, while 8 Device slots were held by finished conversations' checkpoints.
+// The two steps partitioned the candidates the wrong way round - `CopyToHost` accepted only
+// DeviceOnly, `DropDeviceReplica` ran under a different veto - so a Both-resident image that the
+// drop step vetoed was invisible to both, and the request waited out its queue deadline. §一 says
+// waiting on a finished conversation's cache is a defect, not R0.
+void test_a_device_slot_gap_is_answerable_by_every_checkpoint_holding_a_replica() {
+    using state_reclaim::StateReplicaLayout;
+
+    // Both layouts free a Device slot; the layout only decides which step runs.
+    require(state_reclaim::state_can_answer_device_slot_gap(StateReplicaLayout::DeviceOnly, false),
+            "a DeviceOnly checkpoint answers a Device-slot gap by demoting");
+    require(state_reclaim::state_can_answer_device_slot_gap(StateReplicaLayout::Both, false),
+            "a Both-resident checkpoint answers it by dropping the Device replica - this is the "
+            "candidate the ladder used to lose, and losing it parked the request (mv_state=0)");
+
+    // An image with no Device replica cannot free a Device slot, and a HostOnly one cannot either.
+    require(!state_reclaim::state_can_answer_device_slot_gap(StateReplicaLayout::None, false),
+            "an image with no replica cannot answer a Device-slot gap");
+    require(!state_reclaim::state_can_answer_device_slot_gap(StateReplicaLayout::HostOnly, false),
+            "a HostOnly image holds no Device slot to give back");
+
+    // The caller's ownership veto still refuses a victim, whatever its layout: the fix widens which
+    // LAYOUT is a candidate, never which OWNER may be reclaimed.
+    require(!state_reclaim::state_can_answer_device_slot_gap(StateReplicaLayout::Both, true),
+            "a vetoed image is never a victim, even when it holds both replicas");
+    require(!state_reclaim::state_can_answer_device_slot_gap(StateReplicaLayout::DeviceOnly, true),
+            "and neither is a vetoed DeviceOnly one");
+
+    // Host-slot gaps are the mirror image: only a redundant Host replica may be given up, because
+    // dropping a HostOnly checkpoint's only replica would leave it unpublished (§2.1).
+    require(state_reclaim::state_can_answer_host_slot_gap(StateReplicaLayout::Both, false),
+            "a Both-resident checkpoint answers a Host-slot gap by dropping the Host replica");
+    require(!state_reclaim::state_can_answer_host_slot_gap(StateReplicaLayout::HostOnly, false),
+            "a HostOnly checkpoint's only replica is not evictable on its own");
+    require(!state_reclaim::state_can_answer_host_slot_gap(StateReplicaLayout::DeviceOnly, false),
+            "a DeviceOnly image holds no Host slot to give back");
+}
+
 // §四 invariant 1 as the CODE-LEVEL prohibition, not a measurement: the strict release asks this
 // table before it destroys anything, and every cache-policy intent must refuse an owner that still
 // holds Device data. The `[invariant1]` probe only made a violation visible after it had happened,
@@ -4398,6 +4441,8 @@ int main() {
     run_test("finished conversations' images are reclaimable",
              test_finished_conversations_images_are_reclaimable);
     test_only_an_ownership_return_may_destroy_device_data();
+    run_test("a device-slot gap is answerable by every checkpoint holding a replica",
+             test_a_device_slot_gap_is_answerable_by_every_checkpoint_holding_a_replica);
     run_test("shared replacement skips a device-holding victim",
              test_shared_replacement_is_not_offered_for_a_device_holding_victim);
     run_test("executing conversation is absent from the retire order",
