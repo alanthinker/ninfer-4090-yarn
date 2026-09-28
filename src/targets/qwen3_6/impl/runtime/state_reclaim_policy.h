@@ -119,13 +119,27 @@ enum class ReleaseIntent : std::uint8_t {
 // So a Device-slot gap is answerable by ANY checkpoint that still holds a Device replica - the
 // replica layout decides WHICH step runs, never WHETHER the image is a candidate.
 //
-// The two steps used to be partitioned the other way round: `CopyToHost` accepted only DeviceOnly
-// images, and `DropDeviceReplica` ran under a different (more conservative) veto than the demote
-// step. An image that was Both-resident AND vetoed for the drop step was therefore invisible to
-// BOTH - the ladder reported `mv_state=0` (no victim can move a state) while finished
-// conversations held every Device slot with a current Host copy sitting right next to it, and the
-// request waited out its queue deadline (2026-09-28 14:4x: `gaps dstate=1 ... mv_state=0
-// ev_state=8`, the exact shape §一 calls a defect rather than R0).
+// The two steps partition the candidates with NO gap (enumeration: CopyToHost takes exactly the
+// DeviceOnly images, DropDeviceReplica exactly the Both-resident ones, both under the same
+// pin/pending and veto gates), so every checkpoint holding a Device slot is reachable by one of
+// them. A `mv_state=0` therefore never means "no movable victim exists" - `mv_state` is the SUM
+// over the policy pool of the state slots each victim's CHOSEN alternative hands back, and an
+// alternative only hands back a state slot when the state can actually land somewhere.
+//
+// The landing side is NOT a dead end: 缓存模块v2.md §三 R1 is explicit that "内存没有空间接收时,
+// 先执行 R2 腾地方,再执行 R1" - a full Host pool is answered by releasing the least-important
+// idle owner's Host-side checkpoint (R2) and then demoting, which is exactly what the ladder's
+// `degrade_idle_owner_host_state` step does. The measured failure was that the step frees ONE Host
+// slot per call while a transaction needs two at once (a demote landing and the capture snapshot),
+// so each freed slot was immediately re-eaten by the next step of the SAME transaction and the
+// request ping-ponged until its queue deadline:
+//
+//   [ladder] degrade endpoint slot=14 host=47 free=1      <- R2 frees one
+//   state-store: D2H copy handle=10 device_slot=7 -> host_slot=39   <- the demote eats it
+//   [capture-snapshot] begin1 failed: host_free=0 ... retrying=1    <- the capture still has none
+//
+// The fix is to reserve the transaction's WHOLE state demand up front (prepare_materialization),
+// not to widen this table.
 //
 // `residency` is the image's replica layout, `vetoed` whatever ownership rule the caller applies.
 // A slot with no Device replica cannot free one; `vetoed` is what the caller may refuse.

@@ -234,9 +234,8 @@ public:
     // The two kinds partition the candidates with no gap: CopyToHost takes exactly the DeviceOnly
     // images and DropDeviceReplica exactly the Both-resident ones, and both share the same
     // pin/pending and veto gates, so every checkpoint that holds a Device slot is reachable by one
-    // of them (verified by enumeration; the 2026-09-28 14:4x `mv_state=0` case is therefore a
-    // candidate that was PINNED - source pins, destination pin or a pending replica - not one that
-    // fell between the two kinds).
+    // of them (verified by enumeration). A `mv_state=0` in the planner is therefore NOT this walk
+    // failing to offer a victim - what it actually means is spelled out in state_reclaim_policy.h.
     enum class SlotReleaseKind {
         DropDeviceReplica,  // victim already holds a Host replica: only the Device slot is freed
         CopyToHost,         // victim is DeviceOnly: copy to Host, then free the Device slot
