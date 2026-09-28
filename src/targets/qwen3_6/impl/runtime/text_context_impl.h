@@ -1064,7 +1064,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
     if (text_prefill != nullptr) {
         if (multimodal != nullptr || base != text_prefill->begin ||
-            text_prefill->token_ids.size() < static_cast<std::size_t>(base) + ids.size()) {
+            text_prefill->token_ids.size() <
+                static_cast<std::size_t>(text_prefill->token_begin) + ids.size()) {
             throw std::invalid_argument("text prefill chunk does not match its full prompt");
         }
     }
@@ -1232,10 +1233,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     : text_prefill != nullptr
                         ? static_cast<std::uint32_t>(text_prefill->token_ids.size())
                         : static_cast<std::uint32_t>(T);
+                // The alignment window indexes the PROMPT arrays, so it takes the chunk's
+                // prompt-space index; a response-echo splice makes that differ from `prompt_t0`.
                 const std::uint32_t alignment_begin =
-                    multimodal != nullptr || text_prefill != nullptr
-                        ? prompt_t0
-                        : static_cast<std::uint32_t>(t0);
+                    multimodal != nullptr     ? prompt_t0
+                    : text_prefill != nullptr ? text_prefill->token_begin +
+                                                    static_cast<std::uint32_t>(t0)
+                                              : static_cast<std::uint32_t>(t0);
                 const qwen3_6::MtpAlignmentWindow mtp_window = qwen3_6::plan_mtp_alignment_window(
                     alignment_tokens, alignment_begin, static_cast<std::uint32_t>(len));
                 const std::span<const int> alignment_ids =
@@ -1338,26 +1342,28 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 }
 
 PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
+                                              std::uint32_t token_begin,
                                               std::uint32_t nominal_length, bool finalize_at_end) {
-    if (begin >= full_ids.size() || nominal_length == 0 ||
-        nominal_length > full_ids.size() - begin) {
+    if (token_begin >= full_ids.size() || nominal_length == 0 ||
+        nominal_length > full_ids.size() - token_begin) {
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
-    const TextPrefill text_prefill{full_ids, begin};
+    const TextPrefill text_prefill{full_ids, begin, token_begin};
     NullTap tap;
-    return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, tap,
+    return prefill_impl(full_ids.subspan(token_begin, nominal_length), &text_prefill, nullptr, tap,
                         finalize_at_end);
 }
 
 PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
+                                              std::uint32_t token_begin,
                                               std::uint32_t nominal_length, bool finalize_at_end,
                                               DFlashFeatureSink& sink) {
-    if (begin >= full_ids.size() || nominal_length == 0 ||
-        nominal_length > full_ids.size() - begin) {
+    if (token_begin >= full_ids.size() || nominal_length == 0 ||
+        nominal_length > full_ids.size() - token_begin) {
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
-    const TextPrefill text_prefill{full_ids, begin};
-    return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, sink,
+    const TextPrefill text_prefill{full_ids, begin, token_begin};
+    return prefill_impl(full_ids.subspan(token_begin, nominal_length), &text_prefill, nullptr, sink,
                         finalize_at_end);
 }
 

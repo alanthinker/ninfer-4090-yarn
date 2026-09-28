@@ -5,6 +5,8 @@
 
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6_27b/package.h>
+#include "targets/qwen3_6/frontend_fixture.h"
+#include "targets/qwen3_6/impl/frontend/test_access.h"
 
 #include <bit>
 #include <cmath>
@@ -186,9 +188,11 @@ int verify_profile_mismatch_rejection() {
     const std::uint32_t pages = planner.capacity_curve().minimum_main_page_groups;
     auto sequence             = std::move(planner).finalize(pages);
     RuntimeModelView empty_model;
+    const auto frontend = ninfer::targets::qwen3_6::FrontendTestAccess::create_component(
+        ninfer::test::qwen36_frontend::resources(), false);
     try {
         (void)ninfer::targets::qwen3_6::create_program<Variant>(
-            empty_model, WeightsProfile::Qwen36Nvfp4, std::move(sequence), device,
+            empty_model, WeightsProfile::Qwen36Nvfp4, frontend, std::move(sequence), device,
             ninfer::StartupObserver{});
     } catch (const std::invalid_argument& error) {
         if (std::string(error.what()).find("weights profile") != std::string::npos) { return 0; }

@@ -202,10 +202,12 @@ public:
 
     [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
                                                    std::uint32_t begin,
+                                                   std::uint32_t token_begin,
                                                    std::uint32_t nominal_length,
                                                    bool finalize_at_end);
     [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
                                                    std::uint32_t begin,
+                                                   std::uint32_t token_begin,
                                                    std::uint32_t nominal_length,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
     [[nodiscard]] PrefillChunkResult
@@ -293,7 +295,12 @@ private:
 
     struct TextPrefill {
         std::span<const int> token_ids;
+        // STATE-space base of this chunk: the KV/RoPE position of its first token. It differs
+        // from the chunk's index inside `token_ids` only for a response-echo splice, which runs
+        // the incoming re-tokenized tail on top of the state's raw prefix.
         std::uint32_t begin = 0;
+        // Index of this chunk's first token inside `token_ids` (prompt space).
+        std::uint32_t token_begin = 0;
     };
 
     template <class Tap>

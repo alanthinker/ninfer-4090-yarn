@@ -782,6 +782,10 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         byte_boundaries.push_back(run.bytes.begin);
         byte_boundaries.push_back(run.bytes.end);
     }
+    // Read back last: the response-echo splice frontier.
+    if (rendered.assistant_body_end) {
+        byte_boundaries.push_back(*rendered.assistant_body_end);
+    }
 
     BoundaryEncodedText tokenized = tokenizer.encode_with_boundaries(
         rendered.text, byte_boundaries, EncodeOptions{.max_tokens = maximum_tokens},
@@ -861,6 +865,13 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
             .item_index  = run.item_index,
             .frame_index = run.frame_index,
         });
+    }
+    if (rendered.assistant_body_end) {
+        const TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
+        if (boundary.exact_frontier && *boundary.exact_frontier != 0) {
+            encoded.assistant_body_end =
+                to_frontier(*boundary.exact_frontier, "assistant body end");
+        }
     }
     if (boundary_index != tokenized.boundaries.size()) {
         throw std::logic_error("rendered token boundary result count changed during encoding");

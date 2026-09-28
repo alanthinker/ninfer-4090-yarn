@@ -2,6 +2,7 @@
 
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
+#include <ninfer/targets/qwen3_6/frontend.h>
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include <cstddef>
@@ -103,6 +104,11 @@ struct CheckpointSummary {
     runtime::CheckpointRef ref;
     runtime::CheckpointScope scope = runtime::CheckpointScope::Private;
     PrefixShortlistKey shortlist_key;
+    // Endpoint-only: the SHA-256 of the round's prompt text (up to its rewrite checkpoint).
+    // The core indexes endpoints by this exact key so a follow-up client echo - whose
+    // re-tokenized tokens no longer match the raw generated tokens - is still offered as a
+    // candidate; the Program then verifies the full response-echo identity.
+    std::optional<std::array<std::uint8_t, 32>> echo_key;
     runtime::ReplicaResidency state_residency = runtime::ReplicaResidency::DeviceOnly;
     TargetKVRequirement required_kv;
     runtime::PrefillWork rebuild_work;
@@ -226,6 +232,7 @@ public:
     [[nodiscard]] const PreparedContextCache& context_cache() const noexcept;
     [[nodiscard]] std::optional<PrefixShortlistKey>
     prefix_shortlist_key(std::uint32_t frontier) const noexcept;
+    [[nodiscard]] std::optional<std::array<std::uint8_t, 32>> echo_prefix_key() const;
     [[nodiscard]] std::optional<runtime::PrefillWork>
     shared_candidate_rebuild_work(std::uint32_t frontier) const noexcept;
 
@@ -1053,7 +1060,8 @@ private:
 
     template <class V>
     friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
-                                                      typename V::WeightsProfile, SequencePlan<V>&&,
+                                                      typename V::WeightsProfile,
+                                                      const Frontend&, SequencePlan<V>&&,
                                                       DeviceContext&, const StartupObserver&);
 };
 
@@ -1218,7 +1226,8 @@ make_sequence_planner(DeviceContext& device, const EngineOptions& options,
 template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>
 create_program(const typename Variant::ModelView& model,
-               typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
-               DeviceContext& device, const StartupObserver& startup_observer);
+               typename Variant::WeightsProfile weights_profile, const Frontend& frontend,
+               SequencePlan<Variant>&& plan, DeviceContext& device,
+               const StartupObserver& startup_observer);
 
 } // namespace ninfer::targets::qwen3_6

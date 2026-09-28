@@ -4,6 +4,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
+#include "targets/qwen3_6/impl/frontend/digest.h"
 #include "targets/qwen3_6/impl/frontend/media_cache.h"
 #include "targets/qwen3_6/impl/frontend/processor.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
@@ -1596,6 +1597,81 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         if (encoded.input_ids.size() > impl_->max_context) {
             throw_context_length_exceeded(impl_->max_context);
         }
+        // Response-echo identity (text-only prompts): when the rendered prompt is a continuation
+        // (ResponseReplay rewrite checkpoint) and an assistant response sits in the history,
+        // digest the rendered text before that response (the shared history a follow-up client
+        // re-sends byte-identically) and the response block itself. The follow-up round matches
+        // the previous round's endpoint on these text digests and resumes from the raw
+        // generated token state instead of trusting the re-tokenization of the echoed response.
+        if (rendered.rewrite_checkpoint) {
+            const std::size_t span_end = rendered.rewrite_checkpoint->offset;
+            // The carried digest is the state's echo prefix key for the NEXT round: it covers
+            // exactly the shared history (text up to the rewrite checkpoint) that a follow-up
+            // client re-sends. It is set for every continuation, with or without an echoed
+            // response.
+            result.identity.prompt_text_digest =
+                fi::sha256(rendered.text.substr(0, span_end));
+            {
+                static const char* hex = "0123456789abcdef";
+                char head[9] = {};
+                for (int i = 0; i < 4; ++i) {
+                    head[i * 2]     = hex[result.identity.prompt_text_digest[i] >> 4];
+                    head[i * 2 + 1] = hex[result.identity.prompt_text_digest[i] & 0x0f];
+                }
+                std::fprintf(stderr, "[echo] carried digest: prompt_bytes=%zu"
+                                    " rewrite_offset=%zu head=%s\n",
+                             rendered.text.size(), span_end, head);
+            }
+            std::size_t assistant_index = 0;
+            bool found_assistant        = false;
+            for (std::size_t index = message_roles.size(); index > 0; --index) {
+                if (message_roles[index - 1] == ChatRole::Assistant) {
+                    assistant_index = index - 1;
+                    found_assistant = true;
+                    break;
+                }
+            }
+            if (found_assistant && assistant_index + 1 < rendered.message_boundaries.size() &&
+                rendered.message_boundaries[assistant_index + 1]) {
+                const std::optional<std::size_t> block_begin =
+                    assistant_index == 0
+                        ? std::optional<std::size_t>(0)
+                        : rendered.message_boundaries[assistant_index];
+                const std::size_t block_end = *rendered.message_boundaries[assistant_index + 1];
+                if (block_begin && *block_begin <= block_end && block_end <= span_end &&
+                    encoded.assistant_body_end) {
+                    const std::size_t begin = *block_begin;
+                    ResponseEchoSpec spec;
+                    spec.prefix_digest  = fi::sha256(rendered.text.substr(0, begin));
+                    spec.block_digest   = fi::sha256(rendered.text.substr(begin, block_end - begin));
+                    // The splice frontier is the END OF THE ECHOED BODY, not the end of the whole
+                    // block: the resident raw prefix ends where the generated response ends, and
+                    // the tail that replaces the echoed block must therefore carry the assistant
+                    // turn's closing serialization (`<|im_end|>\n`). Splicing at the block end
+                    // drops it and leaves the echoed assistant turn unterminated.
+                    spec.boundary_token = *encoded.assistant_body_end;
+                    result.identity.response_echo = std::move(spec);
+                    {
+                        static const char* hex = "0123456789abcdef";
+                        const auto head_of = [](const std::array<std::uint8_t, 32>& d,
+                                                const char* hex) {
+                            char out[9] = {};
+                            for (int i = 0; i < 4; ++i) {
+                                out[i * 2]     = hex[d[i] >> 4];
+                                out[i * 2 + 1] = hex[d[i] & 0x0f];
+                            }
+                            return std::string(out, 8);
+                        };
+                        std::fprintf(stderr, "[echo] spec: prompt=%zu prefix=%s block=%s"
+                                            " boundary=%u\n",
+                                     encoded.input_ids.size(),
+                                     head_of(spec.prefix_digest, hex).c_str(),
+                                     head_of(spec.block_digest, hex).c_str(),
+                                     spec.boundary_token);
+                    }
+                }
+            }
+        }
         result.token_ids                   = std::move(encoded.input_ids);
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
@@ -1612,6 +1688,13 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         leading_boundary, checked_token_count(result.token_ids.size()));
     result.starts_in_reasoning =
         options.continuation == PromptContinuationMode::NewAssistantTurn && options.enable_thinking;
+    // The serve layer runs tool-bearing (or tool-historing) requests with special-token bytes
+    // preserved in the output decoder; the response-echo re-parse must use the same flag or the
+    // parsed fields diverge from what the client actually received.
+    result.output_preserve_special =
+        result.tool_call_output != nullptr ||
+        std::any_of(message_roles.begin(), message_roles.end(),
+                    [](ChatRole role) { return role == ChatRole::Tool; });
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
@@ -1707,6 +1790,63 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     return OutputSession(std::make_unique<OutputSession::Impl>(
         impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning, thinking,
         impl_->thinking_control_tokens, prompt.data_->tool_call_output));
+}
+
+std::array<std::uint8_t, 32> Frontend::response_block_digest(std::span<const TokenId> tokens,
+                                                              std::shared_ptr<const fi::ToolCallOutputContract> tool_contract,
+                                                              bool starts_in_reasoning,
+                                                              bool preserve_special) const {
+    // Reproduce, with the exact publication path of this engine, the (reasoning, content,
+    // tool calls) fields a response-echo client sends back for these generated tokens, then
+    // digest their canonical block. A one-shot output session over the full token span with
+    // the model's default stop policy is the parity oracle: it is the same decode/split/parse
+    // pipeline that published the response the client echoed.
+    auto prompt_data = std::make_unique<PreparedPromptData>();
+    prompt_data->tool_call_output    = std::move(tool_contract);
+    prompt_data->starts_in_reasoning = starts_in_reasoning;
+    const PreparedPrompt prompt(std::move(prompt_data));
+    ninfer::OutputOptions output_options;
+    output_options.preserve_special_tokens = preserve_special;
+    OutputSession session = make_output_session(prompt, impl_->defaults, output_options, {});
+    (void)session.preview_model(tokens, std::numeric_limits<std::uint32_t>::max(),
+                                 FinishReason::OutputLimit);
+    const PublishedOutput published = session.commit_preview();
+    std::string reasoning;
+    std::string content;
+    for (const OutputDelta& delta : published) {
+        if (delta.channel == OutputChannel::Reasoning) {
+            reasoning += delta.text;
+        } else {
+            content += delta.text;
+        }
+    }
+    std::vector<fi::ToolCall> calls;
+    for (const GeneratedToolCall& call : session.take_tool_calls()) {
+        fi::ToolCall converted;
+        converted.name           = call.name;
+        converted.arguments_json = call.arguments_json;
+        calls.push_back(std::move(converted));
+    }
+    const PromptCapabilities capabilities = prompt_capabilities();
+    const bool allow_empty_arguments = capabilities.reasoning_effort.low ||
+                                       capabilities.reasoning_effort.medium ||
+                                       capabilities.reasoning_effort.xhigh;
+    const std::string block =
+        fi::render_echo_block(reasoning, content, calls, allow_empty_arguments);
+    const auto digest = fi::sha256(block);
+    {
+        static const char* hex = "0123456789abcdef";
+        char head[9] = {};
+        for (int i = 0; i < 4; ++i) {
+            head[i * 2]     = hex[digest[i] >> 4];
+            head[i * 2 + 1] = hex[digest[i] & 0x0f];
+        }
+        std::fprintf(stderr, "[echo] stored parse: span=%zu starts_in_reasoning=%d"
+                            " reasoning=%zu content=%zu calls=%d block=%s\n",
+                     tokens.size(), starts_in_reasoning ? 1 : 0, reasoning.size(),
+                     content.size(), calls.size(), head);
+    }
+    return digest;
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

@@ -13,6 +13,12 @@
 
 namespace ninfer::targets::qwen3_6 {
 
+namespace frontend_internal {
+// Forward declaration only (the full contract type lives with the output parser); the Frontend
+// API references it by shared_ptr, which needs no complete type.
+struct ToolCallOutputContract;
+} // namespace frontend_internal
+
 inline constexpr std::size_t kTokenDomain = 248077;
 
 struct FrontendOptions {
@@ -143,6 +149,18 @@ public:
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
+
+    // SHA-256 of the canonical response block a follow-up request reassembles from the echoed
+    // fields of `tokens`: the tokens are decoded and split into reasoning and content exactly
+    // as this engine published them (tool calls parsed with `tool_contract` under the model's
+    // default stop policy, no raw output), then rendered with render_echo_block. Response-echo
+    // reuse compares this digest against the incoming prompt's response-echo block digest, so
+    // it is part of the reuse contract.
+    [[nodiscard]] std::array<std::uint8_t, 32>
+    response_block_digest(std::span<const TokenId> tokens,
+                          std::shared_ptr<const frontend_internal::ToolCallOutputContract> tool_contract,
+                          bool starts_in_reasoning,
+                          bool preserve_special) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const noexcept;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession

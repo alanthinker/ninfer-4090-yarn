@@ -131,12 +131,42 @@ struct RenderedChat {
     std::vector<std::optional<std::size_t>> message_boundaries;
     // One rendered byte boundary per requested cache marker.
     std::vector<std::optional<std::size_t>> cache_boundaries;
+    // Byte frontier just after the LAST assistant message's body and before the assistant turn's
+    // closing serialization (`<|im_end|>\n`) - or after the body of a continued final assistant
+    // message, which has no closing serialization. Response-echo reuse splices the resident raw
+    // prefix in at this frontier: the echo block's canonical render (render_echo_block) contains
+    // both the opener and the closing serialization, so the tail replacing the echoed block must
+    // begin before the closing serialization. Splicing at the end of the whole block instead
+    // leaves the echoed assistant turn unterminated in the spliced prompt.
+    std::optional<std::size_t> assistant_body_end;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {
     ThinkingToggle,
     ReasoningEffort,
 };
+
+// Split raw generated text into (reasoning, content) with the same semantics the jinja template
+// uses when reasoning_content is not provided: reasoning is the text between the last <think>
+// and the first </think> (surrounding newlines stripped); content is everything after the last
+// </think> (leading newlines stripped). Without a </think> the whole text is content.
+[[nodiscard]] std::pair<std::string, std::string> split_think(std::string_view raw);
+
+// Render the canonical assistant block for one generated response: the exact bytes the prompt
+// renderer emits for the same (reasoning, content, tool_calls) fields when a follow-up request
+// echoes them back -
+//
+//   <|im_start|>assistant\n
+//   <think>\n{trimmed reasoning}\n</think>\n\n
+//   {content}{tool call blocks}
+//   <|im_end|>\n
+//
+// `allow_empty_arguments` mirrors the template semantics (ReasoningEffort templates permit an
+// empty argument object; ThinkingToggle templates do not). Response-echo reuse digests this
+// block on both sides, so its bytes are part of the reuse contract.
+[[nodiscard]] std::string render_echo_block(std::string_view reasoning, std::string_view content,
+                                            const std::vector<ToolCall>& tool_calls,
+                                            bool allow_empty_arguments);
 
 class CompiledChatTemplate {
 public:

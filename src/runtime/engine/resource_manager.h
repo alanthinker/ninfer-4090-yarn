@@ -503,11 +503,17 @@ public:
         // A request that already failed to place its reuse is planned from root: recomputing is the
         // documented fallback, and re-selecting the same reuse would repeat the same capacity miss.
         if (cache_enabled_ && allow_reuse) {
+            const std::optional<std::array<std::uint8_t, 32>> incoming_echo =
+                base.echo_prefix_key();
             for (const PrefixIndexEntry& index : prefix_index_) {
                 if (!valid_prefix_index_entry(index)) { continue; }
-                const std::optional<PrefixShortlistKey> incoming =
-                    base.prefix_shortlist_key(index.key.frontier);
-                if (!incoming || *incoming != index.key) { continue; }
+                if (index.echo) {
+                    if (!incoming_echo || *incoming_echo != index.echo_key) { continue; }
+                } else {
+                    const std::optional<PrefixShortlistKey> incoming =
+                        base.prefix_shortlist_key(index.key.frontier);
+                    if (!incoming || *incoming != index.key) { continue; }
+                }
 
                 if (!index.shared) {
                     CatalogEntry& entry = catalog_[index.slot];
@@ -1787,6 +1793,11 @@ private:
         bool occupied = false;
         bool shared   = false;
         PrefixShortlistKey key;
+        // Echo channel: when set, this entry offers the checkpoint to a follow-up client echo
+        // keyed by the incoming prompt's response-echo prefix digest (text space) instead of
+        // the token-space shortlist digest - the raw generated tokens re-tokenize differently.
+        bool echo = false;
+        std::array<std::uint8_t, 32> echo_key{};
         std::uint32_t slot     = kInvalidCatalogSlot;
         std::uint64_t owner_id = 0;
         std::uint64_t revision = 0;
@@ -1900,7 +1911,7 @@ private:
     [[nodiscard]] static std::size_t checked_prefix_index_capacity(std::uint32_t private_capacity,
                                                                    std::uint32_t shared_capacity,
                                                                    std::uint32_t max_long_anchors) {
-        const std::size_t width = static_cast<std::size_t>(max_long_anchors) + 2U;
+        const std::size_t width = static_cast<std::size_t>(max_long_anchors) + 3U;
         if (private_capacity != 0 &&
             width >
                 (std::numeric_limits<std::size_t>::max() - shared_capacity) / private_capacity) {
@@ -2350,7 +2361,8 @@ private:
         for (PrefixIndexEntry& entry : prefix_index_) { entry = {}; }
         std::size_t cursor = 0;
         const auto append  = [&](bool shared, std::uint32_t slot, std::uint64_t owner_id,
-                                std::uint64_t revision, const auto& checkpoint) {
+                                std::uint64_t revision, const auto& checkpoint,
+                                bool echo = false) {
             if (cursor >= prefix_index_.size()) {
                 throw std::logic_error("prefix index exceeded fixed capacity");
             }
@@ -2358,6 +2370,8 @@ private:
                  .occupied   = true,
                  .shared     = shared,
                  .key        = checkpoint.shortlist_key,
+                 .echo       = echo,
+                 .echo_key   = echo ? *checkpoint.echo_key : std::array<std::uint8_t, 32>{},
                  .slot       = slot,
                  .owner_id   = owner_id,
                  .revision   = revision,
@@ -2369,6 +2383,9 @@ private:
             if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
             if (entry.summary.endpoint) {
                 append(false, slot, entry.id, entry.revision, *entry.summary.endpoint);
+                if (entry.summary.endpoint->echo_key) {
+                    append(false, slot, entry.id, entry.revision, *entry.summary.endpoint, true);
+                }
             }
             if (entry.summary.rewrite) {
                 append(false, slot, entry.id, entry.revision, *entry.summary.rewrite);
@@ -2422,7 +2439,7 @@ private:
                      shared_catalog_count_, protected_slots.size());
         for (const PrefixIndexEntry& index : prefix_index_) {
             if (!index.occupied) { continue; }
-            const char* kind = "unknown";
+            const char* kind = index.echo ? "echo" : "unknown";
             std::string detail;
             if (index.shared) {
                 kind = "shared";
@@ -2448,14 +2465,21 @@ private:
                          std::to_string(is_fair_share_protected(protected_slots, index.slot) ? 1
                                                                                             : 0);
             }
-            const std::optional<PrefixShortlistKey> incoming =
-                base.prefix_shortlist_key(index.key.frontier);
+            const std::optional<PrefixShortlistKey> incoming = index.echo
+                ? std::nullopt
+                : base.prefix_shortlist_key(index.key.frontier);
+            const std::optional<std::array<std::uint8_t, 32>> incoming_echo_key =
+                base.echo_prefix_key();
             std::string verdict;
             if (!valid_prefix_index_entry(index)) {
                 verdict = "REJECT index-invalid";
-            } else if (!incoming) {
+            } else if (index.echo &&
+                       (!incoming_echo_key || *incoming_echo_key != index.echo_key)) {
+                verdict = incoming_echo_key ? "REJECT echo-digest-mismatch"
+                                            : "REJECT no-echo-spec";
+            } else if (!index.echo && !incoming) {
                 verdict = "REJECT frontier-beyond-prompt";
-            } else if (*incoming != index.key) {
+            } else if (!index.echo && *incoming != index.key) {
                 verdict = "REJECT digest-mismatch";
                 // Which side diverged decides the fix (stale index entry vs tag vs content):
                 // dump BOTH keys the first time a mismatch rejects an ENDPOINT candidate -

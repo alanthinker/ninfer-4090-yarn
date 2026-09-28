@@ -53,7 +53,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
 }
 
 PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const TokenId> ids,
-                                      std::uint32_t nominal_length,
+                                      std::uint32_t chunk_begin, std::uint32_t nominal_length,
                                       std::optional<std::uint32_t> split_frontier,
                                       bool finalize_at_end) {
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
@@ -68,10 +68,11 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
-        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
-                                  sink);
+        return card.prefill_chunk(prompt, state.text_kv_base, chunk_begin, nominal_length,
+                                  finalize_at_end, sink);
     }
-    return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
+    return card.prefill_chunk(prompt, state.text_kv_base, chunk_begin, nominal_length,
+                              finalize_at_end);
 }
 
 PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,

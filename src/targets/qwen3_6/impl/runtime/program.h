@@ -2,6 +2,8 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
+#include <ninfer/targets/qwen3_6/frontend.h>
+#include "targets/qwen3_6/impl/frontend/tool_call_parser.h"
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
@@ -189,6 +191,10 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_6::VisionControlPlan> vision_control_plan;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
+    // The incoming response-echo spec (text-space digests): the core indexes resident states by
+    // their carried prompt text digest so an endpoint whose raw tokens re-tokenize differently
+    // is still offered as a candidate.
+    std::optional<qwen3_6::ResponseEchoSpec> echo_spec;
     std::vector<NINFER_QWEN36_RUNTIME_NS::CaptureGroup> capture_groups;
     std::vector<NINFER_QWEN36_RUNTIME_NS::CaptureGroup> shared_candidates;
     qwen3_6::detail::PrefixShortlistDigests prefix_digests;
@@ -264,6 +270,12 @@ struct AdmissionCandidateImpl<NINFER_QWEN36_VARIANT> : ResourceCandidateState {
     runtime::MaterializationRejection identity_rejection = runtime::MaterializationRejection::None;
     // Numbers behind that rejection, when it was a capacity verdict (diagnostic; empty otherwise).
     std::string identity_rejection_detail;
+    // Response-echo acceptance: the resident prefix matched on text digests (see
+    // ResponseEchoSpec), so its raw generated tokens continue the incoming re-tokenized tail.
+    // Materialization re-derives the splice: the tail starts at `echo_boundary_token` in staged
+    // prompt token space and executes on top of the source state's full raw prefix.
+    bool echo_reuse          = false;
+    std::uint32_t echo_boundary_token = 0;
 };
 
 template <>
@@ -445,6 +457,28 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
     bool endpoint_valid           = false;
+    // Response-echo identity carried with the resident state: SHA-256 of the prompt text of the
+    // round that produced this state (up to its ResponseReplay rewrite checkpoint), i.e. the
+    // shared history a follow-up client re-sends. A follow-up response echo matches this state's
+    // endpoint when its own prefix digest agrees and the canonical re-render of the raw
+    // generated block (see tool_call_output) agrees with the echoed block digest.
+    std::array<std::uint8_t, 32> prompt_text_digest{};
+    // Tool contract the round that produced this state used; parsing the raw generated tool
+    // calls with it reproduces the fields the client echoes back. Null when the round had no
+    // tools (or after a snapshot restore, until the next prefill carries one).
+    std::shared_ptr<const frontend_internal::ToolCallOutputContract> tool_call_output;
+    // The round that produced this state started inside the thinking opener (its prompt ended
+    // with `<think>\n`): re-parsing the raw generated block for a response-echo match must use
+    // the same output-session split state or the parsed fields do not agree with the echo.
+    bool starts_in_reasoning = false;
+    // End of the round's rendered prompt (including the generation opener) in the state's own
+    // token space: the raw generated block a response-echo match re-parses is exactly
+    // ledger[prompt_end .. execution_frontier) - the opener belongs to the prompt, not to the
+    // response the client echoes.
+    std::uint32_t prompt_end = 0;
+    // The round's output decoder preserved special-token bytes (tool requests); re-parsing the
+    // raw generated block for a response-echo match must use the same decoder mode.
+    bool output_preserve_special = false;
     RewriteCheckpoint rewrite_checkpoint;
     std::vector<LongAnchorCheckpoint> long_anchors;
     std::vector<std::uint32_t> shared_prefix_references;
@@ -506,6 +540,14 @@ struct RequestControl {
         std::uint32_t base                  = 0;
         std::uint32_t cursor                = 0;
         std::uint32_t prompt_tokens         = 0;
+        // Response-echo resume: nonzero when the loaded state prefix is the RAW tokenization
+        // that the staged prompt continues with a re-tokenized tail. The staged prompt keeps
+        // the incoming re-tokenized token ids; the tail begins at `base` (prompt token space)
+        // but executes on top of the raw generated state of `echo_state_frontier` tokens.
+        // Every state-space frontier of this prefill is the prompt-space value plus the
+        // difference, which is signed: the raw prefix and the incoming boundary are two
+        // tokenizations of the same text and neither length bounds the other.
+        std::uint32_t echo_state_frontier   = 0;
         std::uint32_t initial_mtp_extent    = 0;
         double elapsed_seconds              = 0.0;
         bool prepare_mtp                    = false;
@@ -545,8 +587,12 @@ public:
         qwen3_6::ContinuationSummary continuation_summary;
     };
 
+    // `frontend` owns the tokenizer/template/output semantics this Program uses for
+    // response-echo matching (canonical re-rendering of a state's raw generated block) and is
+    // stateless, so the Program keeps a copy.
     ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
-                    DeviceContext& device, const StartupObserver& startup_observer);
+                    const Frontend& frontend, DeviceContext& device,
+                    const StartupObserver& startup_observer);
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
@@ -683,6 +729,7 @@ public:
 
     const LoadedModelData& model;
     DeviceContext& device;
+    Frontend frontend;
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
@@ -1146,6 +1193,12 @@ private:
                                  RewriteCheckpointDisposition rewrite_disposition,
                                  std::optional<runtime::CheckpointRef> checkpoint,
                                  std::uint32_t reuse_base) const;
+    // One reusable-prefix authority shared by lane inspection and materialization
+    // revalidation: token-exact reuse, or response-echo reuse (text digests agreeing over the
+    // shared history and the canonical re-render of the resident raw generated block).
+    [[nodiscard]] bool resident_prefix_reusable(const AdmissionCandidateImpl& plan,
+                                                const PreparedPromptData& prompt,
+                                                const SequenceState& source) const;
     [[nodiscard]] bool can_retain_rewrite_checkpoint(const PreparedPromptData& prompt,
                                                      const RewriteCheckpointSpec& desired,
                                                      const SequenceState& sequence, ReusePath reuse,
@@ -1489,7 +1542,8 @@ private:
     void
     commit_generated_prefix_identity(SequenceState& sequence, std::uint32_t base_ledger_frontier,
                                      std::span<const TokenId> accepted_tokens,
-                                     std::optional<std::uint32_t> prefix_execution_split_after);
+                                     std::optional<std::uint32_t> prefix_execution_split_after,
+                                     const char* site);
     [[nodiscard]] runtime::ExecutionTiming
     resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
                                     std::uint32_t accepted_tokens, bool terminal,

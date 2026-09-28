@@ -171,8 +171,9 @@ Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stab
                                          const StartupObserver& startup_observer)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       capacity(sequence_plan.capacity()),
-      program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), device,
-                                          startup_observer)) {}
+      program(Qwen3_6_27B::create_program(*loaded->model, loaded->frontend,
+                                                std::move(sequence_plan), device,
+                                                startup_observer)) {};
 
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
 
@@ -189,8 +190,9 @@ Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35B
                                                const StartupObserver& startup_observer)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       capacity(sequence_plan.capacity()),
-      program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), device,
-                                             startup_observer)) {}
+      program(Qwen3_6_35BA3B::create_program(*loaded->model, loaded->frontend,
+                                                    std::move(sequence_plan), device,
+                                                    startup_observer)) {};
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
 

@@ -274,33 +274,6 @@ std::string parameter_text(const OrderedJson& value) {
     return tojson_text(value);
 }
 
-RenderedFragment render_tool_call(const ToolCall& call, bool allow_empty_arguments) {
-    RenderBuilder rendered;
-    if (allow_empty_arguments && call.arguments_json.empty()) {
-        rendered.append_template("<tool_call>\n<function=");
-        rendered.append_literal(call.name);
-        rendered.append_template(">\n</function>\n</tool_call>");
-        return std::move(rendered).release();
-    }
-    OrderedJson args = OrderedJson::parse(call.arguments_json);
-    if (!args.is_object()) {
-        throw std::invalid_argument("tool call arguments must be a JSON object");
-    }
-
-    rendered.append_template("<tool_call>\n<function=");
-    rendered.append_literal(call.name);
-    rendered.append_template(">\n");
-    for (auto it = args.begin(); it != args.end(); ++it) {
-        rendered.append_template("<parameter=");
-        rendered.append_literal(it.key());
-        rendered.append_template(">\n");
-        rendered.append_literal(parameter_text(it.value()));
-        rendered.append_template("\n</parameter>\n");
-    }
-    rendered.append_template("</function>\n</tool_call>");
-    return std::move(rendered).release();
-}
-
 struct RenderedToolsSystemBlock {
     RenderedFragment fragment;
     std::vector<std::size_t> tool_boundaries;
@@ -364,6 +337,104 @@ std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
 }
 
 } // namespace
+
+// render_tool_call is part of the frontend_internal API (used by the prompt renderer
+// and by render_echo_block, which must share its exact serialization).
+RenderedFragment render_tool_call(const ToolCall& call, bool allow_empty_arguments) {
+    RenderBuilder rendered;
+    if (allow_empty_arguments && call.arguments_json.empty()) {
+        rendered.append_template("<tool_call>\n<function=");
+        rendered.append_literal(call.name);
+        rendered.append_template(">\n</function>\n</tool_call>");
+        return std::move(rendered).release();
+    }
+    OrderedJson args = OrderedJson::parse(call.arguments_json);
+    if (!args.is_object()) {
+        throw std::invalid_argument("tool call arguments must be a JSON object");
+    }
+
+    rendered.append_template("<tool_call>\n<function=");
+    rendered.append_literal(call.name);
+    rendered.append_template(">\n");
+    for (auto it = args.begin(); it != args.end(); ++it) {
+        rendered.append_template("<parameter=");
+        rendered.append_literal(it.key());
+        rendered.append_template(">\n");
+        rendered.append_literal(parameter_text(it.value()));
+        rendered.append_template("\n</parameter>\n");
+    }
+    rendered.append_template("</function>\n</tool_call>");
+    return std::move(rendered).release();
+}
+
+std::pair<std::string, std::string> split_think(std::string_view raw) {
+    const std::string_view close = "</think>";
+    const std::size_t first_close = raw.find(close);
+    if (first_close == std::string_view::npos) {
+        return {std::string{}, std::string(raw)};
+    }
+    // Mirrors derive_think_parts: reasoning is the text between the last <think> and the first
+    // </think> with the surrounding newlines stripped; content follows the last </think> with
+    // its leading newlines stripped.
+    std::size_t before_end = first_close;
+    while (before_end > 0 && raw[before_end - 1] == '\n') {
+        --before_end;
+    }
+    const std::string_view open = "<think>";
+    const std::size_t last_open = raw.substr(0, before_end).rfind(open);
+    std::size_t reasoning_begin =
+        last_open == std::string_view::npos ? 0 : last_open + open.size();
+    while (reasoning_begin < before_end && raw[reasoning_begin] == '\n') {
+        ++reasoning_begin;
+    }
+    const std::string reasoning(raw.substr(reasoning_begin, before_end - reasoning_begin));
+    const std::size_t last_close = raw.rfind(close);
+    std::size_t content_begin = last_close + close.size();
+    while (content_begin < raw.size() && raw[content_begin] == '\n') {
+        ++content_begin;
+    }
+    return {std::move(reasoning), std::string(raw.substr(content_begin))};
+}
+
+std::string render_echo_block(std::string_view reasoning, std::string_view content,
+                              const std::vector<ToolCall>& tool_calls, bool allow_empty_arguments) {
+    // Byte-identical to the renderer's assistant branch for the final message of a conversation
+    // (keep_thinking is unconditionally true there: the response block always follows the last
+    // user query). Response-echo reuse digests this block on both sides of the reuse, so any
+    // divergence from the renderer breaks the echo chain.
+    auto trim_view = [](std::string_view text) {
+        std::size_t begin = 0;
+        std::size_t end   = text.size();
+        while (begin < end && std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
+            ++begin;
+        }
+        while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) {
+            --end;
+        }
+        return text.substr(begin, end - begin);
+    };
+    std::string block;
+    block.reserve(64 + reasoning.size() + content.size() + tool_calls.size() * 48U);
+    block += "<|im_start|>assistant\n";
+    block += "<think>\n";
+    block += trim_view(reasoning);
+    block += kCanonicalReasoningCloseSerialization;
+    // The template trims the echoed content on both ends before serialization; mirror it so
+    // trailing bytes the output parser held pending (for example a boundary newline) do not
+    // break the digest parity with the client's re-rendered block.
+    block += trim_view(content);
+    const bool body_has_text = !trim_view(content).empty();
+    for (std::size_t call_index = 0; call_index < tool_calls.size(); ++call_index) {
+        if (call_index == 0) {
+            if (body_has_text) { block += "\n\n"; }
+        } else {
+            block += "\n";
+        }
+        block += render_tool_call(tool_calls[call_index], allow_empty_arguments).text;
+    }
+    block += "<|im_end|>\n";
+    return block;
+}
 
 bool ChatMessage::has_media() const noexcept {
     for (const ChatPart& part : parts) {
@@ -505,6 +576,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     }
 
     std::vector<std::optional<std::size_t>> message_boundaries(messages.size() + 1U);
+    std::optional<std::size_t> assistant_body_end;
     std::vector<std::optional<std::size_t>> cache_boundaries(options.cache_markers.size());
     if (message_begin == 0) {
         message_boundaries[0] = rendered.size();
@@ -595,6 +667,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             add_rewrite_execution_boundary();
             rendered.append(content);
             message_boundaries[i + 1U] = rendered.size();
+            // A continued final assistant message has no closing serialization: its body end is
+            // the block end (see RenderedChat::assistant_body_end).
+            assistant_body_end = rendered.size();
             continue;
         }
         RenderedFragment reasoning;
@@ -638,6 +713,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                 rendered.append(render_tool_call(message.tool_calls[call_index], effort_template));
             }
         }
+        assistant_body_end = rendered.size();
         rendered.append_template("<|im_end|>\n");
         message_boundaries[i + 1U] = rendered.size();
     }
@@ -702,7 +778,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                         .rewrite_checkpoint           = rewrite_checkpoint,
                         .rewrite_execution_boundaries = std::move(rewrite_execution_boundaries),
                         .message_boundaries           = std::move(message_boundaries),
-                        .cache_boundaries             = std::move(cache_boundaries)};
+                        .cache_boundaries             = std::move(cache_boundaries),
+                        .assistant_body_end           = assistant_body_end};
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

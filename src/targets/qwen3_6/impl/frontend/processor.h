@@ -139,6 +139,9 @@ struct EncodedChat {
     std::vector<std::uint32_t> rewrite_execution_frontiers;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
+    // Token frontier of RenderedChat::assistant_body_end; missing when that byte offset does not
+    // fall on an exact token boundary (response-echo reuse is then unavailable for the prompt).
+    std::optional<std::uint32_t> assistant_body_end;
 };
 
 EncodedChat

@@ -120,6 +120,13 @@ RequestBasePlan<Variant>::prefix_shortlist_key(std::uint32_t frontier) const noe
 }
 
 template <>
+std::optional<std::array<std::uint8_t, 32>>
+RequestBasePlan<Variant>::echo_prefix_key() const {
+    if (impl_ == nullptr || !impl_->echo_spec) { return std::nullopt; }
+    return impl_->echo_spec->prefix_digest;
+}
+
+template <>
 std::optional<runtime::PrefillWork>
 RequestBasePlan<Variant>::shared_candidate_rebuild_work(std::uint32_t frontier) const noexcept {
     if (impl_ == nullptr) { return std::nullopt; }
@@ -683,15 +690,15 @@ SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
 template <>
 std::unique_ptr<Program<Variant>>
 create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile weights_profile,
-                        SequencePlan<Variant>&& plan, DeviceContext& device,
-                        const StartupObserver& startup_observer) {
+                        const Frontend& frontend, SequencePlan<Variant>&& plan,
+                        DeviceContext& device, const StartupObserver& startup_observer) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
     if (plan.impl_->weights_profile != weights_profile) {
         throw std::invalid_argument(
             "loaded model weights profile does not match the sequence plan");
     }
-    auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, *plan.impl_, device,
-                                                               startup_observer);
+    auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, *plan.impl_, frontend,
+                                                               device, startup_observer);
     plan.impl_.reset();
     return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
 }

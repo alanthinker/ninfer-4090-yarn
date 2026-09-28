@@ -151,8 +151,11 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                           TextContext& card, TargetVerifyFrameView frame,
                           ops::CausalAttentionExecutionEnvelope envelope);
 
+// `chunk_begin` is the chunk's index inside `ids` (prompt space); the KV/RoPE base stays
+// `state.text_kv_base`, which a response-echo splice places inside the state's raw prefix.
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(PrefillContext& state,
                                                     std::span<const TokenId> ids,
+                                                    std::uint32_t chunk_begin,
                                                     std::uint32_t nominal_length,
                                                     std::optional<std::uint32_t> split_frontier,
                                                     bool finalize_at_end);

@@ -515,6 +515,10 @@ ProgramImplCore::save_continuation(const ContinuationHandle& continuation,
     write_vision_items(writer, sequence.prefix_identity.vision_items());
     write_vector(writer, sequence.prefix_identity.rewrite_execution_frontiers());
     write_vector(writer, sequence.prefix_digests.image());
+    writer.bytes(sequence.prompt_text_digest.data(), sizeof(sequence.prompt_text_digest));
+    writer.pod<std::uint8_t>(sequence.starts_in_reasoning ? 1 : 0);
+    writer.pod(sequence.prompt_end);
+    writer.pod<std::uint8_t>(sequence.output_preserve_special ? 1 : 0);
 
     // Checkpoint directory: rewrite checkpoint, long anchors, and the StateImage table map.
     writer.pod<std::uint8_t>(sequence.rewrite_checkpoint.valid ? 1 : 0);
@@ -736,6 +740,11 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
     std::vector<std::array<std::uint64_t, 2>> digest_image =
         read_vector<std::array<std::uint64_t, 2>>(reader, static_cast<std::size_t>(session.tokens) + 1U,
                                                   "shortlist digest");
+    std::array<std::uint8_t, 32> prompt_text_digest{};
+    reader.bytes(prompt_text_digest.data(), sizeof(prompt_text_digest));
+    const bool starts_in_reasoning_flag = reader.pod<std::uint8_t>() != 0;
+    const std::uint32_t prompt_end = reader.pod<std::uint32_t>();
+    const bool output_preserve_special = reader.pod<std::uint8_t>() != 0;
     if (token_types.size() != session.tokens || positions[0].size() != session.tokens ||
         positions[1].size() != session.tokens || positions[2].size() != session.tokens ||
         digest_image.size() != static_cast<std::size_t>(session.tokens) + 1U) {
@@ -954,6 +963,11 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
         sequence.prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1ULL);
         sequence.prefix_digests.restore(std::move(digest_image));
         sequence.prefix_digests.reserve(static_cast<std::size_t>(capacity) + 1ULL);
+        sequence.prompt_text_digest = std::move(prompt_text_digest);
+        sequence.starts_in_reasoning = starts_in_reasoning_flag;
+        sequence.prompt_end = prompt_end;
+        sequence.starts_in_reasoning = starts_in_reasoning_flag;
+        sequence.output_preserve_special = output_preserve_special;
         sequence.execution_frontier       = session.execution_frontier;
         sequence.ledger_frontier          = session.ledger_frontier;
         sequence.text_kv_valid            = session.text_kv_valid;

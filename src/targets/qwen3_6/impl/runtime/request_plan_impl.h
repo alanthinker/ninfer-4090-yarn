@@ -318,6 +318,9 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
         }
         base->rewrite_checkpoint = candidate;
     }
+    if (prompt.identity.response_echo) {
+        base->echo_spec = *prompt.identity.response_echo;
+    }
     std::uint32_t previous_rewrite_frontier = 0;
     for (const std::uint32_t frontier : prompt.identity.rewrite_execution_frontiers) {
         if (frontier == 0 || frontier > base->summary.prompt_tokens ||
@@ -459,6 +462,104 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     return RequestBasePlan(std::move(base));
 }
 
+// Structural gate for response-echo reuse (see ResponseEchoSpec): the prompt carries an echo
+// spec for a text-only continuation, and the resident state holds the previous round's
+// ResponseReplay rewrite frontier inside the selected endpoint, its carried history digest, and
+// a usable tool contract context. The caller still verifies the response BLOCK digest (the
+// canonical re-render of the state's raw generated block), which this gate deliberately leaves
+// out so a digest miss does not pay the re-render cost.
+struct ResponseEchoGateReport {
+    bool open;
+    std::string reason;
+};
+
+// Provisioning clause of the response-echo gate. The splice replaces the incoming prefix
+// [0, boundary) with the resident raw prefix [0, reuse_base), so the state prompt becomes
+// reuse_base + (prompt_tokens - boundary) tokens long. The plan prices KV pages and the context
+// capacity from the INCOMING prompt plus the request's output allowance, and the echo acceptance
+// deducts the splice's extra tokens from that allowance, so the spliced state never outgrows what
+// the request provisioned. A re-serialized response body is routinely a token or two longer than
+// the raw span (the state then ends up shorter, which is free); the opposite order consumes
+// allowance instead of being refused.
+[[nodiscard]] constexpr bool response_echo_allowance_fits(std::uint32_t reuse_base,
+                                                          std::uint32_t boundary_token,
+                                                          std::uint32_t output_allowance) noexcept {
+    const std::uint32_t extra = reuse_base > boundary_token ? reuse_base - boundary_token : 0U;
+    // A zero allowance means the plan reserved no output tokens at all; then only a splice that
+    // adds nothing may proceed.
+    return output_allowance == 0 ? extra == 0 : extra < output_allowance;
+}
+
+// Diagnostic mirror of response_echo_conditions_met: names the first failing gate clause so
+// production logs say which identity piece of a response-echo attempt broke.
+[[nodiscard]] ResponseEchoGateReport
+response_echo_gate_report(const PreparedPromptData& prompt, const SequenceState& source,
+                          std::uint32_t reuse_base, std::uint32_t output_allowance) {
+    if (!prompt.identity.response_echo) {
+        return {false, "no echo spec in the incoming prompt"};
+    }
+    if (prompt.has_media()) {
+        return {false, "prompt has media"};
+    }
+    if (!source.endpoint_valid) {
+        return {false, "source endpoint is invalid"};
+    }
+    if (source.execution_frontier != reuse_base) {
+        return {false, "source frontier is not the endpoint frontier"};
+    }
+    if (source.prompt_end == 0) {
+        return {false, "source prompt_end is unset"};
+    }
+    if (source.prompt_end >= reuse_base) {
+        return {false, "source generated span is empty"};
+    }
+    if (source.prompt_text_digest != prompt.identity.response_echo->prefix_digest) {
+        return {false, "prompt text digest disagrees with the incoming prefix digest"};
+    }
+    if (prompt.identity.response_echo->boundary_token >= prompt.token_ids.size()) {
+        return {false, "echo boundary token is outside the prompt"};
+    }
+    if (!response_echo_allowance_fits(reuse_base, prompt.identity.response_echo->boundary_token,
+                                      output_allowance)) {
+        return {false, "spliced prompt exceeds the request's output allowance"};
+    }
+    return {true, ""};
+}
+
+[[nodiscard]] bool response_echo_conditions_met(const PreparedPromptData& prompt,
+                                                const SequenceState& source,
+                                                std::uint32_t reuse_base,
+                                                std::uint32_t output_allowance) {
+    const auto* echo = &*prompt.identity.response_echo;
+    return echo != nullptr && !prompt.has_media() && source.endpoint_valid &&
+           source.execution_frontier == reuse_base && source.prompt_end > 0 &&
+           source.prompt_end < reuse_base &&
+           source.prompt_text_digest == echo->prefix_digest &&
+           echo->boundary_token < prompt.token_ids.size() &&
+           response_echo_allowance_fits(reuse_base, echo->boundary_token, output_allowance);
+}
+
+bool ProgramImplCore::resident_prefix_reusable(const AdmissionCandidateImpl& plan,
+                                               const PreparedPromptData& prompt,
+                                               const SequenceState& source) const {
+    if (!plan.echo_reuse) {
+        return qwen3_6::detail::prefix_matches(prompt, source.ledger, source.prefix_identity,
+                                               plan.reuse_base);
+    }
+    if (!response_echo_conditions_met(prompt, source, plan.reuse_base,
+                                      plan.summary.effective_output_tokens)) {
+        return false;
+    }
+    const auto* echo   = &*prompt.identity.response_echo;
+    const auto begin   = source.prompt_end;
+    return frontend.response_block_digest(
+               std::span<const TokenId>(source.ledger.data() + begin,
+                                        source.execution_frontier - begin),
+               source.tool_call_output, source.starts_in_reasoning,
+               source.output_preserve_special) ==
+           echo->block_digest;
+}
+
 std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base_plan,
     const SequenceState* source, const SharedPrefixState* shared_source,
@@ -527,8 +628,90 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                              selected.frontier, source->execution_frontier);
                 return std::nullopt;
             }
-            if (!qwen3_6::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,
-                                                 selected.frontier)) {
+            // Token gate: exact token-id + resident-identity equality over the whole prefix.
+            // When it fails the prompt re-serialized the resident response differently than the
+            // model generated it (non-canonical merges, template whitespace normalization). A
+            // response echo - the client re-sending the published fields byte-identically -
+            // still matches in TEXT space: the state's carried prefix digest covers the shared
+            // history, and the canonical re-render of the state's raw generated block covers the
+            // echoed response. On agreement the raw token state is the correct continuation.
+            bool endpoint_accepted = qwen3_6::detail::prefix_matches(
+                prompt, source->ledger, source->prefix_identity, selected.frontier);
+            if (!endpoint_accepted) {
+                const auto gate = response_echo_gate_report(prompt, *source, selected.frontier,
+                                                            plan->summary.effective_output_tokens);
+                if (gate.open) {
+                    const auto* echo = &*prompt.identity.response_echo;
+                    const std::size_t begin = source->prompt_end;
+                    const auto block = frontend.response_block_digest(
+                        std::span<const TokenId>(source->ledger.data() + begin,
+                                                 selected.frontier - begin),
+                        source->tool_call_output, source->starts_in_reasoning,
+                        source->output_preserve_special);
+                    if (block != echo->block_digest) {
+                        std::fprintf(stderr,
+                                     "[echo] block digest mismatch: slot=%u frontier=%u"
+                                     " begin=%zu span=%zu starts_in_reasoning=%d tool=%d"
+                                     " incoming_boundary=%u\n",
+                                     source->lane, selected.frontier, begin,
+                                     selected.frontier - begin,
+                                     source->starts_in_reasoning ? 1 : 0,
+                                     source->tool_call_output ? 1 : 0,
+                                     echo->boundary_token);
+                    }
+                } else {
+                    std::fprintf(stderr, "[echo] gate closed: slot=%u frontier=%u %s\n",
+                                 source->lane, selected.frontier, gate.reason.c_str());
+                }
+            }
+            if (!endpoint_accepted &&
+                response_echo_conditions_met(prompt, *source, selected.frontier,
+                                             plan->summary.effective_output_tokens)) {
+                const auto* echo = &*prompt.identity.response_echo;
+                {
+                    const std::size_t begin = source->prompt_end;
+                    const auto block = frontend.response_block_digest(
+                        std::span<const TokenId>(source->ledger.data() + begin,
+                                                 selected.frontier - begin),
+                        source->tool_call_output, source->starts_in_reasoning,
+                        source->output_preserve_special);
+                    if (block == echo->block_digest) {
+                        endpoint_accepted = true;
+                        plan->echo_reuse          = true;
+                        plan->echo_boundary_token = echo->boundary_token;
+                        // Charge the splice's extra tokens to the output allowance: the plan's KV
+                        // page entitlement and capacity clamp then describe exactly the state this
+                        // request will occupy, instead of being short by (raw prefix - boundary).
+                        const std::uint32_t spliced_extra =
+                            selected.frontier > echo->boundary_token
+                                ? selected.frontier - echo->boundary_token
+                                : 0U;
+                        if (spliced_extra != 0) {
+                            plan->summary.effective_output_tokens -= spliced_extra;
+                            plan->summary.effective_limit_reason = FinishReason::ContextCapacity;
+                        }
+                        // The state this prefill produces is the SPLICED token space: the raw
+                        // prefix plus the incoming tail, which is reuse_base + (prompt_tokens -
+                        // boundary_token) tokens long. Its rebuild cost and rebuild boundary must
+                        // be measured there: the runtime requires rebuild_work.tokens to equal
+                        // the state's execution frontier, and the base plan derived them from the
+                        // incoming prompt length instead.
+                        const std::uint32_t spliced_prompt =
+                            selected.frontier +
+                            (plan->summary.prompt_tokens - echo->boundary_token);
+                        plan->root_rebuild_work = runtime::make_prefill_work(0, spliced_prompt, 0, 0,
+                                                                            prefill_chunk);
+                        plan->root_rebuild_tail_begin = 0;
+                        std::fprintf(stderr,
+                                     "[reuse] response-echo endpoint accepted: frontier=%u"
+                                     " incoming_tail=%u raw_prefix=%u spliced_prompt=%u\n",
+                                     selected.frontier,
+                                     prompt.token_ids.size() - echo->boundary_token,
+                                     selected.frontier, spliced_prompt);
+                    }
+                }
+            }
+            if (!endpoint_accepted) {
                 return std::nullopt;
             }
             plan->reuse      = ReusePath::PrivateEndpoint;
@@ -741,8 +924,14 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             plan->shared_candidates.push_back(std::move(group));
         }
     }
-    plan->summary.reusable_prompt_tokens = plan->reuse_base;
-    plan->summary.prefix_reuse_path      = plan->reuse;
+    // The Engine accounts the prefill suffix in INCOMING prompt space: it publishes this value
+    // as the generation-start summary and then requires the prefill to consume exactly
+    // prompt_tokens - reusable_prompt_tokens tokens. A response-echo plan resumes at the
+    // incoming boundary (the resident raw prefix replaces the incoming prefix before it), so
+    // its reusable count is the boundary, not the raw frontier.
+    plan->summary.reusable_prompt_tokens =
+        plan->echo_reuse ? plan->echo_boundary_token : plan->reuse_base;
+    plan->summary.prefix_reuse_path = plan->reuse;
     if (speculative_backend == SpeculativeBackend::Mtp) {
         if (plan->reuse == ReusePath::Root) {
             plan->prepare_mtp = true;
@@ -810,9 +999,13 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     }
 
     const std::size_t prefill_splits = plan->vision ? plan->vision->uses.size() : 0ULL;
+    // Cost models measure the prefill in PROMPT space: the reused prefix is
+    // reusable_prompt_tokens (the echo boundary for a splice, reuse_base otherwise), so a splice
+    // that resumes beyond the incoming boundary is not charged for tokens it never prefills.
     plan->summary.service_work_quanta =
-        projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits,
-                               plan->capture_groups, prompt.identity.rewrite_execution_frontiers);
+        projected_service_work(plan->summary, plan->summary.reusable_prompt_tokens, prefill_chunk,
+                               prefill_splits, plan->capture_groups,
+                               prompt.identity.rewrite_execution_frontiers);
     std::uint64_t remaining_vision_items   = 0;
     std::uint64_t remaining_vision_patches = 0;
     if (plan->vision) {
@@ -835,7 +1028,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         }
     }
     plan->remaining_prefill_work =
-        scheduled_prefill_work(plan->reuse_base, plan->summary.prompt_tokens,
+        scheduled_prefill_work(plan->summary.reusable_prompt_tokens, plan->summary.prompt_tokens,
                                remaining_vision_items, remaining_vision_patches, prefill_chunk,
                                plan->capture_groups, prompt.identity.rewrite_execution_frontiers);
     plan->transfer_requirements.reserve(4);

@@ -585,8 +585,10 @@ void log_capture_decision(const char* outcome, std::uint32_t frontier, const cha
 } // namespace
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
-                                 DeviceContext& device_in, const StartupObserver& startup_observer)
-    : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
+                                 const Frontend& frontend_in, DeviceContext& device_in,
+                                 const StartupObserver& startup_observer)
+    : model(model_in), device(device_in), frontend(frontend_in),
+      capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), context_cache(plan.context_cache),
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
@@ -1024,8 +1026,8 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
                 nullptr};
             mark_workspace_usage(workspace_plan.text_prefill);
             const schedule::PrefillChunkResult result = schedule::prefill_text_chunk(
-                schedule_state, std::span<const TokenId>(prompt.token_ids), nominal, std::nullopt,
-                false);
+                schedule_state, std::span<const TokenId>(prompt.token_ids), cursor, nominal,
+                std::nullopt, false);
             if (result.finalized || result.processed_tokens == 0 ||
                 result.processed_tokens > nominal) {
                 throw std::logic_error("causal score Prefill made invalid progress");
@@ -4358,9 +4360,32 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
     if (lane >= max_concurrency || (details.has_source && details.has_shared_source)) {
         return reject_invariant();
     }
+    // Distinguish WHICH consistency check bounced a reuse materialization: the done line only
+    // reports the aggregate reason, and a session-bound lane that is not Empty (or an epoch that
+    // moved between planning and revalidation) rejects every target of one request at once.
+    const auto dump_stale = [this, &details, lane](const char* where) noexcept {
+        const bool has_src = details.has_source;
+        const std::uint32_t src = has_src ? details.source_index : 0U;
+        const bool src_valid = has_src && src < continuation_capacity;
+        std::fprintf(stderr,
+                     "[materialize] stale where=%s dest_lane=%u dest_epoch=%llu lane_epoch=%llu "
+                     "lifecycle=%u active_cont=%u cont_cap=%u src_slot=%u src_role=%d "
+                     "src_planned_gen=%llu src_live_gen=%llu victims=%zu\n",
+                     where, lane,
+                     static_cast<unsigned long long>(details.destination_epoch),
+                     static_cast<unsigned long long>(lane_epochs[lane]),
+                     static_cast<unsigned int>(requests[lane].lifecycle),
+                     active_continuations[lane], continuation_capacity, src,
+                     src_valid ? static_cast<int>(continuation_slots[src].role) : -1,
+                     static_cast<unsigned long long>(details.source_generation),
+                     src_valid ? static_cast<unsigned long long>(continuation_slots[src].generation)
+                              : 0ULL,
+                     details.pressure_options.size());
+    };
     if (details.destination_epoch != lane_epochs[lane] ||
         requests[lane].lifecycle != Lifecycle::Empty ||
         active_continuations[lane] < continuation_capacity) {
+        dump_stale("destination");
         return reject(runtime::MaterializationRejection::DestinationStale);
     }
 
@@ -4369,6 +4394,7 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
         if (details.source_index >= continuation_capacity ||
             continuation_slots[details.source_index].role != ContinuationSlotRole::Catalogued ||
             continuation_slots[details.source_index].generation != details.source_generation) {
+            dump_stale("source-slot");
             return reject(runtime::MaterializationRejection::DestinationStale);
         }
         source_state = &continuation_states[details.source_index];
@@ -4380,6 +4406,7 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
                 SharedPrefixSlotRole::Catalogued ||
             shared_prefix_slots[details.shared_source_index].generation !=
                 details.shared_source_generation) {
+            dump_stale("shared-source-slot");
             return reject(runtime::MaterializationRejection::DestinationStale);
         }
         shared_state = &shared_prefix_states[details.shared_source_index];
@@ -4390,6 +4417,7 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
         if (index >= continuation_capacity ||
             continuation_slots[index].role != ContinuationSlotRole::Catalogued ||
             continuation_slots[index].generation != generation) {
+            dump_stale("victim-slot");
             return reject(runtime::MaterializationRejection::DestinationStale);
         }
         bool matches = false;
@@ -4400,7 +4428,10 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
             matches = pressure_decision_valid(continuation_states[index],
                                               details.pressure_options[victim], &*protection);
         }
-        if (!matches) { return reject(runtime::MaterializationRejection::DestinationStale); }
+        if (!matches) {
+            dump_stale("victim-option");
+            return reject(runtime::MaterializationRejection::DestinationStale);
+        }
         if (details.has_source && index == details.source_index &&
             generation == details.source_generation) {
             return reject_invariant();
@@ -4424,6 +4455,7 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
         if (index >= shared_prefix_capacity ||
             shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued ||
             shared_prefix_slots[index].generation != generation) {
+            dump_stale("shared-victim-slot");
             return reject(runtime::MaterializationRejection::DestinationStale);
         }
         bool matches = false;
@@ -4437,6 +4469,7 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
         if ((details.has_shared_source && index == details.shared_source_index &&
              generation == details.shared_source_generation) ||
             shared_prefix_states[index].active_references != 0 || !matches) {
+            dump_stale("shared-victim-option");
             return reject(runtime::MaterializationRejection::DestinationStale);
         }
         for (std::size_t prior = 0; prior < victim; ++prior) {
@@ -4484,7 +4517,10 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
     const std::optional<detail::PressureTargetProjection> projected_pressure =
         evaluate_pressure_target(&*protection, projected_private_owners, details.pressure_options,
                                  projected_shared_owners, details.shared_pressure_options, nullptr);
-    if (!projected_pressure) { return reject(runtime::MaterializationRejection::DestinationStale); }
+    if (!projected_pressure) {
+        dump_stale("pressure-projection");
+        return reject(runtime::MaterializationRejection::DestinationStale);
+    }
 
     const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (prompt_tokens != details.summary.prompt_tokens ||
@@ -4493,9 +4529,12 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
          (details.reuse == ReusePath::Root))) {
         return reject_invariant();
     }
-    if (source_state != nullptr &&
-        !qwen3_6::detail::prefix_matches(prompt, source_state->ledger,
-                                         source_state->prefix_identity, details.reuse_base)) {
+    // Shares the materialization path's predicate: a token-space plan needs token-id equality,
+    // a response-echo plan (details.echo_reuse) needs the text-space echo condition - the client
+    // re-tokenizes the published response differently than the model generated it, so a raw
+    // prefix_matches here would reject every echoed continuation as stale.
+    if (source_state != nullptr && !resident_prefix_reusable(details, prompt, *source_state)) {
+        dump_stale("source-prefix");
         return reject(runtime::MaterializationRejection::DestinationStale);
     }
     if (shared_state != nullptr &&
@@ -4503,6 +4542,7 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
          !qwen3_6::detail::prefix_matches(prompt, shared_state->identity->ledger(),
                                           *shared_state->identity->prefix_identity(),
                                           details.reuse_base))) {
+        dump_stale("shared-prefix");
         return reject(runtime::MaterializationRejection::DestinationStale);
     }
     if (details.reuse == ReusePath::SharedStablePrefix &&
@@ -4738,10 +4778,8 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
              (request_plan.reuse == ReusePath::Root))) {
             throw std::logic_error("materialization source does not match the selected reuse path");
         }
-        if (source_state != nullptr &&
-            !qwen3_6::detail::prefix_matches(prompt, source_state->ledger,
-                                             source_state->prefix_identity,
-                                             request_plan.reuse_base)) {
+        if (source_state != nullptr && !resident_prefix_reusable(request_plan, prompt,
+                                                                 *source_state)) {
             throw std::logic_error("planned resident prefix is no longer reusable");
         }
         if (shared_state != nullptr &&
@@ -4848,26 +4886,99 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
         }
         if (prompt.has_media() && !request_plan.vision) { prompt.release_all_media_payloads(); }
 
-        materialization_ledger_.assign(prompt.token_ids.begin(), prompt.token_ids.end());
-        materialization_identity_.assign(prompt);
-        materialization_prefix_digests_.assign(prompt);
+        // Response-echo splice: one execution space continuing the resident state's RAW
+        // generated prefix into the incoming re-tokenized tail. The staged prompt keeps the
+        // incoming token ids (its tail is what executes); the ledger, resident identity, and
+        // digest image track the spliced space, so the runtime's frontier invariants keep one
+        // coherent authority. The tail's rope positions are re-anchored onto the raw prefix
+        // length. This round captures no new checkpoints (its capture backing describes the
+        // incoming tokenization, not the spliced one): the endpoint publishes at completion,
+        // and its next round is reached by the same response-echo or token match.
+        std::uint32_t staged_base        = request_plan.reuse_base;
+        std::uint32_t echo_state_frontier = 0;
+        if (request_plan.echo_reuse) {
+            staged_base         = request_plan.echo_boundary_token;
+            echo_state_frontier = request_plan.reuse_base;
+            // `staged_base` indexes the INCOMING re-tokenization, `echo_state_frontier` the
+            // state's RAW tokenization: both end at the same text offset (the end of the echoed
+            // assistant body), so neither length bounds the other and the splice handles both
+            // orders. The resulting state prompt is echo_state_frontier + (prompt_tokens -
+            // staged_base) tokens; the plan priced it by charging the difference to the request's
+            // output allowance (response_echo_conditions_met), which revalidation has already
+            // enforced here.
+            if (staged_base >= prompt_tokens || echo_state_frontier == 0 ||
+                source_state == nullptr ||
+                echo_state_frontier != source_state->execution_frontier) {
+                throw std::logic_error("response-echo splice bounds are inconsistent");
+            }
+            // A spliced round captures nothing: its capture backing describes the incoming
+            // tokenization, not the token space this prefill executes in. The ENGINE has already
+            // run its shared-capture selection against the plan's candidates (that protocol
+            // requires the plan to carry them until here), so dropping them at this point is the
+            // target declining every offered capture - a supported outcome, exactly like a
+            // skipped shared capture.
+            request_plan.capture_groups.clear();
+            request_plan.shared_candidates.clear();
+            request_plan.rewrite_disposition = RewriteCheckpointDisposition::DropOptional;
+            const std::ptrdiff_t reanchor =
+                static_cast<std::ptrdiff_t>(echo_state_frontier) - staged_base;
+            for (std::size_t axis = 0; axis < 3; ++axis) {
+                auto& positions = prompt.positions;
+                for (std::size_t index = staged_base; index < prompt_tokens; ++index) {
+                    positions[axis * prompt_tokens + index] += reanchor;
+                }
+            }
+            materialization_ledger_.assign(
+                source_state->ledger.begin(),
+                source_state->ledger.begin() + std::ptrdiff_t(echo_state_frontier));
+            materialization_ledger_.insert(
+                materialization_ledger_.end(),
+                prompt.token_ids.begin() + std::ptrdiff_t(staged_base), prompt.token_ids.end());
+            // A resident state's ledger, identity, and digest images all carry one entry beyond
+            // its execution frontier (the committed pending token: ledger_frontier ==
+            // execution_frontier + 1). The splice keeps only the RAW PREFIX below the frontier,
+            // so the copied images must be truncated to it before the tail is appended;
+            // otherwise all three images stay one entry ahead of the spliced ledger and every
+            // generated-token commit reports a shape mismatch.
+            materialization_identity_ = source_state->prefix_identity;
+            materialization_identity_.truncate(echo_state_frontier);
+            materialization_identity_.append_generated(
+                std::size_t(prompt_tokens) - staged_base, prompt.rope_delta);
+            materialization_prefix_digests_ = source_state->prefix_digests;
+            materialization_prefix_digests_.truncate(echo_state_frontier);
+            materialization_prefix_digests_.append_generated(
+                std::span<const TokenId>(prompt.token_ids.begin() + std::ptrdiff_t(staged_base),
+                                         std::size_t(prompt_tokens) - staged_base),
+                prompt.rope_delta);
+        } else {
+            materialization_ledger_.assign(prompt.token_ids.begin(), prompt.token_ids.end());
+            materialization_identity_.assign(prompt);
+            materialization_prefix_digests_.assign(prompt);
+        }
 
+        const std::uint32_t state_prompt_end =
+            echo_state_frontier != 0
+                ? echo_state_frontier + (prompt_tokens - staged_base)
+                : prompt_tokens;
         const std::uint32_t initial_mtp_extent =
             speculative_backend == SpeculativeBackend::Mtp
                 ? std::min({draft_window,
                             request_plan.summary.effective_output_tokens > 1
                                 ? request_plan.summary.effective_output_tokens - 2
                                 : 0U,
-                            capacity - prompt_tokens > 0 ? capacity - prompt_tokens - 1 : 0U})
+                            capacity - state_prompt_end > 0
+                                ? capacity - state_prompt_end - 1
+                                : 0U})
                 : 0U;
         RequestControl::Prefill prefill{
             .prompt             = std::move(prompt),
             .vision_plan        = std::move(request_plan.vision),
             .vision             = nullptr,
             .capture_groups     = std::move(request_plan.capture_groups),
-            .base               = request_plan.reuse_base,
-            .cursor             = request_plan.reuse_base,
+            .base               = staged_base,
+            .cursor             = staged_base,
             .prompt_tokens      = prompt_tokens,
+            .echo_state_frontier = echo_state_frontier,
             .initial_mtp_extent = initial_mtp_extent,
             .elapsed_seconds    = 0.0,
             .prepare_mtp        = request_plan.prepare_mtp,
@@ -8381,6 +8492,13 @@ void ProgramImplCore::retire_continuation_slot(std::uint32_t index) noexcept {
     sequence.mtp_draft_count         = 0;
     sequence.tail_hidden_valid       = false;
     sequence.endpoint_valid          = false;
+    // The response-echo identity is per-request: a retired slot must not hand a stale carried
+    // digest, prompt boundary, or tool contract to whatever state is restored into it.
+    sequence.prompt_text_digest      = {};
+    sequence.prompt_end              = 0;
+    sequence.starts_in_reasoning     = false;
+    sequence.output_preserve_special = false;
+    sequence.tool_call_output.reset();
     sequence.rewrite_checkpoint      = {};
     sequence.rebuild_work            = {};
     sequence.rebuild_tail_begin      = 0;
@@ -9428,6 +9546,8 @@ ProgramImplCore::checkpoint_summary(const SequenceState& sequence,
     const std::uint32_t identity_tag = static_cast<std::uint32_t>(speculative_backend) |
                                        (static_cast<std::uint32_t>(proposal_head) << 8U) |
                                        (static_cast<std::uint32_t>(kv_storage) << 16U);
+    const bool echo_indexable =
+        checkpoint.kind == runtime::CheckpointKind::SessionEndpoint;
     return qwen3_6::CheckpointSummary{
         .ref   = checkpoint,
         .scope = runtime::CheckpointScope::Private,
@@ -9437,6 +9557,10 @@ ProgramImplCore::checkpoint_summary(const SequenceState& sequence,
                 .frontier     = checkpoint.frontier,
                 .identity_tag = identity_tag,
             },
+        .echo_key =
+            echo_indexable
+                ? std::optional<std::array<std::uint8_t, 32>>(sequence.prompt_text_digest)
+                : std::nullopt,
         .state_residency = residency,
         .required_kv =
             {
@@ -11320,7 +11444,22 @@ PendingBatch ProgramImplCore::decode(std::span<const SequenceHandle> members,
 void ProgramImplCore::commit_generated_prefix_identity(
     SequenceState& sequence, std::uint32_t base_ledger_frontier,
     std::span<const TokenId> accepted_tokens,
-    std::optional<std::uint32_t> prefix_execution_split_after) {
+    std::optional<std::uint32_t> prefix_execution_split_after, const char* site) {
+    // Name the numbers that disagree: this commit is the single place where the accepted-prefix
+    // identity, the digest image, and the ledger must line up, and a mismatch there is otherwise
+    // only reported as a bare fatal.
+    const auto dump_shape = [&](const char* what) noexcept {
+        std::fprintf(stderr,
+                     "[identity] %s site=%s base=%u accepted=%zu ledger=%zu identity=%zu"
+                     " digests=%zu ledger_frontier=%u execution_frontier=%u text_kv_valid=%u"
+                     " mtp_kv_valid=%u prompt_end=%u split=%d\n",
+                     what, site, base_ledger_frontier, accepted_tokens.size(),
+                     sequence.ledger.size(), sequence.prefix_identity.size(),
+                     sequence.prefix_digests.size(), sequence.ledger_frontier,
+                     sequence.execution_frontier, sequence.text_kv_valid, sequence.mtp_kv_valid,
+                     sequence.prompt_end, prefix_execution_split_after ? 1 : 0);
+        std::fflush(stderr);
+    };
     if (base_ledger_frontier > sequence.ledger.size() ||
         accepted_tokens.size() > sequence.ledger.size() - base_ledger_frontier ||
         sequence.ledger.size() != base_ledger_frontier + accepted_tokens.size() ||
@@ -11329,6 +11468,7 @@ void ProgramImplCore::commit_generated_prefix_identity(
         (prefix_execution_split_after &&
          (*prefix_execution_split_after == 0 ||
           *prefix_execution_split_after > accepted_tokens.size()))) {
+        dump_shape("invalid-span");
         throw std::logic_error("committed generated-prefix identity has an invalid span");
     }
     const bool already_appended = sequence.prefix_identity.size() == sequence.ledger.size() &&
@@ -11336,6 +11476,7 @@ void ProgramImplCore::commit_generated_prefix_identity(
     const bool awaits_append = sequence.prefix_identity.size() == base_ledger_frontier &&
                                sequence.prefix_digests.size() == base_ledger_frontier;
     if (!already_appended && !awaits_append) {
+        dump_shape("not-at-base");
         throw std::logic_error("generated-prefix identity is not at its base or committed extent");
     }
     if (already_appended && !prefix_execution_split_after) { return; }
@@ -11347,6 +11488,7 @@ void ProgramImplCore::commit_generated_prefix_identity(
                                              prefix_execution_split_after);
     if (sequence.prefix_identity.size() != sequence.ledger.size() ||
         sequence.prefix_digests.size() != sequence.ledger.size()) {
+        dump_shape("shape-changed");
         throw std::logic_error("committed generated-prefix identity changed the ledger shape");
     }
 }
@@ -11499,7 +11641,7 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                     mark_workspace_usage(workspace_plan.dflash_context);
                 }
                 const schedule::PrefillChunkResult result = schedule::prefill_text_chunk(
-                    schedule_state, sequence.ledger, count, std::nullopt, false);
+                    schedule_state, sequence.ledger, cursor, count, std::nullopt, false);
                 if (result.finalized || result.processed_tokens == 0 ||
                     result.processed_tokens > count) {
                     throw std::logic_error("forced-token prefill made invalid progress");
@@ -11523,7 +11665,7 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
             work.reset();
 
             commit_generated_prefix_identity(sequence, base_ledger_frontier, forced,
-                                             prefix_execution_splits[row]);
+                                             prefix_execution_splits[row], "forced");
             advance_rebuild_work(sequence, end, prefill_chunk);
             sequence.execution_frontier = end;
             sequence.ledger_frontier    = end + 1U;
@@ -12237,6 +12379,16 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
     const auto started                     = Clock::now();
     const std::uint32_t prompt_tokens      = staged.prompt_tokens;
     const std::uint32_t base               = staged.base;
+    // The prefill's end in STATE space: for a response-echo splice the staged prompt tail
+    // executes on top of a longer raw prefix, so state frontiers exceed prompt frontiers.
+    const std::uint32_t state_prompt_end =
+        staged.echo_state_frontier != 0
+            ? staged.echo_state_frontier + (prompt_tokens - base)
+            : prompt_tokens;
+    // The prefill's prefix end in STATE space (KV/GDN frontiers), for every state-space
+    // bookkeeping below; for a response-echo splice it is the raw prefix length, not `base`.
+    const std::uint32_t state_base =
+        staged.echo_state_frontier != 0 ? staged.echo_state_frontier : base;
     const std::uint32_t initial_mtp_extent = staged.initial_mtp_extent;
     request.lifecycle                      = Lifecycle::Empty;
     try {
@@ -12557,12 +12709,12 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     : nullptr;
             const std::uint32_t source_text_frontier =
                 private_source != nullptr ? private_source->text_kv_valid : shared_source->frontier;
-            if (!sequence.kv || source_text_frontier < base) {
+            if (!sequence.kv || source_text_frontier < state_base) {
                 throw std::logic_error("retained prefix has incomplete Text KV");
             }
-            sequence.text_kv_valid = base;
+            sequence.text_kv_valid = state_base;
             if (speculative_backend == SpeculativeBackend::Mtp) {
-                const std::uint32_t mtp_base       = base == 0 ? 0 : base - 1U;
+                const std::uint32_t mtp_base       = state_base == 0 ? 0 : state_base - 1U;
                 const std::uint32_t source_backend = private_source != nullptr
                                                          ? private_source->mtp_kv_valid
                                                          : shared_source->backend_frontier;
@@ -12574,10 +12726,10 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 const std::uint32_t source_backend = private_source != nullptr
                                                          ? private_source->dflash_context_frontier
                                                          : shared_source->backend_frontier;
-                if (source_backend < base) {
+                if (source_backend < state_base) {
                     throw std::logic_error("retained prefix has incomplete DFlash KV");
                 }
-                sequence.dflash_context_frontier = base;
+                sequence.dflash_context_frontier = state_base;
             }
             sequence.tail_hidden_valid =
                 base == prompt_tokens &&
@@ -12613,11 +12765,11 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             if (!sequence.kv) {
                 throw std::logic_error("resident prefix has no KV allocation bundle");
             }
-            if (sequence.text_kv_valid < base) {
+            if (sequence.text_kv_valid < state_base) {
                 throw std::logic_error("resident Text KV is shorter than the append frontier");
             }
             if (speculative_backend == SpeculativeBackend::Mtp) {
-                const std::uint32_t mtp_base = base == 0 ? 0 : base - 1;
+                const std::uint32_t mtp_base = state_base == 0 ? 0 : state_base - 1;
                 if (!request_plan.prepare_mtp) {
                     throw std::logic_error("MTP backend active but prepare_mtp is not set");
                 }
@@ -12635,16 +12787,16 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     sequence.mtp_kv_valid = mtp_base;
                 }
             } else if (speculative_backend == SpeculativeBackend::DFlash &&
-                       sequence.dflash_context_frontier != base) {
+                       sequence.dflash_context_frontier != state_base) {
                 throw std::logic_error("resident DFlash context is not at the append frontier");
             }
             bind_sequence_kv(sequence);
-            trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
+            trim_sequence_kv(sequence, state_base, backend_kv_valid(sequence));
             resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
                                            request_plan.backend_kv_page_entitlement);
-            sequence.text_kv_valid = base;
-            sequence.ledger.resize(base);
-            sequence.prefix_digests.truncate(base);
+            sequence.text_kv_valid = state_base;
+            sequence.ledger.resize(state_base);
+            sequence.prefix_digests.truncate(state_base);
             reserve_state_entitlement(sequence, state_slots);
             refresh_state_views(sequence);
         } else if (is_rewrite_checkpoint_restore(request_plan.reuse)) {
@@ -12684,10 +12836,10 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 if (!dflash || !sequence.kv->backend || sequence.dflash_context_frontier < base) {
                     throw std::logic_error("planned DFlash rewrite checkpoint is unavailable");
                 }
-                sequence.dflash_context_frontier = base;
+                sequence.dflash_context_frontier = state_base;
             }
             bind_sequence_kv(sequence);
-            trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
+            trim_sequence_kv(sequence, state_base, backend_kv_valid(sequence));
             resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
                                            request_plan.backend_kv_page_entitlement);
             sequence.tail_hidden_valid = base == prompt_tokens;
@@ -12700,15 +12852,18 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         }
 
         sequence.endpoint_valid = false;
-        if (!preserving_source) { trim_sequence_kv(sequence, base, backend_kv_valid(sequence)); }
+        if (!preserving_source) {
+            trim_sequence_kv(sequence, state_base, backend_kv_valid(sequence));
+        }
         bind_sequence_kv(sequence);
         const std::uint32_t backend_materialized =
             speculative_backend == SpeculativeBackend::Mtp
                 ? std::min(capacity,
-                           prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
-            : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
+                           state_prompt_end +
+                               (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
+            : speculative_backend == SpeculativeBackend::DFlash ? state_prompt_end
                                                                 : 0U;
-        materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
+        materialize_sequence_kv(sequence, state_prompt_end, backend_materialized);
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
@@ -12721,8 +12876,28 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         sequence.ledger.swap(materialization_ledger_);
         sequence.prefix_identity.swap(materialization_identity_);
         sequence.prefix_digests.swap(materialization_prefix_digests_);
+        if (staged.echo_state_frontier != 0) {
+            // Shape snapshot for a response-echo splice: the three images must agree here, at the
+            // generated-token commit, and at every decode round.
+            std::fprintf(stderr,
+                         "[identity] splice-staged ledger=%zu identity=%zu digests=%zu"
+                         " state_base=%u state_prompt_end=%u prompt_tokens=%u base=%u\n",
+                         sequence.ledger.size(), sequence.prefix_identity.size(),
+                         sequence.prefix_digests.size(), state_base, state_prompt_end,
+                         prompt_tokens, base);
+            std::fflush(stderr);
+        }
         sequence.rebuild_work       = request_plan.root_rebuild_work;
         sequence.rebuild_tail_begin = request_plan.root_rebuild_tail_begin;
+        // Response-echo identity for the state this prefill produces: the incoming prompt's
+        // carried text digest and tool contract are exactly what the next round's echo (which
+        // re-sends this round's response) compares against, for a response-echo continuation as
+        // for an ordinary one.
+        sequence.prompt_text_digest  = staged.prompt.identity.prompt_text_digest;
+        sequence.tool_call_output    = staged.prompt.tool_call_output;
+        sequence.starts_in_reasoning = staged.prompt.starts_in_reasoning;
+        sequence.prompt_end            = state_prompt_end;
+        sequence.output_preserve_special = staged.prompt.output_preserve_special;
 
         if (speculative_backend == SpeculativeBackend::DFlash) {
             if (!dflash || !io.dflash_decode || !sequence.kv->backend) {
@@ -12963,7 +13138,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
             commit_generated_prefix_identity(sequence, pending.base_S,
                                              std::span<const TokenId>(token_base, committed),
-                                             prefix_execution_splits[row]);
+                                             prefix_execution_splits[row], "speculative");
             advance_rebuild_work(sequence, pending.base_E + committed, prefill_chunk);
             sequence.execution_frontier = pending.base_E + committed;
             sequence.ledger_frontier    = pending.base_S + committed;
@@ -14205,6 +14380,18 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
     if (staged.pending_capture_offer != 0) {
         throw std::logic_error("prefill cannot advance while a capture offer is pending");
     }
+    // Response-echo splice: the staged prompt tail is indexed in PROMPT token space, but the
+    // loaded state prefix is the RAW prefix; every KV/state frontier is the prompt-space value
+    // plus this offset (zero for ordinary prefill). The offset is signed: the re-serialized
+    // block is routinely longer than the raw span, so the raw prefix is often SHORTER than the
+    // incoming boundary it replaces.
+    const std::int32_t echo_delta =
+        staged.echo_state_frontier != 0
+            ? static_cast<std::int32_t>(staged.echo_state_frontier) -
+                  static_cast<std::int32_t>(staged.base)
+            : 0;
+    const std::uint32_t state_prompt_end = static_cast<std::uint32_t>(
+        static_cast<std::int64_t>(staged.prompt_tokens) + echo_delta);
     if (const char* reuse_diag = std::getenv("NINFER_REUSE_DIAG");
         reuse_diag == nullptr || *reuse_diag != '0') {
         // Pairs with `capture-plan:`/`capture:`: a request that resumes its prefill deeper than a
@@ -14262,7 +14449,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             decoder->text_kv,
             decoder->mtp_cache(),
             dflash ? &*dflash : nullptr,
-            staged.cursor,
+            staged.cursor + echo_delta,
             static_cast<const ops::SamplingConfig*>(
                 sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
             boundary_hidden_ptr,
@@ -14278,10 +14465,20 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             }
             mark_workspace_usage(workspace_plan.mtp_prefill);
             const Tensor& previous_hidden = sequence.tail_hidden;
+            // For a response-echo splice the prefix's last token is the raw state prefix's end
+            // (state space), whose rope position is not in the staged prompt metadata.
+            const std::array<std::int32_t, 3> echo_bridge_rope = {
+                static_cast<std::int32_t>(staged.base + echo_delta - 1) + staged.prompt.rope_delta,
+                static_cast<std::int32_t>(staged.base + echo_delta - 1) + staged.prompt.rope_delta,
+                static_cast<std::int32_t>(staged.base + echo_delta - 1) + staged.prompt.rope_delta,
+            };
             const schedule::MtpBridgeInput bridge{
                 .previous_hidden = &previous_hidden,
-                .position        = checked_i32(staged.base - 1, "MTP bridge position"),
-                .rope_position   = prompt_rope_position(staged.prompt, staged.base - 1),
+                .position        = checked_i32(staged.base + echo_delta - 1,
+                                               "MTP bridge position"),
+                .rope_position   = echo_delta != 0
+                                       ? echo_bridge_rope
+                                       : prompt_rope_position(staged.prompt, staged.base - 1),
             };
             if (staged.vision) {
                 schedule::mtp_bridge_multimodal(schedule_state, staged.prompt, *staged.vision,
@@ -14294,7 +14491,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 schedule::mtp_bridge_and_propose(schedule_state, bridge_token, previous_hidden,
                                                  bridge.position, bridge.rope_position, false);
             }
-            sequence.mtp_kv_valid = staged.base;
+            sequence.mtp_kv_valid = staged.base + echo_delta;
             commit_sequence_kv(sequence, sequence.text_kv_valid, sequence.mtp_kv_valid);
             staged.mtp_bridge = MtpBridgeMode::None;
         }
@@ -14311,7 +14508,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             std::uint32_t final_chunk_tokens = 0;
             bool finalized                   = false;
             while (remaining != 0) {
-                schedule_state.text_kv_base           = staged.cursor;
+                schedule_state.text_kv_base           = staged.cursor + echo_delta;
                 selectors                             = state_selectors(sequence);
                 schedule_state.state_source_slot      = selectors.source;
                 schedule_state.state_destination_slot = selectors.destination;
@@ -14346,7 +14543,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 } else {
                     result = schedule::prefill_text_chunk(
                         schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
-                        remaining, split_frontier, final_candidate);
+                        staged.cursor, remaining, split_frontier, final_candidate);
                 }
                 timing.include(result.timing);
                 timing.resume_post();
@@ -14358,10 +14555,10 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 processed_prompt_tokens += result.processed_tokens;
                 remaining -= result.processed_tokens;
                 final_chunk_tokens     = result.processed_tokens;
-                sequence.text_kv_valid = staged.cursor;
-                if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
+                sequence.text_kv_valid = staged.cursor + echo_delta;
+                if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor + echo_delta; }
                 if (speculative_backend == SpeculativeBackend::DFlash) {
-                    sequence.dflash_context_frontier = staged.cursor;
+                    sequence.dflash_context_frontier = staged.cursor + echo_delta;
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
 
@@ -14378,7 +14575,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                         // hidden for it, so the committed prefix is closed here too: a client that
                         // abandons the prefill while a capture offer is in flight must still be
                         // able to resume from it.
-                        staged.boundary_hidden_frontier = staged.cursor;
+                        staged.boundary_hidden_frontier = staged.cursor + echo_delta;
                         staged.elapsed_seconds +=
                             std::chrono::duration<double>(Clock::now() - started).count();
                         if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
@@ -14397,7 +14594,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
 
             // The last chunk call recorded the hidden of the token it committed, so this frontier
             // can be published as it stands: an abandoned prefill resumes from it directly.
-            staged.boundary_hidden_frontier = staged.cursor;
+            staged.boundary_hidden_frontier = staged.cursor + echo_delta;
 
             if (!finalized) {
                 if (staged.cursor == staged.prompt_tokens) {
@@ -14459,23 +14656,23 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
 
         validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
-        if (sequence.ledger.size() != prompt_tokens) {
+        if (sequence.ledger.size() != state_prompt_end) {
             throw std::logic_error("candidate token ledger does not match prompt length");
         }
         sequence.ledger.push_back(host_tokens[0]);
         sequence.prefix_identity.append_generated(1, sequence.rope_delta);
         sequence.prefix_digests.append_generated(std::span<const TokenId>(host_tokens, 1),
                                                  sequence.rope_delta);
-        sequence.text_kv_valid = prompt_tokens;
+        sequence.text_kv_valid = state_prompt_end;
         if (staged.prepare_mtp) {
-            if (sequence.mtp_kv_valid != prompt_tokens) {
+            if (sequence.mtp_kv_valid != state_prompt_end) {
                 throw std::logic_error("staged MTP prefill did not reach the prompt frontier");
             }
             sequence.mtp_draft_count = staged.initial_mtp_extent;
             std::copy_n(initial_drafts.begin(), staged.initial_mtp_extent,
                         sequence.mtp_drafts.begin());
         } else if (speculative_backend == SpeculativeBackend::DFlash &&
-                   sequence.dflash_context_frontier != prompt_tokens) {
+                   sequence.dflash_context_frontier != state_prompt_end) {
             throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
         }
         sequence.tail_hidden_valid      = true;
@@ -14491,7 +14688,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
                                              .base_E        = 0,
                                              .base_S        = 0,
-                                             .prompt_tokens = prompt_tokens,
+                                             .prompt_tokens = state_prompt_end,
                                              .produced      = 1};
         request.lifecycle = Lifecycle::Pending;
         return runtime::PrefillStepResult{
@@ -15061,7 +15258,8 @@ runtime::ExecutionTiming ProgramImplCore::resolve_non_speculative_pending(
     commit_generated_prefix_identity(
         sequence, base_ledger_frontier,
         std::span<const TokenId>(sequence.ledger).subspan(base_ledger_frontier, accepted_tokens),
-        prefix_execution_split_after);
+        prefix_execution_split_after,
+        request.pending.kind == PendingKind::Begin ? "pending-begin" : "pending-ordinary");
 
     switch (request.pending.kind) {
     case PendingKind::Begin:

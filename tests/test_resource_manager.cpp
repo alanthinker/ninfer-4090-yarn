@@ -137,6 +137,7 @@ struct FakeCheckpointSummary {
     CheckpointRef ref;
     CheckpointScope scope = CheckpointScope::Private;
     FakeShortlistKey shortlist_key;
+    std::optional<std::array<std::uint8_t, 32>> echo_key;
     ninfer::runtime::ReplicaResidency state_residency =
         ninfer::runtime::ReplicaResidency::DeviceOnly;
     FakeRequiredKV required_kv;
@@ -228,10 +229,17 @@ struct FakeRequestBasePlan {
     std::uint32_t shortlist_digest = 0;
     bool allow_shortlist           = true;
     bool isolated_feasible         = true;
+    std::array<std::uint8_t, 32> echo_key{};
+    bool allow_echo = false;
 
     [[nodiscard]] const RequestPlanSummary& summary() const noexcept { return value; }
 
     [[nodiscard]] const FakeContextCache& context_cache() const noexcept { return cache; }
+
+    [[nodiscard]] std::optional<std::array<std::uint8_t, 32>> echo_prefix_key() const {
+        if (!allow_echo) { return std::nullopt; }
+        return echo_key;
+    }
 
     [[nodiscard]] std::optional<FakeShortlistKey>
     prefix_shortlist_key(std::uint32_t frontier) const noexcept {

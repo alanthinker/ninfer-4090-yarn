@@ -79,6 +79,33 @@ struct RewriteCheckpointSpec {
     std::uint32_t frontier     = 0;
 };
 
+// Text-level identity of one prepared prompt for response-echo reuse. A conversation client
+// echoes the assistant fields this engine generated (content, reasoning, tool calls) back
+// byte-identically, but the follow-up prompt is re-tokenized: the stored endpoint state holds
+// the model's RAW generated tokens, which can differ from the re-tokenization of the echoed
+// text (the model may emit non-canonical merges, and the template normalizes the whitespace
+// around the thinking block on re-assembly).
+//
+// The spec digests the prompt in TEXT space at the response boundary: `prefix_digest` covers
+// the rendered text before the last assistant message (the shared history), `block_digest`
+// covers that assistant message's rendered block. A follow-up request matches the previous
+// round's endpoint when both digests agree, and resumes from the raw generated token state
+// instead of re-tokenizing the echoed response. `boundary_token` is the token frontier at the
+// end of that assistant message's BODY, before its closing serialization (`<|im_end|>\n`): an
+// echoed continuation splices the stored raw prefix with the incoming re-tokenized tail
+// beginning there, so the tail carries the closing serialization that the echoed block's
+// canonical render (render_echo_block) contains. Splicing at the end of the whole block instead
+// would drop that serialization and leave the echoed assistant turn unterminated.
+//
+// Present only for text-only continuation prompts whose ResponseReplay rewrite checkpoint
+// ends exactly where the last assistant message ends (the shape where the next generation
+// continues the turn the response belongs to).
+struct ResponseEchoSpec {
+    std::array<std::uint8_t, 32> prefix_digest{};
+    std::array<std::uint8_t, 32> block_digest{};
+    std::uint32_t boundary_token = 0;
+};
+
 struct PromptIdentity {
     bool reusable = true;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
@@ -86,6 +113,12 @@ struct PromptIdentity {
     // by an earlier turn. Prefill splits at these frontiers so resumed and root execution use the
     // same GDN decomposition; they are not capture requests by themselves.
     std::vector<std::uint32_t> rewrite_execution_frontiers;
+    // SHA-256 of the rendered prompt text before the ResponseReplay rewrite checkpoint (zero
+    // otherwise). Carried into the resident state and published with the session endpoint: it
+    // is the `prefix_digest` the next round's response echo compares against, so the endpoint
+    // stays echo-matchable no matter how the raw generated tokens re-tokenize.
+    std::array<std::uint8_t, 32> prompt_text_digest{};
+    std::optional<ResponseEchoSpec> response_echo;
 };
 
 inline constexpr std::size_t kPreparedSessionKeyCapacity = kMaximumContextCacheSessionKeyBytes;
@@ -148,6 +181,9 @@ struct PreparedPromptData {
     PreparedContextCache context_cache;
     std::shared_ptr<const frontend_internal::ToolCallOutputContract> tool_call_output;
     bool starts_in_reasoning = false;
+    // The round's output decoder preserved special-token bytes (tool requests); the response-
+    // echo re-parse must reproduce the same decoder or its fields disagree with the echo.
+    bool output_preserve_special = false;
     PrepareStats prepare;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
