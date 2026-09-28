@@ -803,7 +803,11 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         // The Host landing budget covers BOTH pools: every page that moves off Device (main or
         // backend) lands here, and one logical page is one Host page either way. The candidate's
         // own Host peak is absolute; the landing terms are the SHED above - what really moves.
-        .host_kv           = peak.host.kv_bytes + shed_device_kv * page_bytes,
+        // ③'s water line rides in the same function: the demand is what the arena must be able to
+        // hold, and the policy turns it into a gap with its own shortfall - it is never handed a
+        // net figure (see host_kv_demand).
+        .host_kv           = host_kv_demand(peak.host.kv_bytes, shed_device_kv * page_bytes,
+                                            program->host_headroom_bytes),
         .host_state        = peak.host.state_slots + shed_device_state,
         .catalog_rows      = need_rows,
     };
@@ -813,10 +817,16 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
     // Host, and its moving options only cover what is still Device-resident. Using the teardown
     // footprint here made the policy promise 410 MB of relief that the composed target then could
     // not deliver (proj_removed main=0), so the request stayed blocked.
+    // Which Device pools are SHORT decides which of a victim's own alternatives is its move
+    // option, so the answer has to be per pool, like the policy's own spill loop - the rule and
+    // the production case it comes from live in cachep::prefer_move_relief. These are the same
+    // gaps `cachep::plan` derives from `demand` below, state included.
+    const bool device_main_short = peak.device.main_kv_pages > tiers.device_kv_free();
+    const bool device_backend_short = peak.device.backend_kv_pages > tiers.device_backend_kv_free();
+    const bool device_state_short = peak.device.state_slots > tiers.device_state_free();
     struct MoveOption {
-        std::uint16_t choice       = 0;
-        std::uint64_t device_kv    = 0;  // relief per pool: pages ...
-        std::uint64_t device_state = 0;  // ... and state slots
+        std::uint16_t choice = 0;
+        cachep::MoveRelief relief;  // per pool: what the chosen alternative hands back
     };
     std::vector<MoveOption> move_options(options.victims.size());
     for (std::size_t victim_index = 0; victim_index < options.victims.size(); ++victim_index) {
@@ -825,17 +835,20 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
             pressure_successors(victim, residual, *protection, nullptr);
         for (const PressureDecision& successor : successors) {
             if (successor.evicts_continuation) { continue; }
-            const std::uint64_t relief_kv =
-                static_cast<std::uint64_t>(successor.effect.removed.device.main_kv_pages +
-                                           successor.effect.removed.device.backend_kv_pages);
-            const std::uint64_t relief_state =
-                static_cast<std::uint64_t>(successor.effect.removed.device.state_slots);
             // Choosing between ONE victim's own alternatives is the only place two units meet,
             // and there only as a preference: bytes weigh pages against slots the way the pools
             // are actually sized. The relief that gets REPORTED stays per-pool.
-            const MoveOption& current = move_options[victim_index];
-            if (relief_kv * page_bytes + relief_state * image_bytes <=
-                current.device_kv * page_bytes + current.device_state * image_bytes) {
+            const cachep::MoveRelief relief{
+                .main_pages =
+                    static_cast<std::uint64_t>(successor.effect.removed.device.main_kv_pages),
+                .backend_pages =
+                    static_cast<std::uint64_t>(successor.effect.removed.device.backend_kv_pages),
+                .state_slots =
+                    static_cast<std::uint64_t>(successor.effect.removed.device.state_slots),
+            };
+            if (!cachep::prefer_move_relief(relief, move_options[victim_index].relief,
+                                            device_main_short, device_backend_short,
+                                            device_state_short, page_bytes, image_bytes)) {
                 continue;
             }
             std::size_t index = victim.decisions.size();
@@ -850,10 +863,9 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
                 victim.decisions.push_back(successor);
                 index = victim.decisions.size() - 1U;
             }
-            MoveOption& chosen       = move_options[victim_index];
-            chosen.choice            = static_cast<std::uint16_t>(index + 1U);
-            chosen.device_kv         = relief_kv;
-            chosen.device_state      = relief_state;
+            MoveOption& chosen  = move_options[victim_index];
+            chosen.choice       = static_cast<std::uint16_t>(index + 1U);
+            chosen.relief       = relief;
         }
     }
 
@@ -919,7 +931,8 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
             evict_device_backend_kv = removed.device.backend_kv_pages;
             evict_device_state      = removed.device.state_slots;
         }
-        if (move.device_kv == 0 && move.device_state == 0 && droppable_kv == 0 &&
+        if (move.relief.main_pages == 0 && move.relief.backend_pages == 0 &&
+            move.relief.state_slots == 0 && droppable_kv == 0 &&
             droppable_state == 0 && need_rows == 0 && evict_device_kv == 0 &&
             evict_device_backend_kv == 0 && evict_device_state == 0 &&
             joint_device_kv == 0 && joint_device_backend_kv == 0) {
@@ -967,7 +980,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
             .device_kv    = attributed_device_kv, // what R1's SPILL takes off Device, per pool:
                                                   // union-honest, first-wins across victims
             .device_backend_kv = attributed_backend_kv,
-            .device_state = move.device_state,  // ... and the Device state slots it hands back
+            .device_state = move.relief.state_slots,  // ... and the state slots it hands back
             .evict_device_kv      = evict_device_kv,
             .evict_device_backend_kv = evict_device_backend_kv,
             .evict_device_state   = evict_device_state,
@@ -991,7 +1004,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         // candidate is the reference-leak signature (address_references stuck >1 on pages only
         // one live address space still maps), not a policy verdict - print the fields first.
         std::uint64_t ev_main = 0, ev_bkv = 0, ev_state = 0, hkv = 0, hst = 0;
-        std::uint64_t mv_main = 0, mv_state = 0, rows = 0;
+        std::uint64_t mv_main = 0, mv_bkv = 0, mv_state = 0, rows = 0;
         for (const cachep::Datum& datum : pool) {
             ev_main += datum.evict_device_kv;
             ev_bkv += datum.evict_device_backend_kv;
@@ -999,12 +1012,18 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
             hkv += datum.host_kv;
             hst += datum.host_state;
             mv_main += datum.device_kv;
+            mv_bkv += datum.device_backend_kv;
             mv_state += datum.device_state;
             rows += datum.catalog_row;
         }
+        // Both move pools are printed: the plan closes them separately, so a victim supply that
+        // covers one and not the other is the failure this line has to expose. mv_main alone let
+        // "all Main, no Backend" read as plenty of relief (2026-09-28: mv_main 9046 = the entire
+        // Device Main occupancy while Backend relief was 227 pages against a 636-page gap).
         std::fprintf(stderr,
                      "[cache] pool sums cand=%zu ev_main=%llu ev_bkv=%llu ev_state=%llu"
-                     " host_kv=%llu host_st=%llu mv_main=%llu mv_state=%llu rows=%llu\n",
+                     " host_kv=%llu host_st=%llu mv_main=%llu mv_bkv=%llu mv_state=%llu"
+                     " rows=%llu\n",
                      pool.size(),
                      static_cast<unsigned long long>(ev_main),
                      static_cast<unsigned long long>(ev_bkv),
@@ -1012,19 +1031,21 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
                      static_cast<unsigned long long>(hkv),
                      static_cast<unsigned long long>(hst),
                      static_cast<unsigned long long>(mv_main),
+                     static_cast<unsigned long long>(mv_bkv),
                      static_cast<unsigned long long>(mv_state),
                      static_cast<unsigned long long>(rows));
         for (std::size_t i = 0; i < pool.size() && i < 4; ++i) {
             const cachep::Datum& datum = pool[i];
             std::fprintf(stderr,
                          "[cache]   datum[%zu] id=%llu ev_main=%llu ev_state=%llu"
-                         " host_kv=%llu host_st=%llu mv=%llu\n",
+                         " host_kv=%llu host_st=%llu mv_main=%llu mv_bkv=%llu\n",
                          i, static_cast<unsigned long long>(datum.id),
                          static_cast<unsigned long long>(datum.evict_device_kv),
                          static_cast<unsigned long long>(datum.evict_device_state),
                          static_cast<unsigned long long>(datum.host_kv),
                          static_cast<unsigned long long>(datum.host_state),
-                         static_cast<unsigned long long>(datum.device_kv));
+                         static_cast<unsigned long long>(datum.device_kv),
+                         static_cast<unsigned long long>(datum.device_backend_kv));
         }
         std::fflush(stderr);
     }
@@ -1085,7 +1106,10 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
     };
     for (int round = 0; round < 3 && !plan.enqueue; ++round) {
         apply_plan();
-        const std::uint64_t want = host_kv(residual) + applied_landing_pages() * page_bytes;
+        // The iterative re-plan must carry the same water line, otherwise raising the demand
+        // below would wash it out after the first round - same function, same terms.
+        const std::uint64_t want = host_kv_demand(
+            host_kv(residual), applied_landing_pages() * page_bytes, program->host_headroom_bytes);
         if (want <= demand.host_kv) { break; }
         demand.host_kv = want;
         plan           = cachep::plan(demand, tiers, pool);

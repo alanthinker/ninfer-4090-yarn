@@ -13,6 +13,14 @@ add_executable(ninfer_cache_tier_policy_test test_cache_tier_policy.cpp)
 target_include_directories(ninfer_cache_tier_policy_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
 add_test(NAME ninfer_cache_tier_policy_test COMMAND ninfer_cache_tier_policy_test)
 
+# Physical peak-fit admission gate (the Device/Host KV relief decision, req#589/#671): a pure
+# function of (occupied, limits, peak, relief), so like the tier-policy test it takes no CUDA or
+# engine library - the "evict the least-important cold KV, never a reserved headroom" decision
+# must be verifiable without a GPU, an artifact, or a service.
+add_executable(ninfer_physical_peak_fit_test test_physical_peak_fit.cpp)
+target_include_directories(ninfer_physical_peak_fit_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME ninfer_physical_peak_fit_test COMMAND ninfer_physical_peak_fit_test)
+
 function(ninfer_add_test name)
   cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES" ${ARGN})
   add_executable(${name} ${arg_SOURCES})

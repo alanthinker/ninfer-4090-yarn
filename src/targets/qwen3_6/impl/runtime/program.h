@@ -760,6 +760,13 @@ public:
     WorkspaceArena work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::unique_ptr<HostKVArena> host_kv_arena;
+    // ③ host-KV headroom: keep the main Host arena with at least this many bytes free so a
+    // Device→Host demote always has room to land. Maintained DYNAMICALLY - after every d2h, if the
+    // free bytes dip below this water line the least-important Host replica (cold-first, never a
+    // protected page or a restore source) is evicted back up to it. No scratch pool and no extra
+    // arena: it rides entirely on the existing d2h + host-R2 eviction. Startup-configurable; the
+    // default holds ~2 GiB (≈6% of the 32 GiB Host KV budget).
+    std::size_t host_headroom_bytes = 2ULL * 1024 * 1024 * 1024;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
     std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
@@ -1300,6 +1307,13 @@ private:
     // Host state slots the ladder can free by evicting an idle owner's retained Host replica (2b):
     // the host half of the release ladder's deliverable capacity.
     [[nodiscard]] std::uint32_t host_slot_relief() const noexcept;
+    // Device main/backend KV pages the release ladder can demote to free Host space (R1), bounded
+    // by the Host landing available right now. The KV half of the relief the State dimensions
+    // always credited: a near-full KV pool resolves by evicting the least-important cold owner's
+    // KV (never a reserved headroom), so the peak gate must not read it as permanently infeasible
+    // (req#589/#671). Only the Device half is credited here; the both-full Host half is delivered
+    // by the scratch swap pool landing.
+    [[nodiscard]] detail::PeakFitRelief kv_relief() const noexcept;
     [[nodiscard]] bool
     protected_materialization_page(const MaterializationSourceProtection* protection,
                                    const KVAddressSpaceStore& addresses, std::uint32_t page_offset,
@@ -1450,6 +1464,15 @@ private:
     [[nodiscard]] bool release_state_capacity_step(const char* site = "unknown",
                                                    bool allow_retire = true,
                                                    bool* did_retire = nullptr);
+    // 缓存模块v2.md §三 R1 at RESERVE time, the KV half of the step above: one Device-KV
+    // reservation that does not fit is answered by moving the least-important cold owner's Device
+    // KV to Host - never by deleting anything (invariant 1) and never by giving up while finished
+    // conversations still hold the pool. The admission gate credits exactly this relief
+    // (`kv_relief`), so the credit has to be executable here: without the step the gate admits a
+    // restore the pool cannot take, the materialization misses on capacity, and the request parks
+    // to its queue deadline on an idle engine. Returns false when nothing more can be moved, and
+    // the caller's reservation then fails exactly as it did before.
+    [[nodiscard]] bool release_device_kv_capacity_step(const char* site);
     // Reserve a private StateImage destination, releasing capacity step by step until it succeeds.
     [[nodiscard]] std::optional<StateImageHandle>
     reserve_state_destination_with_release(bool allow_retire = true);

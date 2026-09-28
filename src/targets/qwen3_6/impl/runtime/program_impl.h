@@ -688,6 +688,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()).page_stride;
     text_kv_pages = std::make_unique<LogicalKVPageStore>(
         decoder->text_kv.page_pool(), logical_page_capacity(decoder->text_kv.page_pool()));
+    // §三 R1 at reserve time: the store answers a Device-KV reservation that does not fit by
+    // asking this Program to move the least-important cold owner's KV to Host - the same relief
+    // `physical_peak_fits` credited when it admitted the target.
+    text_kv_pages->set_device_kv_release(
+        [this]() { return release_device_kv_capacity_step("kv-reserve"); });
     text_kv_addresses = std::make_unique<KVAddressSpaceStore>(
         *text_kv_pages, decoder->text_kv.execution_tables(), address_capacity,
         decoder->text_kv.execution_tables().logical_page_capacity());
@@ -743,6 +748,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             plan_host_kv_page_layout(backend->page_pool().geometry()).page_stride;
         backend_kv_pages = std::make_unique<LogicalKVPageStore>(
             backend->page_pool(), logical_page_capacity(backend->page_pool()));
+        backend_kv_pages->set_device_kv_release(
+            [this]() { return release_device_kv_capacity_step("kv-reserve-backend"); });
         backend_kv_addresses = std::make_unique<KVAddressSpaceStore>(
             *backend_kv_pages, backend->execution_tables(), address_capacity,
             backend->execution_tables().logical_page_capacity());
@@ -5477,7 +5484,10 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
                 if (!pages.device_resident(addresses.logical_page(address, page))) { ++missing; }
             }
             if (source_reservation) {
-                pages.physical_pool().resize_reservation(reservation, missing);
+                // §三 R1 at reserve time, through the store's own hook: a Device-KV pool that
+                // cannot take the restore is answered by moving the least-important cold owner's
+                // Device KV to Host - exactly the relief the admission gate credited.
+                pages.reserve_device_pages(reservation, missing);
             }
             for (std::uint32_t page = 0; page < mapped; ++page) {
                 const LogicalKVPageHandle logical = addresses.logical_page(address, page);
@@ -8240,6 +8250,64 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool sh
     return true;
 }
 
+bool ProgramImplCore::release_device_kv_capacity_step(const char* site) {
+    if (!state_store || !text_kv_addresses || !text_kv_pages) { return false; }
+    // §2.2's one chain, least important first - the same order every other ladder walk uses, then
+    // the age fallback so an unpriced pool still moves its least recently used owner. Only an idle
+    // (Catalogued) owner is spillable, the in-flight admission's own sources stay excluded, and an
+    // owner holding protected state is left alone; the spill helper re-checks the page-level gates
+    // per page and DECLINES rather than latching, so one unmovable owner never kills the step.
+    std::uint32_t declined = 0;
+    const auto try_owner = [&](std::uint32_t index) -> bool {
+        if (index >= continuation_capacity) { return false; }
+        if (continuation_slots[index].role != ContinuationSlotRole::Catalogued) { return false; }
+        if (!continuation_states[index].kv) { return false; }
+        if (std::find(retire_exclude_.begin(), retire_exclude_.end(), index) !=
+            retire_exclude_.end()) {
+            return false;
+        }
+        if (owner_holds_release_protected_state(index)) { return false; }
+        if (materialization_pins(index, continuation_slots[index].generation)) { return false; }
+        if (!spill_owner_device_kv_to_host(index)) { ++declined; return false; }
+        std::fprintf(stderr, "[ladder] spill for Device-KV capacity site=%s slot=%u\n", site, index);
+        std::fflush(stderr);
+        return true;
+    };
+    for (const runtime::RetirePreferenceEntry& entry : retire_preference_) {
+        if (entry.shared_prefix) { continue; } // shared owners are not this step's to move
+        if (try_owner(entry.slot)) { return true; }
+    }
+    struct AgeCandidate {
+        std::uint64_t age;
+        std::uint32_t slot;
+    };
+    std::vector<AgeCandidate> aged;
+    aged.reserve(continuation_capacity);
+    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
+        if (continuation_slots[index].role != ContinuationSlotRole::Catalogued) { continue; }
+        const SequenceState& sequence = continuation_states[index];
+        if (!sequence.kv) { continue; }
+        aged.push_back(AgeCandidate{
+            .age  = state_store->last_touched(sequence.state.read),
+            .slot = index,
+        });
+    }
+    std::sort(aged.begin(), aged.end(), [](const AgeCandidate& left, const AgeCandidate& right) {
+        return left.age < right.age;
+    });
+    for (const AgeCandidate& candidate : aged) {
+        if (try_owner(candidate.slot)) { return true; }
+    }
+    // Nothing more can be moved: the reservation that asked for this will fail, the transaction
+    // rolls back, and the request waits (R0). One line says so, because "the pool is full" and
+    // "every owner declined" are different failures (§八's log-reading rule).
+    std::fprintf(stderr, "[ladder] Device-KV capacity exhausted site=%s declined=%u\n", site,
+                 declined);
+    std::fflush(stderr);
+    return false;
+}
+
+
 void ProgramImplCore::prepare_victim_teardown(std::uint32_t index) {
     if (index >= continuation_capacity || !state_store) { return; }
     const SequenceState& sequence = continuation_states[index];
@@ -9159,40 +9227,53 @@ std::pair<std::uint32_t, std::uint32_t> ProgramImplCore::attribute_pressure_move
     return {main, backend};
 }
 
+detail::PeakFitRelief ProgramImplCore::kv_relief() const noexcept {
+    // The KV half of the release-ladder relief the State dimensions always credited (device-state
+    // / host-state). A near-full KV pool is resolved by EVICTING the least-important cold owner's
+    // KV - R1 demote Device to the free Host space, cascading into an R2 drop of a cold Host
+    // replica when Host is itself full - never by a reserved headroom. The Device half is bounded
+    // by the Host landing available right now (free Host bytes / the page stride); when both pools
+    // run full the scratch swap pool (a small dedicated landing) extends it so the demote always
+    // has somewhere to land. The Host half is left to that scratch landing: reclaiming a full Host
+    // pool is the both-full case, not a Host-KV relief this gate should pre-credit.
+    detail::PeakFitRelief out;
+    if (host_kv_arena == nullptr) { return out; }
+    const std::size_t device_main_used =
+        text_kv_pages != nullptr
+            ? static_cast<std::size_t>(text_kv_pages->physical_pool().allocated_pages()) +
+              text_kv_pages->physical_pool().reserved_pages()
+            : 0;
+    const std::size_t device_backend_used =
+        backend_kv_pages != nullptr
+            ? static_cast<std::size_t>(backend_kv_pages->physical_pool().allocated_pages()) +
+              backend_kv_pages->physical_pool().reserved_pages()
+            : 0;
+    // The landing allocation (main-KV demotes claim the free Host landing first, backend-KV demotes
+    // claim the remainder, both bounded by the Device KV in use) lives in the pure, CPU-tested
+    // kv_landing_relief; the Program only supplies its store/arena inputs here.
+    const auto landing =
+        detail::kv_landing_relief(host_kv_arena->free_bytes(), text_host_kv_page_stride,
+                                  backend_host_kv_page_stride, device_main_used,
+                                  device_backend_used);
+    out.device_main_kv_pages    = landing.main_kv_pages;
+    out.device_backend_kv_pages = landing.backend_kv_pages;
+    return out;
+}
+
 bool ProgramImplCore::physical_peak_fits(detail::PhysicalResources peak) const noexcept {
     const detail::PhysicalResources occupied = physical_occupancy();
     const detail::PhysicalResources limits   = admission_capacity();
-    const auto fits_u32 = [](std::uint32_t used, std::uint32_t added, std::uint32_t capacity) {
-        return added <= capacity && used <= capacity - added;
-    };
-    const auto fits_size = [](std::size_t used, std::size_t added, std::size_t capacity) {
-        return added <= capacity && used <= capacity - added;
-    };
-    // Device state slots the release ladder can free count against `used`, not against a lower
-    // capacity: the runtime ladder (release_one_device_state_slot) backs this credit, and its
-    // final step (degrade the least-important idle owner's HostOnly checkpoint, R2) makes the
-    // reservation succeed regardless - unless nothing can be degraded either, in which case the
-    // reservation fails and the request waits (缓存模块v2.md §三 R0).
-    const std::uint32_t state_relief = state_slot_relief(0);
-    const std::uint32_t state_used   = state_relief > occupied.device.state_slots
-                                           ? 0
-                                           : occupied.device.state_slots - state_relief;
-    // The Host half of the same inequality: a pinned-full Host pool must not read as permanently
-    // infeasible, because 2b can drop an idle owner's Host replica (2026-09-21: a private capture
-    // whose HostSnapshot needed one slot was skipped with 'pressure-baseline-infeasible' at host
-    // 320/320, so the newest request published no anchor and every later sibling missed).
-    const std::uint32_t host_relief = host_slot_relief();
-    const std::uint32_t host_state_used =
-        host_relief > occupied.host.state_slots ? 0 : occupied.host.state_slots - host_relief;
-    return fits_u32(occupied.device.active_lanes, peak.device.active_lanes,
-                    limits.device.active_lanes) &&
-           fits_u32(state_used, peak.device.state_slots, limits.device.state_slots) &&
-           fits_u32(occupied.device.main_kv_pages, peak.device.main_kv_pages,
-                    limits.device.main_kv_pages) &&
-           fits_u32(occupied.device.backend_kv_pages, peak.device.backend_kv_pages,
-                    limits.device.backend_kv_pages) &&
-           fits_u32(host_state_used, peak.host.state_slots, limits.host.state_slots) &&
-           fits_size(occupied.host.kv_bytes, peak.host.kv_bytes, limits.host.kv_bytes);
+    // The State dimensions credit their release-ladder relief (device-state via the demote ladder
+    // and its R2 HostOnly degrade; host-state via the idle-replica eviction). The KV dimensions now
+    // credit theirs too (kv_relief): a near-full KV pool is resolved by EVICTING the
+    // least-important cold owner's KV, not by a reserved buffer. This stops a ~full Device KV pool
+    // from reading as "permanently infeasible" and abandoning the tail restore for a shallow long
+    // anchor (2026-09-28 req#589/#671: main_kv used=9793 cap=10284, tail add=515 -> 24 pages
+    // short; the tail was offered but the gate rejected it and the engine re-derived ~14.7K tokens).
+    detail::PeakFitRelief relief = kv_relief();
+    relief.device_state_slots = state_slot_relief(0);
+    relief.host_state_slots   = host_slot_relief();
+    return detail::physical_peak_fits_core(occupied, limits, peak, relief);
 }
 
 StateImageHandle

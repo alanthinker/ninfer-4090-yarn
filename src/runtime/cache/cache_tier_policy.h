@@ -187,6 +187,69 @@ inline void rank_least_important(std::vector<const Datum*>& pool) {
 
 } // namespace detail
 
+// What a pool is short of: `want - have`, floored at zero. `Demand` carries ABSOLUTE peaks (never
+// figures already net of free) - feeding a net figure here would subtract the free bytes twice -
+// and every gap the plan sets out to close is this one arithmetic, so it is a shared function
+// rather than each caller's own subtraction.
+[[nodiscard]] inline std::uint64_t shortfall(std::uint64_t want, std::uint64_t have) noexcept {
+    return want > have ? want - have : 0;
+}
+
+// What ONE victim's move alternative hands back, told apart per pool. The planner picks a single
+// alternative per victim and then reports THAT alternative's own per-pool walk into the pool, and
+// the spill loop above accumulates each pool on its own - so this choice decides how much relief
+// each Device-KV axis is credited with.
+struct MoveRelief {
+    std::uint64_t main_pages    = 0;
+    std::uint64_t backend_pages = 0;
+    std::uint64_t state_slots   = 0;
+};
+
+// Does this alternative hand back anything for every Device-KV pool that is currently short?
+[[nodiscard]] inline bool move_relief_covers(const MoveRelief& relief, bool main_short,
+                                             bool backend_short, bool state_short) {
+    return (!main_short || relief.main_pages != 0) &&
+           (!backend_short || relief.backend_pages != 0) &&
+           (!state_short || relief.state_slots != 0);
+}
+
+// Which of one victim's own alternatives is that victim's move option.
+//
+// A move answers the pools SEPARATELY: an alternative that moves only Main contributes nothing to
+// a Backend gap however many pages it moves (and a KV-only alternative contributes nothing to a
+// Device-state gap). Ranking the alternatives by one summed score therefore drops whole axes
+// whenever the pools are mirror images of equal size - "move all Main" and "move all Backend" tie
+// on pages, the first of the two wins, and every victim then reports its whole Main estate and
+// zero Backend. The plan has to close every axis it set out to close, so it enqueues forever:
+// `device-not-closable` against a Backend gap no victim can ever answer, while 88% of the Device
+// pool sits idle as finished conversations' cache (2026-09-28 production: pool sums mv_main=9046 =
+// the entire Device Main occupancy, Backend relief 227 pages against a 636-page gap, request parked
+// to its queue deadline four times in a row).
+//
+// So: prefer the alternative that answers EVERY short Device pool this victim can reach - the
+// "residual" alternative does exactly that, since it is built from the candidate's own deficit -
+// and use the summed relief only to rank the alternatives equal on that. A victim that can only
+// reach some of the pools has no covering alternative, keeps its largest move, and is simply not
+// the victim that closes the rest.
+[[nodiscard]] inline bool prefer_move_relief(const MoveRelief& candidate,
+                                             const MoveRelief& incumbent, bool main_short,
+                                             bool backend_short, bool state_short,
+                                             std::uint64_t page_bytes,
+                                             std::uint64_t image_bytes) {
+    const bool candidate_covers =
+        move_relief_covers(candidate, main_short, backend_short, state_short);
+    const bool incumbent_covers =
+        move_relief_covers(incumbent, main_short, backend_short, state_short);
+    if (candidate_covers != incumbent_covers) { return candidate_covers; }
+    const std::uint64_t candidate_weight =
+        (candidate.main_pages + candidate.backend_pages) * page_bytes +
+        candidate.state_slots * image_bytes;
+    const std::uint64_t incumbent_weight =
+        (incumbent.main_pages + incumbent.backend_pages) * page_bytes +
+        incumbent.state_slots * image_bytes;
+    return candidate_weight > incumbent_weight;
+}
+
 // Decide how to make room for `need` given `occupancy` and the current cache pool.
 //
 // The order is fixed by the rules, not by cost: R2 before R1, because Host has to have somewhere
@@ -202,9 +265,6 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
                  std::span<const Datum> pool) {
     Plan out;
 
-    const auto shortfall = [](std::uint64_t want, std::uint64_t have) -> std::uint64_t {
-        return want > have ? want - have : 0;
-    };
     // `need.host_*` already carries what a Device spill will consume on Host.
     const std::uint64_t device_kv_gap =
         shortfall(need.device_kv, occupancy.device_kv_free());
@@ -462,6 +522,15 @@ inline std::string describe(const Plan& outcome, const Demand& need,
         " | gaps dkv=" +
         std::to_string(need.device_kv > occupancy.device_kv_free()
                            ? need.device_kv - occupancy.device_kv_free()
+                           : 0) +
+        // Both Device-KV pools are separate resources and the plan closes them separately, so
+        // both gaps belong on the line: printing only the main one pointed every reader at the
+        // axis that was trivially closable while the unprinted backend gap was the one that
+        // enqueued the plan (2026-09-28 production: `gaps dkv=640` printed, backend gap 636 did
+        // not, and the enqueue was backend's).
+        " dbkv=" +
+        std::to_string(need.device_backend_kv > occupancy.device_backend_kv_free()
+                           ? need.device_backend_kv - occupancy.device_backend_kv_free()
                            : 0) +
         " dstate=" +
         std::to_string(need.device_state > occupancy.device_state_free()

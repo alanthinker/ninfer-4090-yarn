@@ -1,12 +1,14 @@
 #pragma once
 
 #include "core/paged_kv_cache.h"
+#include "targets/qwen3_6/impl/runtime/resource_projection.h"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -261,6 +263,31 @@ public:
     [[nodiscard]] DeviceKVPagePool& physical_pool() noexcept { return *physical_; }
 
     [[nodiscard]] const DeviceKVPagePool& physical_pool() const noexcept { return *physical_; }
+
+    // 缓存模块v2.md §三 R1 at RESERVE time. `release` is the owner's ladder step: it frees Device
+    // KV by moving the least-important cold owner's pages to Host, and reports whether it moved
+    // anything. Every reservation this store makes goes through `reserve_device_pages`, so a pool
+    // that is full of finished conversations is answered by MOVING their KV - never by failing the
+    // reservation while Host has room for the landing. With no hook installed the store behaves
+    // exactly as before: the pool reports the shortfall and the reservation raises its BAD_ALLOC.
+    void set_device_kv_release(std::function<bool()> release) {
+        device_kv_release_ = std::move(release);
+    }
+
+    // Reserve `wanted` Device pages, giving the owner's release step a chance after every failed
+    // attempt. The retry policy itself - retry only while the release made the pool smaller, stop
+    // when nothing more can be moved - is `detail::reserve_with_release_attempts`, so the rule is
+    // testable without a Device arena. The pool's BAD_ALLOC stands when the reservation still does
+    // not fit, which is the honest answer and the caller's R0 wait.
+    void reserve_device_pages(DeviceKVPageReservation& reservation, std::uint32_t wanted) {
+        const auto fits     = [&]() { return physical_->can_resize_reservation(reservation, wanted); };
+        const auto holdings = [&]() {
+            return physical_->allocated_pages() + physical_->reserved_pages();
+        };
+        const auto release = [&]() { return device_kv_release_ && device_kv_release_(); };
+        (void)detail::reserve_with_release_attempts(fits, holdings, release);
+        physical_->resize_reservation(reservation, wanted);
+    }
 
     [[nodiscard]] std::uint32_t capacity() const noexcept {
         return static_cast<std::uint32_t>(pages_.size());
@@ -824,6 +851,9 @@ private:
     }
 
     DeviceKVPagePool* physical_ = nullptr;
+
+    // The owner's Device-KV release step (see set_device_kv_release); empty = no owner hooked.
+    std::function<bool()> device_kv_release_;
     std::vector<Page> pages_;
     std::vector<std::uint32_t> free_;
     std::vector<DeviceKVPageLease> materialization_scratch_;
@@ -924,8 +954,7 @@ public:
         if (required > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("KV activation reservation overflow");
         }
-        pages_->physical_pool().resize_reservation(reservation,
-                                                   static_cast<std::uint32_t>(required));
+        pages_->reserve_device_pages(reservation, static_cast<std::uint32_t>(required));
         KVExecutionRowLease row = tables_->acquire(execution_row);
         return KVActivationReservation(*this, handle, entitlement, activation_frontier,
                                        std::move(reservation), std::move(row));
@@ -1055,8 +1084,7 @@ public:
         }
 
         DeviceKVPageReservation reservation = pages_->physical_pool().make_empty_reservation();
-        pages_->physical_pool().resize_reservation(
-            reservation, staged_tail_release ? 1U : entitlement - full_pages);
+        pages_->reserve_device_pages(reservation, staged_tail_release ? 1U : entitlement - full_pages);
         KVExecutionRowLease row = tables_->acquire(execution_row);
         std::optional<LogicalKVPageHandle> tail_destination;
         if (tail_columns != 0) {
@@ -1128,7 +1156,7 @@ public:
         }
         const std::uint32_t required_pages = pages_for_tokens(fork.frontier_);
         const std::uint32_t growth         = fork.requested_entitlement_ - required_pages;
-        pages_->physical_pool().resize_reservation(fork.page_reservation_, growth);
+        pages_->reserve_device_pages(fork.page_reservation_, growth);
     }
 
     void commit_prefix_fork(KVPrefixForkReservation&& fork, cudaStream_t stream = nullptr) {
@@ -1286,7 +1314,7 @@ public:
 
         DeviceKVPageReservation tail_reservation = pages_->physical_pool().make_empty_reservation();
         if (shape.copied_pages() != 0) {
-            pages_->physical_pool().resize_reservation(tail_reservation, shape.copied_pages());
+            pages_->reserve_device_pages(tail_reservation, shape.copied_pages());
         }
         std::optional<LogicalKVPageHandle> tail_destination;
         try {
@@ -1425,8 +1453,7 @@ public:
         if (entitlement < address.page_count || entitlement > page_capacity_) {
             throw std::invalid_argument("KV entitlement is smaller than mapped pages");
         }
-        pages_->physical_pool().resize_reservation(address.reservation,
-                                                   entitlement - address.page_count);
+        pages_->reserve_device_pages(address.reservation, entitlement - address.page_count);
     }
 
     void release_growth_entitlement(KVAddressSpaceHandle handle) {

@@ -639,9 +639,124 @@ void case_device_state_gap_closes_by_moving_a_state_that_can_move() {
     check(action_count(outcome, Action::DropFromHost) == 0, "and not by releasing the owner");
 }
 
+// req-589 (2026-09-28): a returning session keeps its tail KV on Host and its endpoint mirror,
+// but to run it must restore that prefix onto a Device pool already full of three concurrent
+// full-context sessions. The only way to free Device pages is to demote another session's Device KV
+// onto a Host pool that is itself full with nothing droppable - so no legal move closes the gap.
+// The policy must WAIT (R0), never apply a partial plan that demotes or deletes cache it cannot
+// actually place; the wiring layer then serves the request by re-deriving from the deepest
+// Device-restorable long anchor instead of blocking on a restore that will not fit.
+//
+// Guard: a change that "frees" Device by overwriting a full Host (or drops a Host estate that has
+// nowhere to receive the demotion) re-opens "deleted a pile of cache that nobody used" exactly
+// here, on the two-tier-saturated shape that produced the 96.8s req-589.
+void case_two_tier_saturation_restores_by_r0_not_partial_delete() {
+    std::printf("case_two_tier_saturation_restores_by_r0_not_partial_delete\n");
+    const std::vector<Datum> pool{
+        // the only idle estate: 50 Device pages and NO Host estate, so R2 has nothing of it to
+        // drop to make room, and Host is full so a Device demotion has nowhere to land.
+        {.id = 1, .device_kv = 50, .host_kv = 0, .importance = 10},
+    };
+    // Device full (free 0) and Host full (free 0): the restore needs 50 Device pages, and staging
+    // the demotion needs 50 Host bytes this pool cannot provide.
+    const Plan outcome =
+        decide(Demand{.device_kv = 50, .host_kv = 50}, occupancy(100, 100, 1000, 1000), pool);
+
+    check(outcome.enqueue, "neither tier can close the gap -> the request waits (R0)");
+    check(outcome.reason == EnqueueReason::HostNotClosable,
+          "the binding axis is Host (no room to receive the Device demotion)");
+    check(outcome.steps.empty(),
+          "no partial plan: Device must not be freed by overwriting a full Host or dropping estate");
+}
+
+// Which of ONE victim's own move alternatives the planner picks. The pool reports the CHOSEN
+// alternative's own per-pool relief, so an alternative that moves only Main credits Main and
+// NOTHING to Backend - however many pages it moves.
+//
+// The bug this pins (2026-09-28 production: one conversation's request parked to its queue
+// deadline four times in a row, cancelled by the client at 5 minutes each time): the alternatives
+// were ranked by their SUMMED page count. Main and Backend are mirror pools of equal size per
+// owner, so "move all Main" and "move all Backend" tie on pages and the first one always won -
+// every victim reported its whole Main estate and zero Backend, the 636-page Backend gap could not
+// be closed by anybody, `plan()` enqueued `device-not-closable` forever, and free Device pages
+// never moved off 1238 while 88% of the pool sat there as finished conversations' cache. The pool
+// sums line showed it only as `mv_main=9046` - exactly the entire Device Main occupancy.
+void case_move_alternative_answers_every_short_pool() {
+    std::printf("case_move_alternative_answers_every_short_pool\n");
+    using ninfer::runtime::cache::MoveRelief;
+    using ninfer::runtime::cache::prefer_move_relief;
+    const std::uint64_t page_bytes  = 1U << 20;
+    const std::uint64_t image_bytes = 1U << 16;
+    const auto prefer = [&](const MoveRelief& candidate, const MoveRelief& incumbent,
+                            bool main_short, bool backend_short, bool state_short = false) {
+        return prefer_move_relief(candidate, incumbent, main_short, backend_short, state_short,
+                                  page_bytes, image_bytes);
+    };
+
+    // Both pools short, mirror owner (a 242K-token conversation: 3785 pages on each side).
+    // "move all Main" (3785) beats "move both, exactly the gap" (640 + 636) on summed pages - and
+    // that is precisely the alternative that leaves Backend at zero.
+    const MoveRelief full_main{.main_pages = 3785, .backend_pages = 0};
+    const MoveRelief both_axes{.main_pages = 640, .backend_pages = 636};
+    check(!prefer(full_main, both_axes, true, true),
+          "a Main-only alternative must not win while Backend is short too");
+    check(prefer(both_axes, full_main, true, true),
+          "the alternative that answers BOTH short pools is the victim's move option");
+    check(prefer(both_axes, MoveRelief{}, true, true),
+          "the first covering alternative becomes the incumbent");
+
+    // Same owner, only Main short: Backend relief is not required, so the largest Main move wins -
+    // the per-pool rule must not shrink a move the plan can use, and must not add pages nobody
+    // asked for (a Backend-only alternative covers nothing and stays out).
+    const MoveRelief full_backend{.main_pages = 0, .backend_pages = 3785};
+    check(prefer(full_main, MoveRelief{}, true, false), "Main-only wins when only Main is short");
+    check(!prefer(full_backend, full_main, true, false),
+          "a Backend-only alternative cannot answer a Main-only gap");
+    check(!prefer(MoveRelief{}, full_main, true, false),
+          "a no-op alternative never replaces a real move");
+
+    // Only Backend short: the mirror case, and the one the old rule lost.
+    check(prefer(full_backend, MoveRelief{}, false, true),
+          "Backend-only wins when only Backend is short");
+    check(!prefer(full_main, full_backend, false, true),
+          "a Main-only alternative cannot answer a Backend-only gap");
+
+    // A victim that can reach only ONE of the short pools has no covering alternative at all: it
+    // keeps its largest move and is simply not the victim that closes the other pool.
+    const MoveRelief main_only_small{.main_pages = 224, .backend_pages = 0};
+    const MoveRelief main_only_large{.main_pages = 2798, .backend_pages = 0};
+    check(prefer(main_only_large, main_only_small, true, true),
+          "with no covering alternative, the largest move still wins");
+    check(!prefer(main_only_small, main_only_large, true, true),
+          "and a smaller one does not replace it");
+
+    // State stays a pool of its own with its own weight: a move that hands back state slots and no
+    // KV pages is still a move when neither KV pool is short.
+    const MoveRelief state_only{.state_slots = 1};
+    check(prefer(state_only, MoveRelief{}, false, false),
+          "a state-only move is chosen when no KV pool is short");
+
+    // All three Device pools short (the production shape): a KV-only alternative answers two of the
+    // three axes and must not win - the state gap would then have no reporter at all, which is the
+    // same stall one pool over.
+    const MoveRelief kv_both_axes{.main_pages = 640, .backend_pages = 636, .state_slots = 0};
+    const MoveRelief residual{.main_pages = 641, .backend_pages = 637, .state_slots = 1};
+    check(prefer(residual, kv_both_axes, true, true, true),
+          "with Device state short too, the alternative that answers all three axes wins");
+    check(!prefer(kv_both_axes, residual, true, true, true),
+          "a KV-only alternative must not displace the one that also hands back state");
+    check(!prefer(state_only, residual, true, true, true),
+          "and a state-only alternative cannot answer the KV pools either");
+    // State short on its own: state-only is a covering alternative, so it is chosen on the pool
+    // that is actually short rather than on the summed weight of KV pages nobody asked for.
+    check(prefer(state_only, kv_both_axes, false, false, true),
+          "with only Device state short, the state move covers and the KV alternative does not");
+}
+
 }  // namespace
 
 int main() {
+    case_move_alternative_answers_every_short_pool();
     case_backend_pool_closes_independently();
     case_shell_group_release_closes_device_gap();
     case_shell_pass_defers_to_move();
@@ -660,6 +775,7 @@ int main() {
     case_state_pressure_with_no_state_to_move_enqueues();
     case_device_state_gap_is_never_closed_by_evicting_a_state_it_cannot_move();
     case_device_state_gap_closes_by_moving_a_state_that_can_move();
+    case_two_tier_saturation_restores_by_r0_not_partial_delete();
     case_nothing_is_dropped_for_a_gap_it_cannot_close();
     case_deletions_stop_at_the_gap();
     case_release_never_gets_a_second_step();
