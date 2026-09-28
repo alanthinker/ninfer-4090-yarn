@@ -251,6 +251,23 @@ case "$MODE" in
         { echo "FAIL: prod mode but service max_model_len=32768 (that is the rig) - use --rig"; exit 1; } ;;
 esac
 echo "(service max_model_len=$model_len matches mode $MODE)"
+# Entry-state settle. `kRecencyHorizonSeconds = 60` decides whether an instance's WARM-START
+# residue (fair_share_small's smoke requests) is still PROTECTED in the victim order, and
+# protected is `2^62 + score` - it outranks every unprotected owner regardless of score. A pool
+# whose owners are ALL under 60 s old therefore ranks purely by score, and the cheapest record
+# there is the test's OWN freshly built conversation: state_index's 2 380-token conversations
+# score 10.4e9 against 49.8e9 (warm sessions, hits≈7) and 62.2e9 (the fill), so each new
+# conversation's capture degraded the previous one (measured 2026-09-28: warm start lost 0-3 of
+# the4, battery flapped red/green on identical preconditions; the COLD start - fill sessions
+# aged past 60 s, hence unprotected, hence the first to yield - went 4/4 and fully green). One
+# minute of wall clock ages the residue out of the horizon so it becomes what production would
+# hand over first, without touching the test, the thresholds, or the pool. NINFER_SETTLE_SECONDS=0
+# skips it (diagnosis runs that need the residue protected).
+SETTLE_SECONDS=${NINFER_SETTLE_SECONDS:-60}
+if [ "$SETTLE_SECONDS" -gt 0 ]; then
+    echo "== settle ${SETTLE_SECONDS}s (age the entry state past the 60 s recency horizon) =="
+    sleep "$SETTLE_SECONDS"
+fi
 # This battery's own window: occupancy peaks and serve-log counters are scoped to it, so a
 # FULL reached by an earlier run can never satisfy today's gate, and churn counts are fresh.
 BATTERY_START_MS=$(( $(python3 -c 'import time; print(int(time.time() * 1000))') - 2000 ))

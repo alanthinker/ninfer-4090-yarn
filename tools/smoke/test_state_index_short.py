@@ -3,16 +3,25 @@
 
 Each conversation is a unique prompt with one request. After all of them complete we wait (the user
 steps away) and re-query the first few: those should come back as cache hits from the retained
-checkpoints.
+checkpoints. Note the case is a FRESH, never-re-read conversation - the cheapest shape a full pool
+can hold (§2.2 evidence floor) - so it only survives the battery's saturation when the entry state
+has aged past the 60 s recency horizon and the stale owners yield first; `full_battery.sh` settles
+for `NINFER_SETTLE_SECONDS` (default 60) for exactly that reason. Measured 2026-09-28: without the
+settle every owner is protected, the order degrades to pure score, and each new conversation's
+capture degraded the previous one (0-3 of the4 lost, battery flapped on identical preconditions);
+with it, 4/4 on every run.
 
 Verdict under a SATURATED pool (2026-09-23): an all-hit expectation is not always satisfiable by
 design. With the pool at its ceiling, the engine may legitimately (a) skip a capture it cannot place
-(`capture: skip frontier=... reason=static-infeasible|capacity-*`) or (b) evict the oldest idle
-conversation to make room (`[evict] ... session=<digest>`). Both are designed degradation, but a
-state that disappears with NO such line in the serve log is a real retention bug. So when
-NINFER_SERVICE_LOG/NINFER_SERVE_LOG is set, each miss must be explained by one of those two lines
-(same conversation digest, or a captured frontier within a few tokens of that conversation's prompt
-length); unexplained misses, or more than half the verifications missing, still fail.
+(`capture: skip frontier=... reason=static-infeasible|capacity-*`), (b) evict the oldest idle
+conversation to make room (`[evict] ... session=<digest>`), or (c) R2-degrade the checkpoint this
+conversation would restore from, because its owner is the cheapest record in a full pool
+(`[ladder] degrade anchor|endpoint slot=... frontier=...`, 上下文缓存物理存储与恢复.md §7 诊断与日志).
+All three are designed degradation, but a state that disappears with NO such line in the serve log
+is a real retention bug. So when NINFER_SERVICE_LOG/NINFER_SERVE_LOG is set, each miss must be
+explained by one of those lines (same conversation digest, or a captured/degraded frontier within a
+few tokens of that conversation's prompt length); unexplained misses, or more than half the
+verifications missing, still fail.
 
 Usage:
     python3 test_state_index_short.py --base-url http://127.0.0.1:8123/v1
@@ -57,6 +66,17 @@ def explain_miss(window: str, prompt_tokens: int, digest: str) -> list:
         skipped = re.search(r"capture: skip frontier=(\d+) reason=([\w-]+)", line)
         if skipped and abs(int(skipped.group(1)) - frontier) <= 16:
             reasons.append(f"capture skipped ({skipped.group(2)}) at frontier {skipped.group(1)}")
+        # R2 dropped the very checkpoint this follow-up would restore from: the owner was the
+        # cheapest record in a full pool, so the ladder degraded its shallowest/turn-closure
+        # state and left it with only a frontier the client's echo cannot reach. The degraded
+        # frontier is the same one the capture above would have produced (prompt - 5), so it is
+        # attributed by the same tolerance. (2026-09-28 rig: conv0/conv1 missed with no [evict]
+        # and no capture-skip, only `[ladder] degrade endpoint slot=10 frontier=2375` against a
+        # 2380-token prompt - designed degradation the test called a retention bug.)
+        degraded = re.search(r"\[ladder\] degrade (anchor|endpoint) slot=\d+ frontier=(\d+)", line)
+        if degraded and abs(int(degraded.group(2)) - frontier) <= 16:
+            reasons.append(f"state degraded for capacity ([ladder] degrade {degraded.group(1)}) "
+                           f"at frontier {degraded.group(2)}")
         if digest and line.startswith("[evict]") and f"session={digest}" in line:
             reasons.append("session evicted for capacity ([evict])")
     return sorted(set(reasons))
