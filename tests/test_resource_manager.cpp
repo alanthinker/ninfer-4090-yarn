@@ -689,10 +689,16 @@ public:
     }
 
     // The manager hands its victim score order over before any call that may reach the ladder.
-    void set_retire_preference(std::span<const ninfer::runtime::RetirePreferenceEntry> order) {
+    // `exclude_slots` are the admission's own sources - off limits to every R2 walk while this
+    // order stands (the Program keeps them for both the score walk and the oldest-touched
+    // fallback; the fake keeps them so a test can read the hand-off back).
+    void set_retire_preference(std::span<const ninfer::runtime::RetirePreferenceEntry> order,
+                               std::span<const std::uint32_t> exclude_slots = {}) {
         retire_preference.assign(order.begin(), order.end());
+        retire_excluded.assign(exclude_slots.begin(), exclude_slots.end());
     }
     std::vector<ninfer::runtime::RetirePreferenceEntry> retire_preference;
+    std::vector<std::uint32_t> retire_excluded;
 
     [[nodiscard]] std::optional<FakeAdmissionCandidate>
     inspect_admission(const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base, LaneId,
@@ -3614,6 +3620,54 @@ void test_manager_hands_the_retire_preference_to_the_program() {
             "capture reservation did not hand a retire preference to the Program");
 }
 
+// §2.1 / §三 R0: what an admission works on is working set, not cache. The order handed to the
+// ladder at RESERVE time must therefore leave the choice's own private source out of the victim
+// set - the reservation is about to restore FROM that owner, so a ladder that picked it would
+// delete the very checkpoint the plan priced. Measured on the rig (fork_hit 2026-09-28): the
+// conversation's own grow ran `[cache] R0 relief` -> `[ladder] degrade anchor slot=33 frontier=733`,
+// and the fork three requests later had nothing below its fork point (`fork@4 cached=0`, root
+// re-prefill). Excluding the ONE source is not a way to empty the domain: every other owner stays
+// in the order (protection is ordering; only the in-flight source is excluded).
+void test_reserve_order_excludes_its_own_private_source() {
+    FakeManager manager = make_manager(1, 4);
+    FakeProgram program;
+    const ActiveRequest first = start_active(
+        manager, program, 601,
+        make_base(601, FakeCacheSessionKey{601}, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, first);
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "the first session did not take catalog slot 0");
+    const ActiveRequest other = start_active(
+        manager, program, 602,
+        make_base(602, FakeCacheSessionKey{602}, RetentionClass::LiveSession), 2);
+    (void)finish_active(manager, program, other);
+
+    auto reuse = manager.inspect(program, FakePreparedPrompt{601}, make_base(601), 3);
+    require(reuse.readiness == Readiness::Ready && reuse.choice,
+            "the catalogued session was not reusable");
+    require(reuse.choice->summary().reusable_prompt_tokens > 0,
+            "the reuse choice carries no reusable prefix");
+
+    program.retire_preference.clear();
+    (void)manager.reserve_materialization(program, std::move(*reuse.choice),
+                                          FakePreparedPrompt{601}, {});
+    require(!program.retire_preference.empty(),
+            "reserve did not hand a retire preference to the Program");
+    require(std::find(program.retire_excluded.begin(), program.retire_excluded.end(), 0u) !=
+                program.retire_excluded.end(),
+            "reserve did not declare its own source as excluded from the R2 walks");
+    bool other_owner_kept = false;
+    for (const RetirePreferenceEntry& entry : program.retire_preference) {
+        if (entry.shared_prefix) { continue; }
+        require(entry.slot != 0,
+                ("the reserve handed its own reuse source (slot 0) to the R2 walk (slot=" +
+                 std::to_string(entry.slot) + ")").c_str());
+        if (entry.slot == 1) { other_owner_kept = true; }
+    }
+    require(other_owner_kept,
+            "the reserve emptied the victim domain instead of excluding its one source");
+}
+
 // Victim ordering must be one combined score, not a lexicographic field chain. The chain's first
 // field was the reuse count, so an owner that had not been re-read yet sorted as the cheapest
 // victim however deep it was: on 2026-09-23 that evicted a 62k-token conversation which had been
@@ -4327,6 +4381,8 @@ int main() {
              test_fair_share_capture_prices_protected_sessions_instead_of_refusing);
     run_test("manager hands over the retire preference",
              test_manager_hands_the_retire_preference_to_the_program);
+    run_test("reserve order excludes its own private source",
+             test_reserve_order_excludes_its_own_private_source);
     run_test("victim score combines value and reuse evidence",
              test_victim_score_ranks_by_value_not_by_one_field);
     run_test("victim score prices live against idle owners",

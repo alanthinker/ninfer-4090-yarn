@@ -601,6 +601,27 @@ public:
             }
         }
 
+        // The ladder runs INSIDE planning too (the Program's capacity-release steps during the
+        // materialization search), so the order it walks must already leave this plan's own
+        // sources out - not only the R0 relief below. The sources are exactly the accepted
+        // candidates of this inspection: usually one owner, never the pool, so the victim domain
+        // stays non-empty and only the self-defeating unit is off limits (§2.1: what this
+        // admission works on is working set, not cache). Paying for a plan by releasing a unit out
+        // of the plan's own source destroys the reuse and still leaves the plan short, and a LATER
+        // request of the same conversation inherits the hole (rig fork_hit 2026-09-28: `[ladder]
+        // degrade anchor slot=39 frontier=736` inside that conversation's own grow, then
+        // `fork@4 cached=0`).
+        std::vector<std::uint32_t> plan_sources;
+        plan_sources.reserve(candidates.size());
+        for (const Candidate& candidate : candidates) {
+            if (!candidate.private_source) { continue; }
+            const std::uint32_t slot = candidate.private_source->slot;
+            if (std::find(plan_sources.begin(), plan_sources.end(), slot) == plan_sources.end()) {
+                plan_sources.push_back(slot);
+            }
+        }
+        push_retire_preference(program, plan_sources);
+
         bool negative_sound = false;
         std::optional<Choice> selected =
             plan_materialization(program, prompt, base, *destination, candidates, publication_order,
@@ -619,6 +640,12 @@ public:
             // to free capacity seven minutes later. The ladder was releasing other owners'
             // checkpoints in that very window, so the unit was there for the taking - and the
             // request that needed it was the one paying for the pool.
+            //
+            // What the relief must NOT do is pay for this plan out of the plan's own source; the
+            // order already in force (pushed above) leaves those sources out of every R2 walk, so
+            // the unit this takes comes from another owner or not at all - and "not at all" is the
+            // honest §三 R0 answer instead of a release that destroys the reuse it was meant to
+            // fund.
             if (program.release_one_cached_unit()) {
                 std::fprintf(stderr,
                              "[cache] R0 relief: no plan fit, released one unit of the least "
@@ -655,8 +682,15 @@ public:
         }
         const ProgramResourceRevision resource_revision = program.resource_revision();
         // The reserve below may run the Program's capacity-release ladder, which can retire an
-        // owner; hand over the current value order first.
-        push_retire_preference(program);
+        // owner; hand over the current value order first. The choice's own private source is off
+        // the victim set for the same reason the relief keeps it: this reservation is about to
+        // restore FROM it (§2.1), and the ladder reaching it would delete what the plan priced.
+        if (choice.private_source_) {
+            const std::uint32_t slot = choice.private_source_->slot;
+            push_retire_preference(program, std::span<const std::uint32_t>(&slot, 1));
+        } else {
+            push_retire_preference(program);
+        }
         if (!choice.plan_ || resource_revision.value == 0) {
             throw std::logic_error("resource choice is malformed");
         }
@@ -2066,7 +2100,17 @@ private:
     // Same arithmetic as the planner's victim score (`victim_value_ns` x `victim_score_ns`); the
     // one term resolved differently is the recovery offset, which needs a Program round-trip per
     // checkpoint and is small next to the rebuild cost it offsets.
-    [[nodiscard]] std::vector<RetirePreferenceEntry> retire_preference_order() const {
+    // `exclude_slots`: owners the caller must not hand to the R2 walk. The only ones that qualify
+    // are the sources the IN-FLIGHT admission would restore from (缓存模块v2.md §2.1: the data a
+    // running admission is working set, not cache): the R0 relief exists to make THIS plan fit, so
+    // releasing a unit out of the plan's own source is self-defeating - it frees capacity by
+    // destroying the reuse it is paying for (rig fork_hit 2026-09-28: the grow request's own
+    // `[cache] R0 relief` degraded anchors 733/1139/1537/... of the very conversation its fork
+    // needed three requests later, `fork@4 cached=0`, and the retire order had that conversation
+    // as its first droppable victim because `retained_private_source` only binds at publish - in
+    // the admission window `private_has_active_edge` still reads 0).
+    [[nodiscard]] std::vector<RetirePreferenceEntry>
+    retire_preference_order(std::span<const std::uint32_t> exclude_slots = {}) const {
         struct Scored {
             RetirePreferenceEntry entry;
             std::uint64_t score = 0;
@@ -2131,6 +2175,12 @@ private:
             // value is effectively infinite and it is left out of the list entirely
             // (缓存模块v2.md §2.1: 活体数据是工作集，不参与 R1/R2).
             if (private_has_active_edge(slot)) { continue; }
+            // ... and neither is a source this admission would restore from: that edge is only
+            // bound once the transaction publishes, so during planning/relief the same session
+            // would otherwise be walkable (see the parameter's contract above).
+            if (std::find(exclude_slots.begin(), exclude_slots.end(), slot) != exclude_slots.end()) {
+                continue;
+            }
             append(false, slot, private_retention_weight(entry.retention),
                    entry.lifetime_selected_hits, entry.last_selected_at,
                    entry.last_active_at != std::chrono::steady_clock::time_point{}
@@ -2180,9 +2230,10 @@ private:
         return order;
     }
 
-    void push_retire_preference(Program& program) const {
-        const std::vector<RetirePreferenceEntry> order = retire_preference_order();
-        program.set_retire_preference(order);
+    void push_retire_preference(Program& program,
+                                std::span<const std::uint32_t> exclude_slots = {}) const {
+        const std::vector<RetirePreferenceEntry> order = retire_preference_order(exclude_slots);
+        program.set_retire_preference(order, exclude_slots);
     }
 
     void require_lane(LaneId lane, LogicalLaneState expected) const {

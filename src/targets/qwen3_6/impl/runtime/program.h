@@ -840,7 +840,14 @@ public:
 
     // Score order for the last-resort release, supplied by the common layer (see the public
     // Program declaration). Empty means "no opinion": the scan then falls back to oldest-touched.
-    void set_retire_preference(std::span<const runtime::RetirePreferenceEntry> order);
+    // `exclude_slots` are owners no R2 step may touch while this order is in force: the sources
+    // the in-flight admission restores from (缓存模块v2.md §2.1 - what a running admission works on
+    // is working set). They are excluded from BOTH walks - the score order and the oldest-touched
+    // fallback - because a walk that fell through to the fallback would otherwise pick the very
+    // owner the plan is about to read (rig fork_hit 2026-09-28: `[ladder] degrade anchor slot=39
+    // frontier=736` inside that conversation's own grow, then `fork@4 cached=0`).
+    void set_retire_preference(std::span<const runtime::RetirePreferenceEntry> order,
+                               std::span<const std::uint32_t> exclude_slots = {});
 
 private:
     void advance_resource_revision() noexcept {
@@ -1420,6 +1427,9 @@ private:
     [[nodiscard]] RetireVictim select_retire_victim() const noexcept;
     [[nodiscard]] std::uint32_t retirable_host_state_slots() const noexcept;
     std::vector<runtime::RetirePreferenceEntry> retire_preference_;
+    // Owners the current order must keep (set_retire_preference): the admission's own sources,
+    // off limits to every R2 walk while this order is in force.
+    std::vector<std::uint32_t> retire_exclude_;
     // Where the last select_retire_victim() came from: preference rank (0 = oldest-touched
     // fallback), the entry's score, and whether it was chosen from the order at all.
     mutable std::size_t retire_pick_rank_     = 0;

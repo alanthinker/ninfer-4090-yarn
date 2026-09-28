@@ -7416,10 +7416,16 @@ std::unique_ptr<PreparedPromptData> ProgramImplCore::take_failed_materialization
 }
 
 void ProgramImplCore::set_retire_preference(
-    std::span<const runtime::RetirePreferenceEntry> order) {
+    std::span<const runtime::RetirePreferenceEntry> order,
+    std::span<const std::uint32_t> exclude_slots) {
     // Bounded by the catalog this Program can hold, and rebuilt by the common layer whenever it may
     // matter, so a stale order can only ever name an owner that is gone - which the walk skips.
     retire_preference_.assign(order.begin(), order.end());
+    // Same lifetime as the order (the caller always hands both together): while it stands, no R2
+    // walk may release or degrade these owners - they are what the in-flight admission restores
+    // from, and deleting them turns the admission's own reuse into the recompute it is paying to
+    // avoid (缓存模块v2.md §2.1 working set; the oldest-touched fallback must honour it too).
+    retire_exclude_.assign(exclude_slots.begin(), exclude_slots.end());
 }
 
 ProgramImplCore::RetireVictim ProgramImplCore::select_retire_victim() const noexcept {
@@ -7503,6 +7509,12 @@ ProgramImplCore::RetireVictim ProgramImplCore::select_retire_victim() const noex
         // Retiring this owner would release the very state the in-flight reservation restores.
         if (owner_holds_release_protected_state(index)) { continue; }
         if (pinned_private(index)) { continue; }
+        // ... and so would retiring an admission's own source: the score walk above already
+        // lacks those slots, and this oldest-touched fallback must not hand them back.
+        if (std::find(retire_exclude_.begin(), retire_exclude_.end(), index) !=
+            retire_exclude_.end()) {
+            continue;
+        }
         const std::uint64_t age =
             state_store->last_touched(continuation_states[index].state.read);
         if (!best_continuation && !best_shared) {
@@ -7808,6 +7820,13 @@ bool ProgramImplCore::degrade_idle_owner_host_state() {
             ++skip_protected;
             continue;
         }
+        // The in-flight admission's sources are off limits here too: this fallback exists to
+        // answer an unpriced pool, never to hand it the owner the running plan restores from
+        // (set_retire_preference's exclusion - the score walk above already lacks them).
+        if (std::find(retire_exclude_.begin(), retire_exclude_.end(), index) !=
+            retire_exclude_.end()) {
+            continue;
+        }
         const SequenceState& sequence = continuation_states[index];
         if (!sequence.kv || sequence.long_anchors.empty()) { continue; }
         aged.push_back(AgeCandidate{
@@ -7933,6 +7952,11 @@ bool ProgramImplCore::release_idle_owner_host_side() {
         if (continuation_slots[index].role != ContinuationSlotRole::Catalogued) { continue; }
         if (owner_holds_release_protected_state(index)) { ++skip_protected; continue; }
         if (materialization_pins(index, continuation_slots[index].generation)) { ++skip_pins; continue; }
+        // The admission's own source is off limits to this fallback too (set_retire_preference).
+        if (std::find(retire_exclude_.begin(), retire_exclude_.end(), index) !=
+            retire_exclude_.end()) {
+            continue;
+        }
         const SequenceState& sequence = continuation_states[index];
         if (!sequence.kv) { continue; }
         aged.push_back(AgeCandidate{

@@ -888,8 +888,12 @@ public:
     // demand window) and hands its score order to the Program, whose last-resort release step runs
     // where that model is unavailable. The Program walks the order, may still refuse an entry it
     // cannot release, and falls back to its own oldest-touched scan - that step must always find
-    // someone, because it exists to make an exhausted pool deliver.
-    void set_retire_preference(std::span<const runtime::RetirePreferenceEntry> order);
+    // someone, because it exists to make an exhausted pool deliver. `exclude_slots` are the
+    // sources the in-flight admission restores from: no R2 walk may take them (neither the score
+    // order nor the oldest-touched fallback), because releasing the owner a plan restores FROM
+    // deletes the reuse the plan is paying to place (缓存模块v2.md §2.1 working set).
+    void set_retire_preference(std::span<const runtime::RetirePreferenceEntry> order,
+                               std::span<const std::uint32_t> exclude_slots = {});
     [[nodiscard]] RequestBasePlan<Variant>
     plan_request(const PreparedPrompt& prompt, const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt,

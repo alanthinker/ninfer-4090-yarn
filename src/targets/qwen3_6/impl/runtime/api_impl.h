@@ -481,8 +481,9 @@ void Program<Variant>::skip_capture(CaptureOffer<Variant>&& offer) {
 
 template <>
 void Program<Variant>::set_retire_preference(
-    std::span<const runtime::RetirePreferenceEntry> order) {
-    impl_->set_retire_preference(order);
+    std::span<const runtime::RetirePreferenceEntry> order,
+    std::span<const std::uint32_t> exclude_slots) {
+    impl_->set_retire_preference(order, exclude_slots);
 }
 
 template <>
