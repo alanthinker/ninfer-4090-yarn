@@ -138,6 +138,11 @@ else
     IMPORTANT_FLOOD_TURNS="${NINFER_IMPORTANT_FLOOD_TURNS:-4}"
 fi
 export NINFER_REQDUMP_DIR="${NINFER_REQDUMP_DIR:-$(dirname "$NINFER_SERVICE_LOG")/reqdump}"
+# pool_soak's replay directory lives next to the service's runtime files (prod: deploy-yarn/soak_dumps).
+# /tmp/crash243 - the 2026-09-22 incident dumps - was /tmp-resident and is not reproducible on other
+# hosts (this machine mounts /tmp per-process ro), so the recorded sequence is kept as a snapshot of
+# recent live request dumps in that directory instead.
+SOAK_DIR="${NINFER_SOAK_DIR:-$(dirname "$NINFER_SERVICE_LOG")/soak_dumps}"
 S="$NINFER_SERVICE_LOG"
 FULL_AT=$((TOTAL - 2))
 # The ceiling path: how close to the total a plateauing pool must get before "this configuration
@@ -393,7 +398,7 @@ echo "== phase 3: pressure/eviction-sensitive tests (pool is FULL) =="
 # the prompts[verify>conversations] IndexError the old defaults hit).
 step state_index      300 python3 tools/smoke/test_state_index_short.py \
     --base-url "http://127.0.0.1:$PORT/v1" --conversations 4 --verify 4 --words 600
-step pool_soak        600 tools/smoke/pool_soak.sh "$PORT" /tmp/crash243
+step pool_soak        600 tools/smoke/pool_soak.sh "$PORT" "$SOAK_DIR"
 step eviction_fix     300 python3 tools/smoke/verify_eviction_fix.py "$PORT"
 step memory_pressure  300 python3 tools/smoke/test_memory_pressure.py \
     --port "$PORT" --conversations 6 --words 800

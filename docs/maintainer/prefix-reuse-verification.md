@@ -109,8 +109,10 @@ is therefore always run with `host_state_slots` at its configured maximum.
 FILL_SESSION_BASE=0  python3 tools/smoke/fill_anchors.py 30000 30   # ... until it prints FULL
 FILL_SESSION_BASE=30 python3 tools/smoke/fill_anchors.py 30000 30
 
-# 2. The recorded sequences that failed in production, plus the live client shape
-tools/smoke/pool_soak.sh 30000 /tmp/crash243
+# 2. The recorded sequences that failed in production, plus the live client shape.
+#    Default DUMP_DIR is <deploy-yarn>/soak_dumps ($NINFER_SOAK_DIR overrides; it holds a snapshot
+#    of live request dumps standing in for the 2026-09-22 incident's /tmp-resident dumps).
+tools/smoke/pool_soak.sh 30000
 
 # 3. The real requests a client complained about, replayed at the saturated pool
 python3 tools/smoke/replay_dump.py 30000 $(cat /tmp/userdumps.txt | tr '\n' ' ')

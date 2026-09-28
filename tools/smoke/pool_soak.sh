@@ -5,9 +5,10 @@
 # Usage: tools/smoke/pool_soak.sh [PORT] [DUMP_DIR]
 #
 #   PORT       service port (default $NINFER_PORT or 30000)
-#   DUMP_DIR   directory of recorded request dumps to replay (default /tmp/crash243, the dumps of
-#              the 2026-09-22 incident; the newest dumps the Engine wrote itself live in
-#              `$NINFER_REQDUMP_DIR`)
+#   DUMP_DIR   directory of recorded request dumps to replay. Default $NINFER_SOAK_DIR, else
+#              <deploy-yarn>/soak_dumps (a snapshot of live request dumps standing in for the
+#              2026-09-22 incident's /tmp-resident dumps, which do not survive a reboot; the newest
+#              dumps the Engine writes itself live in `$NINFER_REQDUMP_DIR`)
 #
 # Run it against a *full* host-state pool: the whole point is that a saturated pool must still
 # publish the newest request's own capture, and that concurrency must not turn a capture decision
@@ -20,7 +21,7 @@ set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT="${1:-${NINFER_PORT:-30000}}"
-DUMP_DIR="${2:-/tmp/crash243}"
+DUMP_DIR="${2:-${NINFER_SOAK_DIR:-/root/ai/large_models/_ninfer_repos/deploy-yarn/soak_dumps}}"
 cd "$HERE/../.." || exit 1
 
 # The soak drives a *running* service, so it resolves only where that service writes; it does not
