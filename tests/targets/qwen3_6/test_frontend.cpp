@@ -2062,6 +2062,49 @@ int test_thinking_budget_control(const Frontend& frontend) {
     return failures;
 }
 
+// Reproduced: a byte boundary that lands INSIDE a multi-byte character must not fail the
+// request. `encode_with_boundaries` only checks `offset > text.size()`, then splits the text at
+// every boundary and normalizes each PIECE on its own - and a piece cut mid-codepoint is not
+// valid UTF-8, so `normalize_nfc` throws "failed to normalize UTF-8 text as NFC: Invalid UTF-8
+// string" and the whole request is rejected with HTTP 400 invalid_prompt.
+//
+// 2026-09-29 production: two chat requests (203/204 messages, EIGHT media items, 26 tools) were
+// rejected that way at phase=prepare. Rich media/tool prompts are exactly the shape that
+// generates many boundaries, and nothing guarantees a caller's offsets sit on character
+// boundaries.
+int test_byte_boundary_inside_a_codepoint_is_not_a_request_failure() {
+    const fi::Tokenizer& tokenizer = fixture_tokenizer();
+    int failures                   = 0;
+
+    // "中" is 3 bytes (E4 B8 AD); offsets 1 and 2 are inside the character.
+    const std::string text = "a\u4e2d" "b";   // bytes: 'a' + 3 + 'b' = 5
+    failures += check(text.size() == 5, "fixture text is not 5 bytes");
+
+    for (const std::size_t interior : {std::size_t{2}, std::size_t{3}}) {
+        const std::size_t boundaries[] = {interior};
+        try {
+            const auto encoded = tokenizer.encode_with_boundaries(text, boundaries);
+            failures += check(!encoded.input_ids.empty(),
+                              "a boundary inside a codepoint produced no tokens");
+        } catch (const std::exception& error) {
+            ++failures;
+            std::cout << "FAIL: boundary at byte " << interior << " inside a codepoint threw: "
+                      << error.what() << "\n";
+        }
+    }
+
+    // A boundary exactly ON the character edges is the well-formed case and must keep working.
+    const std::size_t aligned[] = {std::size_t{1}, std::size_t{4}};
+    try {
+        const auto encoded = tokenizer.encode_with_boundaries(text, aligned);
+        failures += check(!encoded.input_ids.empty(), "aligned boundaries produced no tokens");
+    } catch (const std::exception& error) {
+        ++failures;
+        std::cout << "FAIL: aligned boundaries threw: " << error.what() << "\n";
+    }
+    return failures;
+}
+
 int test_utf8_and_hidden_eos(const Frontend& frontend) {
     auto prompt             = frontend.prepare_tokens({0});
     auto session            = frontend.make_output_session(prompt, {});
@@ -2454,6 +2497,7 @@ int main() {
     failures += test_reasoning_split(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
+    failures += test_byte_boundary_inside_a_codepoint_is_not_a_request_failure();
     failures += test_media_cache_reuses_immutable_payload();
     failures += test_media_payload_outlives_frontend_cache();
     failures += test_media_live_bytes_follow_last_payload_reference();

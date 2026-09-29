@@ -803,13 +803,37 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
         }
         previous_literal_end = span.end;
     }
+    // Snap every requested byte offset onto a UTF-8 character boundary.
+    //
+    // The offsets come from callers marking where a media/tool item sits in the rendered prompt,
+    // and nothing makes them land between characters. The encoder splits the text at each boundary
+    // and normalizes every PIECE on its own (append_ordinary_text and the marker loop below), and
+    // a piece cut mid-codepoint is not valid UTF-8 - `normalize_nfc` then throws "Invalid UTF-8
+    // string" and the whole request is rejected with HTTP 400 invalid_prompt. Rich prompts are
+    // exactly the shape that trips it: 2026-09-29 production rejected two chat requests (203/204
+    // messages, EIGHT media items, 26 tools) at phase=prepare this way.
+    //
+    // A boundary is a position, not a character: moving it to the start of the character it landed
+    // inside keeps the marker on the same character and leaves the token stream unchanged (the
+    // boundary only narrows where a marker may attach). Snapping BACK rather than forward keeps the
+    // marker before the character it pointed into, the conservative reading of "this item starts
+    // here".
+    const auto snap_to_char_boundary = [&text](std::size_t offset) {
+        while (offset != 0 && offset < text.size() &&
+               (static_cast<unsigned char>(text[offset]) & 0xC0U) == 0x80U) {
+            --offset;  // a continuation byte: step back into the character that owns it
+        }
+        return offset;
+    };
     std::vector<IndexedByteBoundary> boundaries;
     boundaries.reserve(byte_boundaries.size());
     for (std::size_t index = 0; index < byte_boundaries.size(); ++index) {
         if (byte_boundaries[index] > text.size()) {
             throw std::out_of_range("Tokenizer byte boundary exceeds input text");
         }
-        boundaries.push_back(IndexedByteBoundary{.offset = byte_boundaries[index], .index = index});
+        boundaries.push_back(
+            IndexedByteBoundary{.offset = snap_to_char_boundary(byte_boundaries[index]),
+                                .index  = index});
     }
     std::stable_sort(
         boundaries.begin(), boundaries.end(),
