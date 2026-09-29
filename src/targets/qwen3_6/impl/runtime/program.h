@@ -177,6 +177,16 @@ struct CaptureAssessmentImpl {
     PhysicalDemand demand;
     PhysicalDelta active_entitlement_delta;
     PhysicalResources capacity_preparation_removed;
+    // The private part of the priced replacement. The residency that decides its axes (a dropped
+    // checkpoint's Device-only replica -> a Device state slot, a Host-only one -> a Host slot) can
+    // change before publication, because the capacity ladder demotes and drops replicas while the
+    // capture still needs a Host slot for its snapshot. Re-deriving the axes at publication then
+    // disagrees with the priced effect and latches the engine with "active capture replacement
+    // effect changed after reservation" (2026-09-29 rig pool_soak: priced removed{st=1} while the
+    // anchor was still Device-only, published removed{hst=1} after a ladder demote took that
+    // replica). 缓存模块v2.md §三 R1: 前奏必须排在容量等式之前 - the priced value IS the equation,
+    // so it is carried, not recomputed.
+    PhysicalResources priced_private_replacement;
 };
 
 template <>
@@ -556,6 +566,21 @@ struct RequestControl {
     };
 
     std::optional<Prefill> prefill;
+};
+
+// The address space the CURRENT in-flight transaction is about to fork from, plus how many
+// leading pages that fork covers. A reserve-time Device-KV release must leave those pages
+// Device-resident whichever owner holds them, or `prepare_prefix_fork` latches the engine with
+// "KV retained-prefix source is not stable" (2026-09-29 18:24, req#562, slot=267, 1146 pages).
+// Namespace-level rather than nested so `kv_pressure_selection.h` can expose the covered-page
+// test to `tests/test_spill_selection.cpp` without pulling in the whole Program.
+struct ProgramPendingForkPrefix {
+    KVAddressSpaceHandle address;
+    std::uint32_t pages = 0;
+
+    ProgramPendingForkPrefix() noexcept = default;
+    ProgramPendingForkPrefix(KVAddressSpaceHandle address, std::uint32_t pages) noexcept
+        : address(address), pages(pages) {}
 };
 
 class ProgramImplCore {
@@ -1103,6 +1128,20 @@ private:
         std::vector<MaterializationSharedVictimResult> shared_pressure_results;
         PressureTransition pressure_transition;
         bool recycles_private_state        = false;
+        // Whether the long-anchor set was ALREADY FULL when this capture was priced. The anchor
+        // set's size decides `install_private_capture`'s branch: below the limit it APPENDS (the
+        // group costs a Device state slot) and at the limit it REPLACES the selected victim (it
+        // costs a Host one). Reading that size again at publication let a ladder step change the
+        // answer in between - and this transaction's own anchors are not the only thing that can
+        // move it, because the ladder degrades OTHER owners' anchors while the capture still needs
+        // a Host slot for its snapshot - so the re-derived `removed` disagreed with the priced one
+        // and the engine latched with "active capture replacement effect changed after
+        // reservation" (2026-09-29 rig pool_soak: priced with 7/8 anchors as removed{st=1},
+        // published at 8/8 as removed{hst=1}). 缓存模块v2.md §三 R1 puts the prelude BEFORE the
+        // capacity equation for exactly this reason; the priced branch is part of the equation.
+        bool priced_with_full_anchor_set = false;
+        // The private part of this capture's priced replacement (see CaptureAssessmentImpl).
+        detail::PhysicalResources priced_private_replacement;
         bool replacement_removed           = false;
         bool prepared                      = false;
         std::uint64_t recycled_state_epoch = 0;
@@ -1295,6 +1334,13 @@ private:
     // publishing transfer makes the commit fail with "Host retained Fork destination was not
     // published" (reproduced on the agent test instance, 2026-09-21).
     std::optional<StateImageHandle> release_protected_state;
+    // Re-entrancy guard for the R2 half of §三 R1 ("内存没有空间接收时，先执行 R2 腾地方，
+    // 再执行 R1"). `release_idle_owner_host_side` reaches `spill_owner_device_kv_to_host` for its
+    // own spill-then-release prelude, so letting a failed spill call R2 again recurses without
+    // bound: spill(A) fails -> R2 -> spill(B) fails -> R2 -> ... measured 7440 "spill prepare
+    // threw" lines with zero declines and a service that answered nothing for minutes
+    // (2026-09-29 rig). While an R2 is already running, a nested spill must simply decline.
+    bool host_release_in_progress_ = false;
     // True when that continuation still holds the release-protected state anywhere in its retained
     // checkpoint set, so the ladder's final retirement step can skip it.
     [[nodiscard]] bool owner_holds_release_protected_state(std::uint32_t index) const;
@@ -1409,7 +1455,11 @@ private:
     // destroyed no Device data); owners that still hold Device data are skipped - destroying them
     // would violate invariant 1, so the ladder spills what it can and otherwise fails to R0
     // (§三 R0; the 280-of-557 baseline is acceptance 7#3).
-    [[nodiscard]] bool release_idle_owner_host_side();
+    // R2: release ONE idle owner's Host side (its Host KV + Host state + catalog row go
+    // together, §2.1). `require_host_state_slot` names the deficit: the default frees a Host
+    // STATE slot, and a caller whose deficit is Host KV BYTES passes false so that an owner
+    // holding a large Host KV range with no Host state is not skipped (§三 R2).
+    [[nodiscard]] bool release_idle_owner_host_side(bool require_host_state_slot = true);
     // Victim prelude (§三 R1): before a cache-path whole-conversation teardown, move what may
     // not be destroyed in place - Device KV pages spill to Host, Both-resident state images drop
     // their Device replica for free, DeviceOnly state demotes when a Host slot allows. What
@@ -1429,8 +1479,18 @@ private:
     // may be about to move it, and moving it first turns that plan stale (fatal
     // 'pressure KV replica changed before transfer'). The teardown only drops the reference;
     // the physical page survives with its other referents, so nothing is destroyed either.
+    //
+    // pending_source (the reserve hook): the address space the CURRENT in-flight transaction is
+    // about to fork from, plus how many leading pages that fork covers. A page inside that prefix
+    // has to stay Device-resident whichever owner holds it, or `prepare_prefix_fork` latches the
+    // engine with "KV retained-prefix source is not stable" (2026-09-29 18:24, req#562). This is
+    // deliberately NARROWER than exclude_shared: only the pages an in-flight fork actually needs
+    // are spared, so ordinary jointly-held pages stay relocatable and the relief still funds the
+    // reservation. Excluding every shared page instead starved the reserve and traded a rare latch
+    // for a routine queue-timeout 503 (rig A/B on one load: `ALL HIT` -> conv4 503).
     [[nodiscard]] bool spill_owner_device_kv_to_host(std::uint32_t index, bool shared = false,
-                                                     bool exclude_shared = false);
+                                                     bool exclude_shared = false,
+                                                     ProgramPendingForkPrefix pending_source = {});
     // The owner that step would delete, without deleting it, and the Host state slots deleting it
     // would return. Split out so the capacity-relief credit prices what the ladder can actually
     // deliver instead of guessing (storage doc 4.2).
@@ -1548,7 +1608,8 @@ private:
     [[nodiscard]] detail::PhysicalResources
     install_private_capture(SequenceState& sequence, const CaptureGroup& group,
                             StateImageHandle checkpoint,
-                            std::optional<runtime::CheckpointRef> replacement, bool publish_anchor);
+                            std::optional<runtime::CheckpointRef> replacement, bool publish_anchor,
+                            bool anchor_set_was_full, detail::PhysicalResources priced_replacement);
     // Returns false when the capture cannot be prepared against the live pool (its state
     // destination has no device slot left), in which case the caller aborts the transaction and
     // skips the capture: publishing an optional checkpoint must not fail the request.

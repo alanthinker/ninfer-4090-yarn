@@ -67,6 +67,47 @@ struct KVPressureSelection {
     std::size_t host_bytes_remaining   = 0;
 };
 
+// The logical pages an in-flight transaction's prefix fork has to keep Device-resident.
+//
+// The reserve hook that frees Device KV runs INSIDE that transaction's reservation, so it may not
+// move these pages whichever owner holds them: `prepare_prefix_fork` requires every page of the
+// source prefix to still be Device-resident and otherwise latches the engine with
+// "KV retained-prefix source is not stable" (2026-09-29 18:24, req#562, slot=267, 1146 pages).
+//
+// Ownership is not the right test here. `materialization_pins` already excludes an owner that IS
+// the source, but a page can also be read through the source while sitting in ANOTHER owner's
+// address space, and `address_references > 1` says a page is shared without saying with whom. So
+// the covered set is built from the SOURCE address space and matched by logical-page identity.
+// This is much narrower than refusing every shared page: ordinary jointly-held pages stay
+// relocatable, so the relief still funds the reservation. Refusing them all starved the reserve
+// and traded a rare latch for a routine queue-timeout 503 (rig A/B, one load: `ALL HIT` -> 503).
+class PendingForkPrefixPages {
+public:
+    PendingForkPrefixPages() noexcept = default;
+
+    PendingForkPrefixPages(const KVAddressSpaceStore& addresses,
+                           ProgramPendingForkPrefix prefix) {
+        if (prefix.pages == 0 || !addresses.valid(prefix.address)) { return; }
+        const std::uint32_t covered =
+            std::min(prefix.pages, addresses.mapped_pages(prefix.address));
+        pages_.reserve(covered);
+        for (std::uint32_t page = 0; page < covered; ++page) {
+            pages_.push_back(addresses.logical_page(prefix.address, page));
+        }
+    }
+
+    [[nodiscard]] bool covers(LogicalKVPageHandle page) const {
+        if (pages_.empty()) { return false; }
+        return std::find(pages_.begin(), pages_.end(), page) != pages_.end();
+    }
+
+    [[nodiscard]] bool empty() const noexcept { return pages_.empty(); }
+    [[nodiscard]] std::size_t size() const noexcept { return pages_.size(); }
+
+private:
+    std::vector<LogicalKVPageHandle> pages_;
+};
+
 inline bool logical_page_matches_prefix(const KVAddressSpaceStore& addresses,
                                  std::optional<KVAddressSpaceHandle> prefix,
                                  std::uint32_t prefix_pages, std::uint32_t page_offset,

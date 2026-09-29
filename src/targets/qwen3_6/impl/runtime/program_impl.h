@@ -7381,22 +7381,33 @@ bool ProgramImplCore::release_state_capacity_step(const char* site, bool allow_r
 }
 
 bool ProgramImplCore::owner_holds_release_protected_state(std::uint32_t index) const {
-    if (!release_protected_state || index >= continuation_capacity) { return false; }
+    if (index >= continuation_capacity) { return false; }
     const SequenceState& sequence = continuation_states[index];
-    if (sequence.state.read == *release_protected_state ||
-        sequence.state.write == *release_protected_state) {
+    const auto holds = [&](StateImageHandle handle) {
+        return sequence.state.read == handle || sequence.state.write == handle ||
+               (sequence.reserved_state && *sequence.reserved_state == handle) ||
+               (sequence.rewrite_state && *sequence.rewrite_state == handle) ||
+               std::any_of(sequence.long_anchors.begin(), sequence.long_anchors.end(),
+                           [&](const LongAnchorCheckpoint& anchor) {
+                               return anchor.state == handle;
+                           });
+    };
+    if (release_protected_state && holds(*release_protected_state)) { return true; }
+    // An ACTIVE CAPTURE prices its effect against these owners (`capacity_preparation_removed`)
+    // and publication re-derives `removed` from the same owners, so degrading one in between makes
+    // the two disagree and latches the engine with "active capture replacement effect changed
+    // after reservation". 缓存模块v2.md §三 R1: 前奏必须排在容量等式之前 - here the equation is
+    // already fixed, so the priced owner is off limits for the rest of the transaction. The
+    // capture's own source state IS that priced anchor, and a materialization source gets exactly
+    // this protection from `release_protected_state`; the capture path never set that member
+    // (2026-09-29 rig pool_soak: `degrade anchor slot=4` freed a checkpoint the capture had
+    // already priced, then the publication threw; the same fatal reproduces on the build from
+    // before any of these changes).
+    if (const auto* capture = std::get_if<ActiveCaptureTransaction>(&context_transaction_);
+        capture != nullptr && capture->source_state.valid() && holds(capture->source_state)) {
         return true;
     }
-    if (sequence.reserved_state && *sequence.reserved_state == *release_protected_state) {
-        return true;
-    }
-    if (sequence.rewrite_state && *sequence.rewrite_state == *release_protected_state) {
-        return true;
-    }
-    return std::any_of(sequence.long_anchors.begin(), sequence.long_anchors.end(),
-                       [this](const LongAnchorCheckpoint& anchor) {
-                           return anchor.state == *release_protected_state;
-                       });
+    return false;
 }
 
 std::optional<StateImageHandle>
@@ -7627,6 +7638,25 @@ bool ProgramImplCore::degrade_idle_owner_host_state() {
     const auto degrade_owner = [&](std::uint32_t index) -> bool {
         SequenceState& sequence = continuation_states[index];
         if (!sequence.kv || sequence.state.fork_pending) { ++skip_nokv; return false; }
+        // 缓存模块v2.md §2.1: 正在执行的对话价值视为无限，永远不进候选.
+        //
+        // "正在执行" for this step means the sequence an ACTIVE CAPTURE is running against. Its
+        // long-anchor set is exactly what `install_private_capture` re-derives `removed` from at
+        // publication, and its size decides that function's branch: with room left it APPENDS a
+        // new anchor, and once the set is full it REPLACES the selected victim - so dropping one
+        // anchor in between flips the re-derived effect from a Device state slot to a Host one and
+        // the publication throws "active capture replacement effect changed after reservation"
+        // (2026-09-29 rig pool_soak: `capture-plan frontier=10567` was priced, then
+        // `degrade anchor slot=4 frontier=10567` took it away, then removed{hst=1} != reserved
+        // {st=1}). Role alone is not the test - the capture's own sequence is not necessarily
+        // Active while `enqueue_active_capture_transfers` needs a Host slot for it, which is
+        // exactly when this step runs - so the capture's lane names it directly.
+        if (const auto* capture = std::get_if<ActiveCaptureTransaction>(&context_transaction_);
+            capture != nullptr && capture->lane < max_concurrency &&
+            active_continuations[capture->lane] == index) {
+            ++skip_active;
+            return false;
+        }
         // Invariant 3: only an owner holding a Host state slot can repay this ladder step.
         if (owner_exclusive_resources(sequence).host.state_slots == 0) {
             ++skip_nohoststate;
@@ -7878,8 +7908,17 @@ bool ProgramImplCore::degrade_idle_owner_host_state() {
     return false;
 }
 
-bool ProgramImplCore::release_idle_owner_host_side() {
+bool ProgramImplCore::release_idle_owner_host_side(bool require_host_state_slot) {
     if (!state_store) { return false; }
+    // §三 R1's R2 half runs the same spill-then-release prelude as the R1 step, so it must be
+    // marked as in-progress: a nested spill that finds Host full again has to decline instead of
+    // starting a second R2 (see the member's comment for the measured recursion).
+    if (host_release_in_progress_) { return false; }
+    host_release_in_progress_ = true;
+    struct ReleaseGuard {
+        bool* flag;
+        ~ReleaseGuard() { *flag = false; }
+    } guard{&host_release_in_progress_};
     // Invariant 1 gate: an owner with ANY Device footprint is never released here - its data has
     // to move (R1) or the ladder fails to R0. This is the LEGAL half of the old retirement (277
     // of 557 production retires destroyed no Device data): both sides already zero on Device, so
@@ -7899,10 +7938,14 @@ bool ProgramImplCore::release_idle_owner_host_side() {
         const SequenceState& sequence = continuation_states[index];
         if (!sequence.kv) { ++skip_nokv; return false; }
         detail::PhysicalResources footprint = owner_exclusive_resources(sequence);
-        // Invariant 3: only release an owner whose deletion actually frees a state slot - that is
-        // the goal this ladder step exists for; a Host-KV-only owner would be destroyed for
-        // nothing the ladder owes anyone.
-        if (footprint.host.state_slots == 0) { ++skip_nohoststate; return false; }
+        // Invariant 3: when the deficit is a STATE slot, only release an owner whose deletion
+        // actually frees one - a Host-KV-only owner would be destroyed for nothing the ladder
+        // owes. When the deficit is Host KV BYTES (the landing a §三 R1 move needs), those bytes
+        // are the goal, so an owner with no Host state is exactly the right victim.
+        if (require_host_state_slot && footprint.host.state_slots == 0) {
+            ++skip_nohoststate;
+            return false;
+        }
         if (!device_free(footprint)) {
             // #12 先搬后释 (spill-then-release): the owner's Device KV moves to Host first (R1,
             // never destroyed in place) and only then may the owner disappear from Host (R2).
@@ -8015,7 +8058,8 @@ bool ProgramImplCore::release_idle_owner_host_side() {
 }
 
 bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool shared,
-                                                    bool exclude_shared) {
+                                                    bool exclude_shared,
+                                                    ProgramPendingForkPrefix pending_source) {
     if (!host_kv_extents || !state_store) { return false; }
     if (shared) {
         if (index >= shared_prefix_capacity ||
@@ -8073,6 +8117,7 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool sh
     work.option.shared_owner = shared;
     work.option.id           = 1;
     std::uint32_t moved_pages = 0;
+    const PendingForkPrefixPages pending_fork(*text_kv_addresses, pending_source);
     const auto build_runs        = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
                                        KVAddressSpaceHandle address,
                                        std::vector<qwen3_6::detail::PressureKVDecision>& changes,
@@ -8088,6 +8133,14 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool sh
             // first makes that plan stale and the prepare guard latches the engine (fatal
             // 'pressure KV replica changed before transfer', kind=2, device=0 after our move).
             if (exclude_shared && pages.address_references(logical) > 1) {
+                return qwen3_6::detail::PressureKVDecisionKind::None;
+            }
+            // The in-flight transaction's own fork source, tested by page identity rather than by
+            // owner: the referent need not be this owner, and `address_references > 1` says a page
+            // is shared without saying with whom. Moving such a page leaves the pending fork
+            // without a Device replica, which is the "source changed / not stable" latch this
+            // spares (2026-09-29: `spill continuation slot=1` then fatal on the very next line).
+            if (pending_fork.covers(logical)) {
                 return qwen3_6::detail::PressureKVDecisionKind::None;
             }
             return pages.host_resident(logical)
@@ -8238,14 +8291,25 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool sh
             }
             return funded;
         };
+        // 缓存模块v2.md §三 R1: 内存没有空间接收时，先执行 R2 腾地方，再执行 R1.
+        // The self-fund above returns only THIS owner's own exclusive Host pages, which is nothing
+        // when Host is full of OTHER conversations' cache - and that is the normal case, not an
+        // edge one. Without the R2 the landing can never happen, the Device pool can never shrink,
+        // and a request that has 20+ reuse candidates sits at `running 0 | waiting 1` until its
+        // queue deadline (2026-09-29 rig req#182: host_kv 12511/12288 MiB, host_state 48/48,
+        // `spill declined ... stage=noruns` six times, then HTTP 503). Free the least-important
+        // idle owner's Host side - by value, this module never names a victim itself - and let the
+        // retry below land the move. Nested spills decline while that R2 runs.
         if (!fund_once()) {
-            std::fprintf(stderr,
-                         "[ladder] spill declined %s slot=%u stage=prepare fund_pages=%u"
-                         " fund_can=%d fund_ok=%d\n",
-                         shared ? "shared" : "", index, fund_pages, fund_can ? 1 : 0,
-                         fund_ok ? 1 : 0);
-            std::fflush(stderr);
-            return false;
+            if (!release_idle_owner_host_side(/*require_host_state_slot=*/false)) {
+                std::fprintf(stderr,
+                             "[ladder] spill declined %s slot=%u stage=prepare fund_pages=%u"
+                             " fund_can=%d fund_ok=%d\n",
+                             shared ? "shared" : "", index, fund_pages, fund_can ? 1 : 0,
+                             fund_ok ? 1 : 0);
+                std::fflush(stderr);
+                return false;
+            }
         }
         try {
             prepare_pressure_work(work, runtime::ContextResourceClass::MainKV);
@@ -8276,6 +8340,29 @@ bool ProgramImplCore::release_device_kv_capacity_step(const char* site) {
     // (Catalogued) owner is spillable, the in-flight admission's own sources stay excluded, and an
     // owner holding protected state is left alone; the spill helper re-checks the page-level gates
     // per page and DECLINES rather than latching, so one unmovable owner never kills the step.
+    // This step runs INSIDE a transaction's reservation, so it must also spare the pages that
+    // transaction is about to fork from. `materialization_pins` covers the case where the owner IS
+    // that source; a jointly-held page reads `address_references > 1` without saying WHO the other
+    // referent is, so the source's own prefix is passed down explicitly. Without it the move
+    // leaves the fork with no Device replica and the engine latches ("KV retained-prefix source is
+    // not stable" / "KV prefix-fork source changed before publication").
+    ProgramPendingForkPrefix pending_source;
+    if (const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_);
+        transaction != nullptr && transaction->text_activation_frontier &&
+        (transaction->has_source || transaction->has_shared_source)) {
+        const SequenceKVBundle* source_kv =
+            transaction->has_source
+                ? (continuation_states[transaction->source_index].kv
+                       ? &*continuation_states[transaction->source_index].kv
+                       : nullptr)
+                : (shared_prefix_states[transaction->shared_source_index].kv
+                       ? &*shared_prefix_states[transaction->shared_source_index].kv
+                       : nullptr);
+        if (source_kv != nullptr) {
+            pending_source.address = source_kv->text;
+            pending_source.pages   = kv_pages_for_frontier(*transaction->text_activation_frontier);
+        }
+    }
     std::uint32_t declined = 0;
     const auto try_owner = [&](std::uint32_t index) -> bool {
         if (index >= continuation_capacity) { return false; }
@@ -8287,7 +8374,11 @@ bool ProgramImplCore::release_device_kv_capacity_step(const char* site) {
         }
         if (owner_holds_release_protected_state(index)) { return false; }
         if (materialization_pins(index, continuation_slots[index].generation)) { return false; }
-        if (!spill_owner_device_kv_to_host(index)) { ++declined; return false; }
+        if (!spill_owner_device_kv_to_host(index, /*shared=*/false, /*exclude_shared=*/false,
+                                           pending_source)) {
+            ++declined;
+            return false;
+        }
         std::fprintf(stderr, "[ladder] spill for Device-KV capacity site=%s slot=%u\n", site, index);
         std::fflush(stderr);
         return true;
@@ -8386,6 +8477,19 @@ void ProgramImplCore::prepare_shared_victim_teardown(std::uint32_t index) {
     if (residency != StateReplicaResidency::DeviceOnly) { return; }
     std::optional<StateImageTransfer> transfer =
         state_store->begin_device_to_host(handle, device.transfer_stream);
+    if (!transfer && state_store->host_free() == 0 && degrade_idle_owner_host_state()) {
+        // 缓存模块v2.md §三 R1: 内存没有空间接收时，先执行 R2 腾地方，再执行 R1.
+        // The private teardown has always done this; this path did not, and that asymmetry is what
+        // let a cheap shared prefix block the request that needed its room. With the Host state
+        // pool full the demotion failed, `shared_prefix_holds_device_data` still saw Device data,
+        // and the whole pressure step rolled back to R0 - so a request that was already paying for
+        // a reuse waited out its queue deadline while the pool never changed (2026-09-29 rig:
+        // `spill declined slot=0/1/2 stage=noruns` then `pressure step refused: shared victim
+        // slot=2 cannot be moved to Host (R1), rolling the step back ... (R0)`, repeated).
+        std::optional<StateImageTransfer> second =
+            state_store->begin_device_to_host(handle, device.transfer_stream);
+        if (second) { transfer.emplace(std::move(*second)); }
+    }
     if (!transfer) { return; }
     if (device.transfer_stream != nullptr) {
         (void)cudaStreamSynchronize(device.transfer_stream);
@@ -9895,6 +9999,7 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
     const std::size_t anchor_limit = context_cache.max_long_anchors_per_continuation.value_or(0);
     const bool anchor_replacement_required =
         group.long_anchor && anchor_limit != 0 && sequence.long_anchors.size() == anchor_limit;
+    assessment.priced_with_full_anchor_set = anchor_replacement_required;
     // The anchor can be unpublishable while the SAME group carries a turn closure, and the closure
     // is exactly what this conversation's next message resumes from (the client replays a different
     // reply than the model generated, so only a closure at the content boundary matches). Dropping
@@ -10051,6 +10156,7 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
     }
     const detail::PhysicalResources replaced =
         checked_resource_sum(replaced_private, replaced_shared);
+    assessment.implementation->priced_private_replacement = replaced_private;
     assessment.implementation->capacity_preparation_removed = replaced_shared;
     assessment.implementation->demand                       = detail::PhysicalDemand{
                               .reservation_added  = added,
@@ -10454,6 +10560,11 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
     transaction.capacity_preparation_removed =
         assessment.implementation->capacity_preparation_removed;
     transaction.recycles_private_state = assessment.recycles_private_state;
+    // The branch `install_private_capture` will take is a PRICED quantity, not a live one: the
+    // anchor set's fullness decided it when the effect was computed, and the ladder may move that
+    // set before publication (see the member's comment).
+    transaction.priced_with_full_anchor_set = assessment.priced_with_full_anchor_set;
+    transaction.priced_private_replacement  = assessment.implementation->priced_private_replacement;
     transaction.state_placement        = assessment.state_placement;
     transaction.transfer_requirements  = assessment.transfer_requirements;
     if (pressure_details != nullptr) {
@@ -10594,7 +10705,8 @@ detail::PhysicalResources
 ProgramImplCore::install_private_capture(SequenceState& sequence, const CaptureGroup& group,
                                          StateImageHandle checkpoint,
                                          std::optional<runtime::CheckpointRef> replacement,
-                                         bool publish_anchor) {
+                                         bool publish_anchor, bool anchor_set_was_full,
+                                         detail::PhysicalResources priced_replacement) {
     detail::PhysicalResources removed;
     if (group.rewrite) {
         if (sequence.rewrite_state && *sequence.rewrite_state != checkpoint) {
@@ -10615,7 +10727,10 @@ ProgramImplCore::install_private_capture(SequenceState& sequence, const CaptureG
         const std::size_t capacity_limit = context_cache.max_long_anchors_per_continuation.value();
         validate_long_anchor_ordinals(sequence.long_anchors, capacity_limit);
         std::uint32_t ordinal = 0;
-        if (sequence.long_anchors.size() == capacity_limit) {
+        // The PRICED branch decides this, not the live size: with room at pricing time the group
+        // appends a new anchor, and the ladder moving other owners' anchors in between must not
+        // turn that append into a replacement (the effect was already priced as an append).
+        if (anchor_set_was_full) {
             if (!replacement || replacement->kind != runtime::CheckpointKind::LongAnchor) {
                 throw std::logic_error("full long-anchor set has no selected replacement");
             }
@@ -10657,7 +10772,14 @@ ProgramImplCore::install_private_capture(SequenceState& sequence, const CaptureG
         });
         validate_long_anchor_ordinals(sequence.long_anchors, capacity_limit);
     }
-    return removed;
+    // 缓存模块v2.md §三 R1: 前奏必须排在容量等式之前. The releases above still ran, but the ACCOUNTING
+    // for what this group's replacement frees was fixed when the capture's effect was priced, and
+    // the ladder may have changed a dropped checkpoint's residency since (a demote turns a
+    // Device-only replica into a Host-only one, so the same drop reports a different axis). Letting
+    // that live re-derivation reach the caller made the published effect disagree with the priced
+    // one and latched the engine ("active capture replacement effect changed after reservation",
+    // 2026-09-29 rig pool_soak: priced removed{st=1}, published removed{hst=1}).
+    return priced_replacement;
 }
 
 bool ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transaction) {
@@ -11027,7 +11149,9 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
         removed = checked_resource_sum(
             removed, install_private_capture(sequence, transaction.group, transaction.source_state,
                                              transaction.private_replacement,
-                                             transaction.publish_anchor));
+                                             transaction.publish_anchor,
+                                             transaction.priced_with_full_anchor_set,
+                                             transaction.priced_private_replacement));
     }
     if (transaction.replaces_shared) {
         if (!transaction.shared_index) {

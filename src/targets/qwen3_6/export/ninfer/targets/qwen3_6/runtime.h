@@ -752,6 +752,17 @@ struct CaptureAssessment {
     // under the ladder). The closure is then still published, and this flag says the group's anchor
     // is not part of it.
     bool publishes_anchor = true;
+    // Whether the long-anchor set was ALREADY FULL when this capture was priced. That fullness
+    // decides `install_private_capture`'s branch - below the limit the group APPENDS an anchor
+    // (costing a Device state slot), at the limit it REPLACES the selected victim (costing a Host
+    // one) - so it is part of the capacity equation and must not be re-read at publication. The
+    // ladder degrades OTHER owners' anchors while the capture still needs a Host slot for its
+    // snapshot, so the live size can move in between; re-reading it made the re-derived `removed`
+    // disagree with the priced one and latched the engine with "active capture replacement effect
+    // changed after reservation" (2026-09-29 rig pool_soak: priced at 7/8 anchors as removed{st=1},
+    // published at 8/8 as removed{hst=1}). 缓存模块v2.md §三 R1 puts the prelude BEFORE the
+    // capacity equation for exactly this reason.
+    bool priced_with_full_anchor_set = false;
     bool needs_transfer                   = false;
     bool physically_feasible              = false;
     bool recycles_private_state           = false;
