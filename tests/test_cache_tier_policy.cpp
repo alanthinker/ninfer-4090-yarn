@@ -753,10 +753,75 @@ void case_move_alternative_answers_every_short_pool() {
           "with only Device state short, the state move covers and the KV alternative does not");
 }
 
+// Reproduced: a Host-water-line demand that can never be met must not swallow the plan.
+//
+// 2026-09-29 production, pool saturated (host KV 31.98/32 GiB, device KV 10236/10284 pages):
+// a 4,136-token request sat in the queue for its whole 5-minute deadline and was cancelled with
+// `output 0`. The plan line for it reads
+//
+//   [cache] gap dkv=73 dbkv=73 dstate=1 hkv=2197618688 hstate=0 rows=0
+//         | free dkv=50 dbkv=55 dstate=8 hkv=19394560 hstate=0 rows=292
+//         | cand=236 steps=62 | gaps dkv=23 dbkv=18 ...
+//   [ladder] non-destructive-exhausted drop=0 demote=0 evicthost=0 dropck=0 host_free=2 dev=0/8
+//
+// ③ raises `Demand::host_kv` by the 2 GiB water line so a later demote always has somewhere to
+// land. With Host nearly full that demand becomes a ~2.18 GB gap that NO amount of cache can
+// close, and the release loop walks its whole candidate list chasing it: all 62 steps came back
+// `removed main=0` (Host-side drops), the Device-KV gap of 23 pages was never answered, and the
+// plan then failed its own simulation and was discarded as a whole (§八) - the request waited out
+// its deadline against a pool it could have been served from.
+//
+// The water line is a PREFERENCE, not a requirement: ③'s own comment says it exists "so a demote
+// always has room to land", which only matters when the plan actually moves Device data to Host.
+// It must never turn an answerable Device gap into an unanswerable plan.
+void case_unreachable_host_water_line_does_not_swallow_the_device_gap() {
+    std::printf("case_unreachable_host_water_line_does_not_swallow_the_device_gap\n");
+    // The production numbers, rounded to what the policy actually takes: bytes for Host, pages
+    // for Device.
+    TierOccupancy occ = occupancy(/*device_kv_cap=*/10284, /*device_kv_used=*/10261,
+                                  /*host_kv_cap=*/32ULL << 30, /*host_kv_used=*/(32ULL << 30) - (19ULL << 20));
+    occ.device_backend_kv_capacity = 10284;
+    occ.device_backend_kv_used     = 10261;
+    occ.device_state_used          = 0;
+    occ.device_state_capacity      = 8;   // the `device_state = 1` demand fits: state is NOT the
+                                          // binding axis here, the Device KV pages are
+    occ.host_state_capacity        = 320;
+
+    // Two idle conversations holding Device pages the plan could move, plus Host-side cache the
+    // release loop can drop for the water line.
+    const std::vector<Datum> pool{
+        {.id = 1, .device_kv = 40, .device_backend_kv = 40, .host_kv = 64ULL << 20,
+         .host_state = 2, .catalog_row = 1, .importance = 10},
+        {.id = 2, .device_kv = 40, .device_backend_kv = 40, .host_kv = 64ULL << 20,
+         .host_state = 2, .catalog_row = 1, .importance = 20},
+    };
+
+    // The production decomposition of that request's Host demand: ~41 MB of landing the plan
+    // really owes (41 Device pages at the rig's page stride), on top of ③'s 2 GiB water line, with
+    // Host KV 19 MB from its cap. The landing fits in what the two idle owners can hand back; the
+    // water line can never be reached, and reaching it is not this plan's job.
+    // ③ declares its water line through `host_kv_preference`; everything above it is the landing
+    // the plan actually owes.
+    const Plan outcome = decide(Demand{.device_kv = 73,
+                                       .device_backend_kv = 73,
+                                       .device_state = 1,
+                                       .host_kv = ((41ULL + 8) << 20) + (2ULL << 30),
+                                       .host_state = 0,
+                                       .catalog_rows = 0,
+                                       .host_kv_preference = (2ULL << 30)},
+                                occ, pool);
+
+    check(!outcome.enqueue,
+          "a 23-page Device gap must be answered even when the Host water line cannot be reached");
+    check(action_kv(outcome, Action::SpillToHost) >= 23,
+          "the Device gap is closed by moving the idle owners' Device KV to Host");
+}
+
 }  // namespace
 
 int main() {
     case_move_alternative_answers_every_short_pool();
+    case_unreachable_host_water_line_does_not_swallow_the_device_gap();
     case_backend_pool_closes_independently();
     case_shell_group_release_closes_device_gap();
     case_shell_pass_defers_to_move();

@@ -92,6 +92,20 @@ struct Demand {
     // 1 when the incoming conversation has nowhere to publish itself (no vacant row and no
     // source row it may consume), else 0.
     std::uint64_t catalog_rows  = 0;
+    // How much of `host_kv` is ③'s water line rather than a landing this plan must place.
+    //
+    // The two are different requirements and the plan must not treat them alike. A landing the
+    // plan's own moves will occupy is a REQUIREMENT: if Host cannot receive it the move is not
+    // legal (§三 R1 never destroys Device data), so the plan may not promise it. The water line is
+    // a PREFERENCE: it exists so a LATER demote has somewhere to land, and failing to reach it
+    // says nothing about whether THIS request can be served.
+    //
+    // Folding them together turned the water line into a hard gap. On 2026-09-29 production, with
+    // Host KV at 31.98/32 GiB, ③ turned a 4,136-token request into `hkv=2197618688` against 19 MB
+    // free: the release loop walked all 236 candidates chasing ~2.18 GB, every step came back
+    // `removed main=0`, the 23-page Device gap went unanswered, and the plan then failed its own
+    // simulation and was discarded whole (§八) - the request waited out its 5-minute deadline.
+    std::uint64_t host_kv_preference = 0;
 };
 
 // One cached CONVERSATION - the unit of retention. `id` is its catalog row.
@@ -272,7 +286,13 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
         shortfall(need.device_backend_kv, occupancy.device_backend_kv_free());
     const std::uint64_t device_state_gap =
         shortfall(need.device_state, occupancy.device_state_free());
-    const std::uint64_t host_kv_gap    = shortfall(need.host_kv, occupancy.host_kv_free());
+    // The Host KV gap is the LANDING this plan owes, with ③'s water line taken out: a preference
+    // that cannot be reached must not become a gap the plan is judged against (see
+    // `Demand::host_kv_preference`). `need.host_kv` still carries the water line as a demand the
+    // release loop may chase - it stops early when the plan's own landing is covered.
+    const std::uint64_t host_kv_required =
+        need.host_kv > need.host_kv_preference ? need.host_kv - need.host_kv_preference : 0;
+    const std::uint64_t host_kv_gap    = shortfall(host_kv_required, occupancy.host_kv_free());
     const std::uint64_t host_state_gap = shortfall(need.host_state, occupancy.host_state_free());
     const std::uint64_t rows_gap = shortfall(need.catalog_rows, occupancy.catalog_rows_vacant);
 
@@ -326,6 +346,12 @@ inline Plan plan(const Demand& need, const TierOccupancy& occupancy,
     for (const Datum* datum : candidates) {
         // Device STATE is deliberately absent here: a release cannot deliver it (see below), so the
         // loop must not keep walking for it. The R1 loop and the simulation verdict own that axis.
+        //
+        // The loop serves the REQUIRED gaps only, ③'s water line excluded: releasing more cache to
+        // push Host toward the water line spends retention on a "maybe later" margin, and on a
+        // nearly-full Host it would spend the WHOLE pool without ever reaching it (2026-09-29: all
+        // 236 candidates walked for a ~2.18 GB line against 19 MB free). The line stays in
+        // `Demand::host_kv` as something a later round may still reach; it just is not owed here.
         if (host_kv_freed >= host_kv_gap && host_state_freed >= host_state_gap &&
             rows_freed >= rows_gap &&
             released_device_kv >= device_kv_gap &&

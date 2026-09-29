@@ -810,6 +810,14 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
                                             program->host_headroom_bytes),
         .host_state        = peak.host.state_slots + shed_device_state,
         .catalog_rows      = need_rows,
+        // ③'s water line is declared as a PREFERENCE: it must not be able to fail the plan.
+        // With Host nearly full the line is unreachable by construction, and treating it as a
+        // requirement made the release loop walk the whole pool chasing it while the Device gap
+        // the request actually needed went unanswered (2026-09-29 production: `hkv=2197618688`
+        // against 19 MB free, 62 steps all `removed main=0`, a 4,136-token request parked for its
+        // full 5-minute deadline).
+        .host_kv_preference = std::min<std::uint64_t>(program->host_headroom_bytes,
+                                                     host_kv_demand(peak.host.kv_bytes, 0, 0)),
     };
 
     // For every victim, ask what MOVING it can actually hand back to Device. This is NOT the same
@@ -1107,12 +1115,16 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
     for (int round = 0; round < 3 && !plan.enqueue; ++round) {
         apply_plan();
         // The iterative re-plan must carry the same water line, otherwise raising the demand
-        // below would wash it out after the first round - same function, same terms.
+        // below would wash it out after the first round - same function, same terms. The
+        // preference term is re-stated because `demand.host_kv` may have grown: it must keep
+        // naming the SAME absolute water line, never grow into a requirement.
         const std::uint64_t want = host_kv_demand(
             host_kv(residual), applied_landing_pages() * page_bytes, program->host_headroom_bytes);
         if (want <= demand.host_kv) { break; }
-        demand.host_kv = want;
-        plan           = cachep::plan(demand, tiers, pool);
+        demand.host_kv          = want;
+        demand.host_kv_preference =
+            std::min<std::uint64_t>(program->host_headroom_bytes, want);
+        plan = cachep::plan(demand, tiers, pool);
     }
     if (plan.enqueue) { apply_plan(); } // keep the diagnostic views consistent
     if (const char* diag = std::getenv("NINFER_REUSE_DIAG"); diag == nullptr || *diag != '0') {
