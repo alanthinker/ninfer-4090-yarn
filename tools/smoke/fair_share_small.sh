@@ -204,9 +204,11 @@ for round_index in range(3):
                          "content": f"session{session} sibling r{round_index} " + ("token " * 600)})
         results.append(post(messages, f"s{session}.sib{round_index}"))
 
-# The agent launcher writes its own JSONL name inside the harness dir.
-log_path = os.environ.get("FSL_REQUEST_LOG") or os.path.join(
-    os.environ["NINFER_HARNESS_DIR"], "request_log_agent.jsonl")
+# The instance writes the path the launcher was told to use, and that is NINFER_REQUEST_LOG -
+# the same variable full_battery.sh --rig reads for its occupancy gate. Deriving a second name here
+# (the launcher's old request_log_agent.jsonl default) is what let a whole battery read a stale
+# build/harness file and fail its saturation gate on peak=-1 (2026-09-30).
+log_path = os.environ["NINFER_REQUEST_LOG"]
 occupancy = {}
 for line in reversed(open(log_path, errors="ignore").read().splitlines()):
     if '"occupancy"' in line:

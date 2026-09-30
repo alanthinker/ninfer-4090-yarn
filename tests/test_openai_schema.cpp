@@ -793,6 +793,65 @@ int test_stream_observations() {
     return failures;
 }
 
+// Regression: a capacity miss during materialization re-admits the request
+// (engine_core.h `retry_materialization_after_capacity_miss`, observed 2026-09-30 as
+// "re-admit after progress capacity miss site=paged_kv_cache: DeviceKVPagePool
+// resize_reservation"). That path clears the Engine's published `stream_start` so the next
+// admission can publish generation start again, and the retried admission delivers a second
+// `on_start` to the same encoder. The encoder already accepted the first one, so treating the
+// repeat as a state violation turned a recoverable re-admission into HTTP 500
+// "invalid OpenAI Chat generation-start state".
+int test_stream_generation_start_republication() {
+    int failures = 0;
+    OpenAIChatStream stream(identity(), true, false, true);
+    (void)stream.start();
+    const auto begin = [](std::uint32_t total, std::uint32_t reused) {
+        return ninfer::GenerationStart{.prompt = {.prompt_tokens = total},
+                                       .reused_prompt_tokens = reused};
+    };
+
+    stream.note_start(begin(32, 12));
+    const Json first = parse_sse(stream.initial_prompt_progress());
+    failures += check(first["prompt_progress"]["total"] == 32 &&
+                          first["prompt_progress"]["cache"] == 12,
+                      "generation start publishes the admitted prompt frontier once");
+
+    // The Engine re-admits after a capacity miss and publishes the same boundary again.
+    failures += check(!throws_logic([&] { stream.note_start(begin(32, 12)); }),
+                      "a re-published generation start is accepted instead of failing the stream");
+    failures += check(!throws_logic([&] { stream.prompt_progress(ninfer::PromptProgress{
+                                          .total_prompt_tokens     = 32,
+                                          .reused_prompt_tokens    = 12,
+                                          .processed_prompt_tokens = 12,
+                                          .elapsed_ns              = 0,
+                                      }); }),
+                      "the re-published boundary keeps prompt progress consistent");
+
+    // The opening progress frame was already streamed; the repeat has nothing left to send and
+    // must not raise the state error that used to surface as HTTP 500.
+    failures += check(stream.initial_prompt_progress().empty(),
+                      "a re-published generation start does not re-emit the opening progress");
+    const Json resumed = parse_sse(stream.prompt_progress(ninfer::PromptProgress{
+        .total_prompt_tokens     = 32,
+        .reused_prompt_tokens    = 12,
+        .processed_prompt_tokens = 18,
+        .elapsed_ns              = 20000000,
+    }));
+    failures += check(resumed["prompt_progress"]["processed"] == 18,
+                      "prompt progress resumes from the re-admitted prefill frontier");
+
+    // A repeat may not contradict the boundary already reported to the client: the transport
+    // already sent the first prompt_progress frame, so a different total or cache figure would
+    // describe a prompt the client never submitted.
+    failures += check(throws_logic([&] { stream.note_start(begin(32, 20)); }),
+                      "a re-published generation start may not move the prompt frontier");
+    failures += check(throws_logic([&] { stream.note_start(begin(48, 12)); }),
+                      "a re-published generation start may not change the prompt length");
+    failures += check(throws_logic([&] { stream.note_start(begin(32, 33)); }),
+                      "a generation start may not reuse more tokens than the prompt holds");
+    return failures;
+}
+
 int test_common_objects() {
     int failures      = 0;
     const Json models = Json::parse(make_models_list("qwen", 7, 240000));
@@ -839,6 +898,7 @@ int main() {
     failures += test_aggregate_response();
     failures += test_stream_response();
     failures += test_stream_observations();
+    failures += test_stream_generation_start_republication();
     failures += test_common_objects();
     if (failures == 0) { std::cout << "OpenAI Chat protocol tests passed\n"; }
     return failures == 0 ? 0 : 1;

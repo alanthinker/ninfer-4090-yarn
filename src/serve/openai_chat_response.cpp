@@ -301,9 +301,23 @@ std::string OpenAIChatStream::start() {
 }
 
 void OpenAIChatStream::note_start(const ninfer::GenerationStart& start) {
-    if (!started_ || admitted_ || finished_ ||
-        start.reused_prompt_tokens > start.prompt.prompt_tokens) {
+    if (!started_ || finished_) {
         throw std::logic_error("invalid OpenAI Chat generation-start state");
+    }
+    if (start.reused_prompt_tokens > start.prompt.prompt_tokens) {
+        throw std::logic_error("generation start reuses more tokens than the prompt holds");
+    }
+    // A capacity miss during materialization re-admits the request and publishes generation start
+    // again for the same prompt (engine_core.h `retry_materialization_after_capacity_miss` clears
+    // the boundary it published so the retried admission can publish it). The transport has
+    // already streamed the first boundary, so the repeat is idempotent when it agrees with what
+    // the client already saw. Rejecting it turned a recoverable re-admission into HTTP 500.
+    if (admitted_) {
+        if (start.prompt.prompt_tokens != prompt_tokens_ ||
+            start.reused_prompt_tokens != cached_tokens_) {
+            throw std::logic_error("re-published generation start contradicts the streamed frontier");
+        }
+        return;
     }
     admitted_      = true;
     prompt_tokens_ = start.prompt.prompt_tokens;
@@ -311,9 +325,13 @@ void OpenAIChatStream::note_start(const ninfer::GenerationStart& start) {
 }
 
 std::string OpenAIChatStream::initial_prompt_progress() {
-    if (!return_progress_ || !started_ || !admitted_ || progress_started_ || finished_) {
+    if (!return_progress_ || !started_ || !admitted_ || finished_) {
         throw std::logic_error("invalid OpenAI Chat initial prompt-progress state");
     }
+    // The opening prompt-progress frame is emitted once. A re-admission after a capacity miss
+    // publishes generation start again, and the boundary it repeats is the one this frame already
+    // reported, so the repeat has nothing left to send.
+    if (progress_started_) { return std::string(); }
     progress_started_         = true;
     last_progress_tokens_     = cached_tokens_;
     last_progress_elapsed_ns_ = 0;

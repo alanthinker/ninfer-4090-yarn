@@ -26,6 +26,14 @@ int check(bool condition, const std::string& message) {
     return 1;
 }
 
+template <typename Function>
+bool throws_logic(Function&& function) {
+    try {
+        function();
+    } catch (const std::logic_error&) { return true; }
+    return false;
+}
+
 Json base_request() {
     return Json{{"model", "claude-local"},
                 {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
@@ -774,6 +782,29 @@ int test_stream() {
     failures += check(provisional["message"]["usage"]["input_tokens"] == 25 &&
                           provisional["message"]["usage"]["cache_read_input_tokens"].is_null(),
                       "pre-admission stream error prefix fabricated cache usage");
+
+    // Regression: a capacity miss during materialization re-admits the request and publishes
+    // generation start again (engine_core.h `retry_materialization_after_capacity_miss`, seen in
+    // production on 2026-09-30). message_start was already streamed with its cache accounting, so
+    // the repeat must be idempotent instead of reporting "stream already started" as HTTP 500.
+    AnthropicMessagesStream readmitted(identity, 100);
+    (void)readmitted.start(warm_start);
+    failures += check(!throws_logic([&] { (void)readmitted.start(warm_start); }),
+                      "a re-published Anthropic start is accepted instead of failing the stream");
+    failures += check(throws_logic([&] {
+                          (void)readmitted.start(ninfer::GenerationStart{
+                              .prompt               = ninfer::PromptSummary{.prompt_tokens = 100},
+                              .reused_prompt_tokens = 30,
+                          });
+                      }),
+                      "a re-published Anthropic start may not move the streamed cache frontier");
+    failures += check(throws_logic([&] {
+                          (void)readmitted.start(ninfer::GenerationStart{
+                              .prompt               = ninfer::PromptSummary{.prompt_tokens = 100},
+                              .reused_prompt_tokens = 100,
+                          });
+                      }),
+                      "a re-published Anthropic start may not move the streamed cache frontier up");
     return failures;
 }
 

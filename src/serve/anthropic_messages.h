@@ -74,6 +74,9 @@ private:
     AnthropicResponseIdentity identity_;
     std::string reasoning_;
     std::string content_;
+    // Cache accounting carried by the message_start frame, kept so a re-published generation
+    // start can be recognized as the same prompt instead of starting the stream twice.
+    std::optional<int> cache_read_tokens_;
     int input_tokens_   = 0;
     int next_index_     = 0;
     int thinking_index_ = -1;

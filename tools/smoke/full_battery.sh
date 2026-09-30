@@ -48,8 +48,13 @@ MODE="${1:-prod}"
 PORT=30000
 if [ "$MODE" = "--rig" ]; then
     TOTAL=48
-    export NINFER_SERVICE_LOG="${NINFER_SERVICE_LOG:-$PWD/build/harness/ninfer_serve_agent.log}"
-    export NINFER_REQUEST_LOG="${NINFER_REQUEST_LOG:-$PWD/build/harness/request_log_agent.jsonl}"
+    # This is a CLIENT: it must read the instance fair_share_small.sh started, which writes inside
+    # NINFER_HARNESS_DIR (/tmp/fs-small-<label>). Defaulting to $PWD/build/harness instead made the
+    # occupancy gate read whatever stale file happened to sit there - no records inside the battery
+    # window, so peak stayed -1 and the saturation gate failed the run (2026-09-30).
+    export NINFER_HARNESS_DIR="${NINFER_HARNESS_DIR:-$PWD/build/harness}"
+    export NINFER_SERVICE_LOG="${NINFER_SERVICE_LOG:-$NINFER_HARNESS_DIR/ninfer_serve_agent.log}"
+    export NINFER_REQUEST_LOG="${NINFER_REQUEST_LOG:-$NINFER_HARNESS_DIR/request_log_agent.jsonl}"
     # Saturation: fill at MSG780 reaches the ever-full peak (>=46) within cap6 sessions
     # (probe-measured: 5,19,33,43,45,46); the small-session top-up below is the fallback.
     export NINFER_FILL_MSG_TOKENS="${NINFER_FILL_MSG_TOKENS:-780}"
@@ -138,11 +143,12 @@ else
     IMPORTANT_FLOOD_TURNS="${NINFER_IMPORTANT_FLOOD_TURNS:-4}"
 fi
 export NINFER_REQDUMP_DIR="${NINFER_REQDUMP_DIR:-$(dirname "$NINFER_SERVICE_LOG")/reqdump}"
-# pool_soak's replay directory lives next to the service's runtime files (prod: deploy-yarn/soak_dumps).
-# /tmp/crash243 - the 2026-09-22 incident dumps - was /tmp-resident and is not reproducible on other
-# hosts (this machine mounts /tmp per-process ro), so the recorded sequence is kept as a snapshot of
-# recent live request dumps in that directory instead.
-SOAK_DIR="${NINFER_SOAK_DIR:-$(dirname "$NINFER_SERVICE_LOG")/soak_dumps}"
+# pool_soak's replay fixtures are repository test data, not this instance's runtime files: the
+# snapshot lives in deploy-yarn/soak_dumps and is tracked there. Deriving it from the service log's
+# directory only worked in prod mode, where that directory happens to be deploy-yarn; in --rig mode
+# the service log sits in /tmp/fs-small-<label>, so the path pointed at an empty directory and
+# pool_soak exited rc=1 in 0s without replaying anything (2026-09-30).
+SOAK_DIR="${NINFER_SOAK_DIR:-$(cd "$HERE/../.." && pwd)/../deploy-yarn/soak_dumps}"
 S="$NINFER_SERVICE_LOG"
 FULL_AT=$((TOTAL - 2))
 # The ceiling path: how close to the total a plateauing pool must get before "this configuration

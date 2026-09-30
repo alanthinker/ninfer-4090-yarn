@@ -76,7 +76,13 @@ PENDING_TIMEOUT_MS="${AGENT_PENDING_TIMEOUT_MS:-60000}"  # tests fail fast: an R
 # Diagnostics ON by default: a TEST rig must emit the evidence its suites assert on
 # (fair_share_sim greps `reuse-diag: ... fair=N ... CANDIDATE`, gated by NINFER_REUSE_DIAG).
 REUSE_DIAG="${REUSE_DIAG:-1}"
-REQUEST_LOG="${AGENT_REQUEST_LOG:-$NINFER_HARNESS_DIR/request_log_agent.jsonl}"
+# NINFER_REQUEST_LOG is the path every reader uses (harness_paths.py, pool_soak.sh, the battery's
+# occupancy gate), so the instance must write there or the readers inspect a file this run never
+# touched. It used to answer only to AGENT_REQUEST_LOG and default to request_log_agent.jsonl,
+# which no caller passes: full_battery.sh --rig then read a stale build/harness file and its
+# saturation gate failed on peak=-1 - no records inside the battery window (2026-09-30).
+REQUEST_LOG="${NINFER_REQUEST_LOG:-${AGENT_REQUEST_LOG:-$NINFER_HARNESS_DIR/request_log_agent.jsonl}}"
+export NINFER_REQUEST_LOG="$REQUEST_LOG"
 
 # Parameter gate: refuse a rig that cannot bind the axes this harness exists to test.
 #

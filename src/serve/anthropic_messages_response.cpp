@@ -226,12 +226,24 @@ std::string AnthropicMessagesStream::start(const ninfer::GenerationStart& genera
     if (generation.prompt.prompt_tokens != static_cast<std::uint32_t>(input_tokens_)) {
         throw std::logic_error("Anthropic stream prompt count differs from Engine start");
     }
+    // A capacity miss during materialization re-admits the request and publishes generation start
+    // again for the same prompt (engine_core.h `retry_materialization_after_capacity_miss`). The
+    // message_start frame already streamed the cache accounting, so the repeat is idempotent only
+    // while it agrees with that frame; anything else would describe a prompt the client never sent.
+    if (started_) {
+        if (finished_ || !cache_read_tokens_ ||
+            *cache_read_tokens_ != static_cast<int>(generation.reused_prompt_tokens)) {
+            throw std::logic_error("re-published Anthropic start contradicts the streamed message");
+        }
+        return std::string();
+    }
     return start_with_cache(static_cast<int>(generation.reused_prompt_tokens));
 }
 
 std::string AnthropicMessagesStream::start_with_cache(std::optional<int> cache_read_input_tokens) {
     if (started_ || finished_) { throw std::logic_error("Anthropic stream already started"); }
-    started_ = true;
+    started_           = true;
+    cache_read_tokens_ = cache_read_input_tokens;
     const Json message{{"id", identity_.message_id},
                        {"type", "message"},
                        {"role", "assistant"},
