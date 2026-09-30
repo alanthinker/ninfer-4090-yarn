@@ -8994,7 +8994,67 @@ bool ProgramImplCore::release_one_cached_unit() {
     // never touches the executing conversation, an in-flight reservation, or Device data without
     // spilling it first. Returns false when nothing is releasable, which is the only state in which
     // waiting (R0) is the honest answer.
-    return release_one_device_state_slot(/*allow_degrade=*/true, nullptr);
+    if (release_one_device_state_slot(/*allow_degrade=*/true, nullptr)) { return true; }
+    // The state half is not the only unit a request can be short of, and it is the wrong one when
+    // the deficit is Device KV PAGES: a state slot does not move a page. Without this second half
+    // the caller concluded "nothing is releasable", parked the request on its negative memo, and
+    // the request then waited for a pool change that could never come because the engine was idle
+    // - which is the state §三 R0 forbids ("空转等待只会把一次可服务的重算换成队列超时").
+    // Measured 2026-09-29/30 production: req#629/#650/#652/#654 each sat at `running 0 | waiting 1`
+    // for the full 300 s deadline (HTTP 499) with 36 `spill declined ... stage=noruns`, and the
+    // identical conversation was served in 2.9 s at 99.2% reuse moments later.
+    //
+    // §三 R1's own half: move ONE cold owner's Device KV to Host. That frees Device pages for the
+    // request waiting on them, and it is the step the ladder would have run had the gate credited
+    // it. One owner per call, the same unit the relief credit prices.
+    return spill_one_movable_owner_device_kv();
+}
+
+bool ProgramImplCore::spill_one_movable_owner_device_kv() {
+    // Walk the one chain (§2.2) - the same order every other ladder step uses - and move the first
+    // owner that still has Device pages to give. Only an idle (Catalogued) owner is eligible, the
+    // in-flight reservation's own source stays excluded, and `spill_owner_device_kv_to_host`
+    // re-checks the page gates and DECLINES rather than latching, so an unmovable owner never kills
+    // the step. Returns false only when no owner can move, which is when R0 waiting is honest.
+    const auto try_owner = [&](std::uint32_t index) -> bool {
+        if (index >= continuation_capacity) { return false; }
+        if (continuation_slots[index].role != ContinuationSlotRole::Catalogued) { return false; }
+        if (!continuation_states[index].kv) { return false; }
+        if (std::find(retire_exclude_.begin(), retire_exclude_.end(), index) !=
+            retire_exclude_.end()) {
+            return false;
+        }
+        if (owner_holds_release_protected_state(index)) { return false; }
+        if (materialization_pins(index, continuation_slots[index].generation)) { return false; }
+        return spill_owner_device_kv_to_host(index, /*shared=*/false, /*exclude_shared=*/false,
+                                             ProgramPendingForkPrefix{});
+    };
+    for (const runtime::RetirePreferenceEntry& entry : retire_preference_) {
+        if (entry.shared_prefix) { continue; }
+        if (try_owner(entry.slot)) { return true; }
+    }
+    struct AgeCandidate {
+        std::uint64_t age;
+        std::uint32_t slot;
+    };
+    std::vector<AgeCandidate> aged;
+    aged.reserve(continuation_capacity);
+    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
+        if (continuation_slots[index].role != ContinuationSlotRole::Catalogued) { continue; }
+        const SequenceState& sequence = continuation_states[index];
+        if (!sequence.kv) { continue; }
+        aged.push_back(AgeCandidate{
+            .age  = state_store->last_touched(sequence.state.read),
+            .slot = index,
+        });
+    }
+    std::sort(aged.begin(), aged.end(), [](const AgeCandidate& left, const AgeCandidate& right) {
+        return left.age < right.age;
+    });
+    for (const AgeCandidate& candidate : aged) {
+        if (try_owner(candidate.slot)) { return true; }
+    }
+    return false;
 }
 
 bool ProgramImplCore::release_one_device_state_slot(bool allow_degrade, bool* did_degrade) {
@@ -9350,15 +9410,123 @@ std::pair<std::uint32_t, std::uint32_t> ProgramImplCore::attribute_pressure_move
     return {main, backend};
 }
 
+// Pages of one owner's KV that the spill step could move right now: Device-resident and past every
+// per-page gate `spill_owner_device_kv_to_host` re-checks (`writer_references`, `source_pins`,
+// active reference). `exclude_shared` mirrors that step's own flag, so a jointly-held page is not
+// counted - the ladder will not take it either.
+std::uint32_t ProgramImplCore::movable_device_kv_pages(const KVAddressSpaceStore& addresses,
+                                                       const LogicalKVPageStore& pages,
+                                                       KVAddressSpaceHandle address,
+                                                       bool exclude_shared) const noexcept {
+    if (!addresses.valid(address)) { return 0; }
+    std::uint32_t movable = 0;
+    const std::uint32_t mapped = addresses.mapped_pages(address);
+    for (std::uint32_t page = 0; page < mapped; ++page) {
+        const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+        if (!pages.device_resident(logical) || pages.writer_references(logical) != 0 ||
+            pages.source_pins(logical) != 0 || addresses.has_active_reference(logical)) {
+            continue;
+        }
+        if (exclude_shared && pages.address_references(logical) > 1) { continue; }
+        ++movable;
+    }
+    return movable;
+}
+
+detail::KvMovableRelief ProgramImplCore::movable_device_kv_relief() const noexcept {
+    detail::KvMovableRelief out;
+    if (text_kv_addresses == nullptr || text_kv_pages == nullptr) { return out; }
+    // The ladder only ever moves an IDLE (Catalogued) owner, so a page held by an Active or
+    // reserved owner is not deliverable however Device-resident it is.
+    const auto count_private = [&](std::uint32_t index) {
+        if (index >= continuation_capacity ||
+            continuation_slots[index].role != ContinuationSlotRole::Catalogued) {
+            return;
+        }
+        const SequenceState& sequence = continuation_states[index];
+        if (!sequence.kv) { return; }
+        out.main_kv_pages += movable_device_kv_pages(*text_kv_addresses, *text_kv_pages,
+                                                     sequence.kv->text, /*exclude_shared=*/true);
+        if (sequence.kv->backend && backend_kv_addresses != nullptr && backend_kv_pages != nullptr) {
+            out.backend_kv_pages +=
+                movable_device_kv_pages(*backend_kv_addresses, *backend_kv_pages,
+                                        *sequence.kv->backend, /*exclude_shared=*/true);
+        }
+    };
+    for (std::uint32_t index = 0; index < continuation_capacity; ++index) { count_private(index); }
+    // Shared prefixes carry KV too, and the ladder's shared step moves them the same way.
+    for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
+        if (shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued ||
+            shared_prefix_states[index].active_references != 0) {
+            continue;
+        }
+        const SharedPrefixState& shared = shared_prefix_states[index];
+        if (!shared.kv) { continue; }
+        out.main_kv_pages += movable_device_kv_pages(*text_kv_addresses, *text_kv_pages,
+                                                     shared.kv->text, /*exclude_shared=*/true);
+        if (shared.kv->backend && backend_kv_addresses != nullptr && backend_kv_pages != nullptr) {
+            out.backend_kv_pages +=
+                movable_device_kv_pages(*backend_kv_addresses, *backend_kv_pages,
+                                        *shared.kv->backend, /*exclude_shared=*/true);
+        }
+    }
+    return out;
+}
+
+std::size_t ProgramImplCore::releasable_host_kv_bytes() const noexcept {
+    // The Host half of §三 R1's relief. `kv_relief` deliberately credits no Host-KV relief ("the
+    // Host half is left to that scratch landing"), but no scratch landing exists: with Host pinned
+    // full its landing term is free_bytes/stride = 0, so the gate reads the Device-KV relief as 0
+    // and rejects a request the ladder could have served by first releasing ONE cold owner's Host
+    // side and then moving the pages (§三 R1's order). That is the same "读作不可行、实际可服务"
+    // shape that produced the 2026-09-29 stalls, one pool over.
+    //
+    // Bounded to ONE owner, like `host_slot_relief`'s state half: the ladder's
+    // `release_idle_owner_host_side` releases one owner per step and the retry loop calls it again
+    // while it makes progress, so crediting a single releasable owner is what the step actually
+    // delivers per attempt. The measurement is the same one the policy uses for that owner's Host
+    // KV (`owner_exclusive_resources(...).host.kv_bytes`), so the credit and the step agree.
+    if (!state_store || !host_kv_arena) { return 0; }
+    const std::uint32_t protected_index =
+        release_protected_state ? state_store->debug_index(*release_protected_state) + 1U : 0U;
+    if (releasable_host_kv_revision_ == resource_revision_.value &&
+        releasable_host_kv_protected_ == protected_index) {
+        return releasable_host_kv_bytes_;
+    }
+    std::size_t bytes = 0;
+    // The same victim the ladder's R2 walk picks first: the least valuable releasable owner. The
+    // walk below mirrors `release_idle_owner_host_side`'s own candidate gates (catalogued, not
+    // protected, not pinned) so a credit is never given for an owner that step would refuse.
+    const RetireVictim victim = select_retire_victim();
+    if (victim.continuation) {
+        bytes = owner_exclusive_resources(continuation_states[*victim.continuation]).host.kv_bytes;
+    } else if (victim.shared) {
+        bytes = owner_exclusive_resources(shared_prefix_states[*victim.shared]).host.kv_bytes;
+    }
+    releasable_host_kv_revision_  = resource_revision_.value;
+    releasable_host_kv_protected_ = protected_index;
+    releasable_host_kv_bytes_     = bytes;
+    return bytes;
+}
+
 detail::PeakFitRelief ProgramImplCore::kv_relief() const noexcept {
     // The KV half of the release-ladder relief the State dimensions always credited (device-state
     // / host-state). A near-full KV pool is resolved by EVICTING the least-important cold owner's
     // KV - R1 demote Device to the free Host space, cascading into an R2 drop of a cold Host
-    // replica when Host is itself full - never by a reserved headroom. The Device half is bounded
-    // by the Host landing available right now (free Host bytes / the page stride); when both pools
-    // run full the scratch swap pool (a small dedicated landing) extends it so the demote always
-    // has somewhere to land. The Host half is left to that scratch landing: reclaiming a full Host
-    // pool is the both-full case, not a Host-KV relief this gate should pre-credit.
+    // replica when Host is itself full - never by a reserved headroom.
+    //
+    // The Device half is bounded by the Host landing available right now (free Host bytes / the
+    // page stride). There is NO scratch swap pool: this comment used to claim one "extends it so
+    // the demote always has somewhere to land", but `kv_landing_relief` has only ever done the
+    // division below, so with Host pinned full the landing term is 0 and this function returned no
+    // Device relief at all. That gap is now answered where it belongs, by the R2 half §三 R1
+    // prescribes: `physical_peak_fits` additionally credits `releasable_host_kv_bytes`, and the
+    // ladder's own landing failure path calls `release_idle_owner_host_side` - so a full Host pool
+    // is released (R2) rather than swapped through a buffer that does not exist.
+    //
+    // The Host half stays out of THIS function for the same reason as before: reclaiming a full
+    // Host pool is the both-full case, and it is credited through `releasable_host_kv_bytes`
+    // instead, bounded to the one owner the R2 step actually releases.
     detail::PeakFitRelief out;
     if (host_kv_arena == nullptr) { return out; }
     const std::size_t device_main_used =
@@ -9396,6 +9564,32 @@ bool ProgramImplCore::physical_peak_fits(detail::PhysicalResources peak) const n
     detail::PeakFitRelief relief = kv_relief();
     relief.device_state_slots = state_slot_relief(0);
     relief.host_state_slots   = host_slot_relief();
+    // Bound the KV credit by what the ladder can actually MOVE, not by what the pools hold.
+    //
+    // `kv_relief` answers "how much Device KV could land in the free Host space", which is not the
+    // same question: an owner whose pages were already spilled to Host holds no Device pages for
+    // the ladder to take, and crediting them admits a request that then cannot be funded at all.
+    // The pool does not change while the engine is idle, so the re-admission parks on its negative
+    // memo and the request waits out its deadline - 缓存模块v2.md §三 R0 forbids exactly that
+    // ("空转等待只会把一次可服务的重算换成队列超时"). Production 2026-09-29 req#629: the gate
+    // credited 3854 pages, the ladder delivered 145, and the request died at HTTP 499 after
+    // `running 0` for 300 s; the identical conversation was served in 2.9 s right after.
+    //
+    // A credit that is too LOW is safe: it sends the request to R0, which is the honest answer
+    // when nothing could be moved (§三 R0). The min() is what keeps the gate from over-crediting.
+    const detail::KvMovableRelief movable = movable_device_kv_relief();
+    relief.device_main_kv_pages    = std::min(relief.device_main_kv_pages, movable.main_kv_pages);
+    relief.device_backend_kv_pages =
+        std::min(relief.device_backend_kv_pages, movable.backend_kv_pages);
+    // The Host half of §三 R1: when the Host pool is pinned full, `kv_relief`'s landing term is
+    // free_bytes/stride = 0 and the gate reads the Device-KV relief as zero, even though the ladder
+    // frees a cold owner's Host side before retrying the move exactly as R1 prescribes. Credit ONE
+    // releasable owner's Host KV - the same unit `release_idle_owner_host_side` delivers per step -
+    // so a request that needs that release is admitted and served instead of being told it is
+    // infeasible. Never over-credits: the measurement is the step's own victim and its own
+    // `host.kv_bytes`, so the gate cannot promise more than that step can hand back.
+    relief.host_kv_bytes =
+        std::max(relief.host_kv_bytes, releasable_host_kv_bytes());
     return detail::physical_peak_fits_core(occupied, limits, peak, relief);
 }
 

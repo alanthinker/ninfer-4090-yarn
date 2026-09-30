@@ -745,6 +745,9 @@ public:
     // Release ONE unit of the least valuable cached data for an admission that has no plan at
     // all (缓存模块v2.md §三 R0/§2.1). False = nothing left to release, the request parks.
     [[nodiscard]] bool release_one_cached_unit();
+    // Move ONE cold owner's Device KV to Host (§三 R1), the KV half of the R0 relief above. Returns
+    // false when no idle owner has Device pages left to give.
+    [[nodiscard]] bool spill_one_movable_owner_device_kv();
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
@@ -1360,6 +1363,39 @@ private:
     // (req#589/#671). Only the Device half is credited here; the both-full Host half is delivered
     // by the scratch swap pool landing.
     [[nodiscard]] detail::PeakFitRelief kv_relief() const noexcept;
+    // Device KV that the release ladder can ACTUALLY move off the pool right now, per pool.
+    //
+    // `kv_relief` bounds its landing by the Device KV in use, which counts pages the ladder may not
+    // be able to touch: a cold owner whose pages were already spilled to Host holds none of them on
+    // Device any more, so the ladder walks it and reports `stage=noruns`. Crediting those pages let
+    // the admission gate admit a request the ladder then could not fund at all - and because the
+    // pool does not change while the engine is idle, the re-admission parked on its negative memo
+    // instead of making progress (2026-09-29 production req#629: the gate credited 3854 pages from
+    // `host_free/page_bytes`, the ladder delivered 145 from the one owner that still had Device
+    // pages, and the request waited out its full 300 s deadline with `running 0` throughout; the
+    // same conversation served in 2.9 s immediately after, at 99.2% reuse).
+    //
+    // This walks the same owners the ladder walks (idle/catalogued only) and counts the pages that
+    // are Device-resident AND movable by the same per-page gates `spill_owner_device_kv_to_host`
+    // enforces, so the credit is a LOWER BOUND on what the step can deliver. It is deliberately a
+    // cheap scan (one pass over the owner's mapped pages, no Host landing attempt): an estimate
+    // that is too LOW only sends a request to R0, which is the honest §三 R0 answer, whereas one
+    // that is too HIGH is what stranded req#629.
+    [[nodiscard]] detail::KvMovableRelief movable_device_kv_relief() const noexcept;
+    // Host KV bytes that R2 can actually free for a landing, so the gate does not read zero when
+    // the Host pool is pinned full. §三 R1's other half: "内存没有空间接收时，先执行 R2 腾地方，
+    // 再执行 R1" - the ladder does exactly that (`spill_owner_device_kv_to_host` runs
+    // `release_idle_owner_host_side(require_host_state_slot=false)` before retrying its landing),
+    // but the gate credited none of it, so a request that only needed the ladder to release one
+    // cold owner's Host KV was told "infeasible" and waited instead. Bounded to the single least
+    // valuable releasable owner, the same way `host_slot_relief` bounds its state half.
+    [[nodiscard]] std::size_t releasable_host_kv_bytes() const noexcept;
+    // Pages of ONE owner's KV the spill step could move right now (Device-resident and past every
+    // per-page gate that step re-checks). The building block of the relief above.
+    [[nodiscard]] std::uint32_t movable_device_kv_pages(const KVAddressSpaceStore& addresses,
+                                                        const LogicalKVPageStore& pages,
+                                                        KVAddressSpaceHandle address,
+                                                        bool exclude_shared) const noexcept;
     [[nodiscard]] bool
     protected_materialization_page(const MaterializationSourceProtection* protection,
                                    const KVAddressSpaceStore& addresses, std::uint32_t page_offset,
@@ -1513,6 +1549,11 @@ private:
     mutable std::uint64_t retirable_relief_revision_  = std::numeric_limits<std::uint64_t>::max();
     mutable std::uint32_t retirable_relief_protected_ = std::numeric_limits<std::uint32_t>::max();
     mutable std::uint32_t retirable_relief_slots_     = 0;
+    // Same memo shape for the Host-KV relief: the scan walks the catalog, and the feasibility
+    // checks call it once per candidate assessment.
+    mutable std::uint64_t releasable_host_kv_revision_  = std::numeric_limits<std::uint64_t>::max();
+    mutable std::uint32_t releasable_host_kv_protected_ = std::numeric_limits<std::uint32_t>::max();
+    mutable std::size_t releasable_host_kv_bytes_       = 0;
     std::unique_ptr<PreparedPromptData> failed_materialization_prompt_;
     // One step of Device/Host StateImage capacity release, least destructive first: drop a
     // redundant Device replica, demote to Host, evict a redundant Host replica, garbage-collect an

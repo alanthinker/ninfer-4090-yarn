@@ -1216,7 +1216,15 @@ public:
     // so the caller must re-plan instead of trusting its previous verdict.
     [[nodiscard]] bool release_one_cached_unit() {
         ++cached_relief_requests;
-        if (!cached_relief_available) { return false; }
+        // §三 R1's two halves, modelled separately because they answer DIFFERENT deficits: a state
+        // slot does not move a Device KV page, and vice versa. Whichever the request is short of is
+        // the one that has to be available for the relief to be real - the fake refuses to report
+        // progress for a unit the deficit cannot use, exactly as the Program must not.
+        const bool usable = cached_relief_available &&
+                            (relief_axis == CachedReliefAxis::StateSlot
+                                 ? deficit_is_state_slot
+                                 : deficit_is_device_kv);
+        if (!usable) { return false; }
         cached_relief_available   = false;
         required_pressure_actions = 0;
         advance_revision();
@@ -1230,6 +1238,16 @@ public:
     // whether the pool moved.
     bool cached_relief_available       = false;
     std::size_t cached_relief_requests = 0;
+    // Which axis the one releasable unit lives on, and which axis this request is short of.
+    // Production 2026-09-30: the relief was state-slot-only (`release_one_device_state_slot`) while
+    // req#629/#650/#652/#654 were short of Device KV PAGES, so it freed a unit the deficit could
+    // not use, reported "nothing releasable", and the request parked on a negative memo for its
+    // full 300 s deadline at `running 0` (HTTP 499) - the pool could not change because the engine
+    // was idle. The KV half (`spill_one_movable_owner_device_kv`) is what makes relief real here.
+    enum class CachedReliefAxis { StateSlot, DeviceKv };
+    CachedReliefAxis relief_axis     = CachedReliefAxis::StateSlot;
+    bool deficit_is_state_slot       = true;
+    bool deficit_is_device_kv        = false;
     // Shared-replacement model for the §三 R1 invariant: `shared_victim_device_data` says the
     // catalogued shared owner still holds Device replicas, `shared_victim_move_possible` whether its
     // data can be moved to Host, `shared_replacement_moves` counts the move attempts and
@@ -4230,6 +4248,51 @@ void test_unplannable_request_takes_cached_relief_before_parking() {
             "the second request must have asked the ladder too (once per unplannable plan)");
 }
 
+// The R0 relief must serve the axis the request is actually short of. A state-slot unit cannot
+// pay a Device-KV deficit, so a relief that only frees state slots reports "nothing releasable" for
+// a request short of KV pages - and then the negative memo parks it for its whole deadline while the
+// engine sits idle, which is the wait §三 R0 forbids (it is not "waiting for the working set to
+// finish", nothing is running at all).
+//
+// Measured 2026-09-30 production: req#629/#650/#652/#654, each a ~186K-token conversation whose
+// reuse base needed 2,890 Device pages, sat at `running 0 | waiting 1` for exactly 4m59.9s and died
+// at HTTP 499 after 36 `spill declined ... stage=noruns`; the identical conversation was served
+// 2.9 s later at 99.2% reuse. The relief existed (`release_one_device_state_slot`) but released a
+// unit the deficit could not use.
+void test_r0_relief_must_serve_the_axis_the_deficit_is_on() {
+    FakeManager manager = make_manager(4, 8, 1);
+    FakeProgram program;
+    const ActiveRequest seed = start_active(
+        manager, program, 811, make_base(811, FakeCacheSessionKey{811}, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, seed, 4096);
+
+    program.required_pressure_actions = 4;
+    // The one releasable unit is a STATE slot, but this request is short of Device KV pages.
+    program.cached_relief_available = true;
+    program.relief_axis             = FakeProgram::CachedReliefAxis::StateSlot;
+    program.deficit_is_state_slot   = false;
+    program.deficit_is_device_kv    = true;
+
+    const FakeManager::Inspection mismatched =
+        manager.inspect(program, FakePreparedPrompt{812}, make_base(812), 2);
+    require(mismatched.readiness == Readiness::TemporarilyBlocked && !mismatched.relief_taken,
+            "a state-slot relief must not be reported as progress for a Device-KV deficit");
+
+    // With the KV half available - what `spill_one_movable_owner_device_kv` provides - the same
+    // request is relieved and re-planned instead of parking.
+    program.cached_relief_available = true;
+    program.relief_axis             = FakeProgram::CachedReliefAxis::DeviceKv;
+    const FakeManager::Inspection relieved =
+        manager.inspect(program, FakePreparedPrompt{812}, make_base(812), 3);
+    require(relieved.readiness == Readiness::TemporarilyBlocked && relieved.relief_taken,
+            "the KV half of the relief must count as progress for a Device-KV deficit (§三 R1)");
+
+    const FakeManager::Inspection served =
+        manager.inspect(program, FakePreparedPrompt{812}, make_base(812), 4);
+    require(served.readiness == Readiness::Ready || served.readiness == Readiness::NeedsTransfer,
+            "after the KV relief the request must be planned, not parked again");
+}
+
 // Fair-share protection is a VALUE, not an exclusion (缓存模块v2.md §六.4): a shared-capture
 // offer whose only feasible target needs pressure no longer refuses the bucket outright - it
 // RESERVES, and the one importance chain prices the protected session (K + age ranks it
@@ -4438,6 +4501,8 @@ int main() {
              test_retire_order_prices_a_just_read_owner_above_a_stale_deeper_one);
     run_test("unplannable request takes cached relief before parking",
              test_unplannable_request_takes_cached_relief_before_parking);
+    run_test("r0 relief serves the axis the deficit is on",
+             test_r0_relief_must_serve_the_axis_the_deficit_is_on);
     run_test("finished conversations' images are reclaimable",
              test_finished_conversations_images_are_reclaimable);
     test_only_an_ownership_return_may_destroy_device_data();

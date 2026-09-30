@@ -84,6 +84,14 @@ struct PressureTargetProjection {
 // from reading a full pool as "permanently infeasible", which is what made a ~24-page Device
 // shortfall (2026-09-28 req#589: endpoint offered 111,901, main_kv add=515 used=9793 cap=10284)
 // abandon the tail restore for a shallow long anchor and re-derive ~14.7K tokens.
+// Device KV the release ladder can actually move off the pools, per pool. See
+// `ProgramImplCore::movable_device_kv_relief` for why the gate needs this bound rather than the
+// pool's total occupancy.
+struct KvMovableRelief {
+    std::uint32_t main_kv_pages    = 0;
+    std::uint32_t backend_kv_pages = 0;
+};
+
 struct PeakFitRelief {
     std::uint32_t device_state_slots      = 0;
     std::uint32_t device_main_kv_pages    = 0;

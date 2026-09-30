@@ -189,6 +189,88 @@ void case_589_pipeline_relief_makes_tail_feasible() {
           "589: KV eviction relief -> the tail restore is feasible (the fix)");
 }
 
+// --- the gate's KV credit must be bounded by what the ladder can MOVE (production req#629) ---
+
+void case_629_credit_is_bounded_by_movable_pages() {
+    // 2026-09-29 production req#629: a 184,902-token conversation selected a reuse base at
+    // frontier 184,897, so the gate priced a 2,890-page Device-KV peak. Host had 15,417 MiB free,
+    // so `kv_landing_relief` credited 3,854 pages and the gate admitted the request. But every cold
+    // owner's Device pages had already been spilled to Host (36 of them walked as `stage=noruns`),
+    // so the ladder could deliver 145 pages from the one owner that still held Device pages - a 20x
+    // shortfall. The pool does not change while the engine is idle, so the re-admission parked on
+    // its negative memo and the request waited out its full 300 s deadline at `running 0` (HTTP 499
+    // from the client). The same conversation was served 0.5 s later in 2.9 s at 99.2% reuse.
+    const auto occupied = occupied_589();   // main_kv used=9793 of cap 10284
+    const auto limits   = limits_589();
+    const std::uint64_t stride = 4096;      // representative page stride
+    const std::size_t host_free = 15'417ULL * 1024 * 1024;  // req#629 [cache] free hkv
+
+    // What the OLD gate credited: bounded only by the pool's occupancy (9,793 pages in use).
+    const KvLandingRelief landing =
+        kv_landing_relief(host_free, stride, stride, occupied.device.main_kv_pages, 0);
+    check(landing.main_kv_pages == occupied.device.main_kv_pages,
+          "629: the raw landing credit is bounded by TOTAL occupancy, not by what can move");
+
+    // The request's peak. With the raw credit the gate admits; that admission is what stranded it.
+    PhysicalResources peak;
+    peak.device.main_kv_pages = static_cast<std::uint32_t>(landing.main_kv_pages);
+    PeakFitRelief raw;
+    raw.device_main_kv_pages = landing.main_kv_pages;
+    check(physical_peak_fits_core(occupied, limits, peak, raw),
+          "629: the raw credit admits the peak - this is the over-credit the fix removes");
+
+    // What the ladder could actually deliver: 36 owners with nothing Device-resident (`noruns`)
+    // plus the one owner that still had pages. 145 pages, not 9,793.
+    const std::uint32_t movable_pages = 145;
+    PeakFitRelief bounded;
+    bounded.device_main_kv_pages = std::min(landing.main_kv_pages, movable_pages);
+    check(bounded.device_main_kv_pages == movable_pages,
+          "629: the bounded credit is the movable page count, not the occupancy");
+    check(!physical_peak_fits_core(occupied, limits, peak, bounded),
+          "629: with the honest credit the gate refuses the peak, so the request goes to R0 "
+          "(§三 R0) instead of being admitted into a ladder that cannot fund it");
+}
+
+// --- Host pinned full: the gate must credit the R2 relief §三 R1 prescribes ---
+
+void case_host_full_credits_the_releasable_r2_unit() {
+    // §三 R1: "内存没有空间接收时，先执行 R2 腾地方，再执行 R1". With the Host pool pinned full
+    // the landing term of `kv_landing_relief` is free_bytes/stride = 0, so the gate used to read
+    // the Device-KV relief as ZERO and reject a request the ladder could have served by releasing
+    // one cold owner's Host side first. No scratch landing exists (the comment claiming one was
+    // describing an intention, not code), so the R2 unit is the only relief there is.
+    const std::size_t stride = 4096;
+    const KvLandingRelief pinned = kv_landing_relief(/*host_free_bytes=*/0, stride, stride,
+                                                     /*device_main_used=*/5000, 0);
+    check(pinned.main_kv_pages == 0,
+          "host-full: with no free Host bytes the landing term is zero (the pinned-full case)");
+
+    // The short axis is HOST KV, which is exactly the axis §三 R1's R2 half answers: `fits_size`
+    // needs used <= capacity - added, so 1,000 used against a 1,000 cap with a 100-byte add is
+    // 100 bytes short. The ladder closes it by releasing the least valuable cold owner's Host KV
+    // (`release_idle_owner_host_side`), which is the unit the gate failed to credit.
+    PhysicalResources occupied;
+    occupied.device.main_kv_pages = 5000;
+    occupied.host.kv_bytes        = 1000;
+    PhysicalResources limits;
+    limits.device.main_kv_pages = 10284;
+    limits.host.kv_bytes        = 1000;
+    PhysicalResources peak;
+    peak.host.kv_bytes = 100;
+
+    PeakFitRelief none;                // what the gate credited before the fix
+    none.device_main_kv_pages = pinned.main_kv_pages;   // 0: Host was pinned full
+    check(!physical_peak_fits_core(occupied, limits, peak, none),
+          "host-full: without the R2 credit the gate refuses a request the ladder could serve");
+
+    // The R2 unit: the least valuable releasable owner's Host KV. Crediting it admits the request,
+    // and the ladder then does exactly that release before retrying its landing.
+    PeakFitRelief with_r2;
+    with_r2.host_kv_bytes = 100;   // one releasable owner's Host KV
+    check(physical_peak_fits_core(occupied, limits, peak, with_r2),
+          "host-full: crediting the releasable R2 unit admits a servable request (§三 R1)");
+}
+
 // --- kv_landing_relief: the Device->Host demote landing the gate credits (main + backend pools) ---
 
 void case_landing_bounded_by_host_then_device() {
@@ -387,6 +469,8 @@ int main() {
     std::printf("589 pipeline: pool snapshot -> kv_landing_relief -> gate -> tail feasible\n");
     case_589_pipeline_relief_makes_tail_feasible();
     std::printf("kv_landing_relief: Device->Host demote landing (main + backend pools)\n");
+    case_629_credit_is_bounded_by_movable_pages();
+    case_host_full_credits_the_releasable_r2_unit();
     case_landing_bounded_by_host_then_device();
     case_landing_device_bound();
     case_landing_671_both_axes_covered();
