@@ -457,6 +457,117 @@ void case_device_kv_reservation_releases_until_it_fits() {
     check(many + 100 <= 1024, "and the pool then takes the reservation");
 }
 
+// "Memory has no room to receive it" is a state to LEAVE, not a reason to give up (§一: everything
+// but the requests being processed is deletable). This pins the two retreats that left a residue
+// for the §四.1 guard to refuse later, both of which were real in `prepare_victim_teardown`:
+//   * testing "the pool is exactly full" instead of "the landing failed" missed a pool with ONE
+//     free slot and a TWO-slot need, so the release never ran;
+//   * releasing exactly ONCE gave up on a need wider than one unit.
+// Either way the owner still held Device data, the strict release refused it, and the plan was
+// thrown away.
+void case_landing_releases_until_it_fits() {
+    // One free slot but a two-slot need: the OLD shape (`host_free() == 0`) never released here.
+    std::int32_t free_slots = 1;
+    const std::int32_t needed = 2;
+    std::uint32_t releases = 0;
+    const bool landed = land_releasing_until_it_fits(
+        [&]() { return free_slots >= needed; },
+        [&]() {
+            ++releases;
+            if (free_slots > 8) { return false; }   // the pool has nothing left to give
+            ++free_slots;                            // R2 frees one Host slot
+            return true;
+        });
+    check(landed, "a one-slot pool must still release for a two-slot need (§三 R1)");
+    check(releases == 1, "and it released exactly the one unit it was short of");
+
+    // A need wider than one unit: the OLD shape released once and gave up.
+    std::int32_t pool_free = 0;
+    std::uint32_t many_releases = 0;
+    const bool wide = land_releasing_until_it_fits(
+        [&]() { return pool_free >= 3; },
+        [&]() {
+            ++many_releases;
+            ++pool_free;
+            return true;
+        });
+    check(wide, "a three-unit need is met by three releases, not abandoned after one");
+    check(many_releases == 3, "one release per missing unit");
+
+    // Nothing left to release: the walk ends on a call that freed nothing, so it is bounded by
+    // PROGRESS rather than a retry count (§三 R0 forbids "试了 N 次就报错").
+    std::uint32_t hopeless = 0;
+    check(!land_releasing_until_it_fits([]() { return false; },
+                                        [&]() {
+                                            ++hopeless;
+                                            return false;   // nothing releasable
+                                        }),
+          "with nothing releasable the rule fails, which the caller turns into R0 waiting");
+    check(hopeless == 1, "and it stops on the first release that frees nothing");
+
+    // A landing that fits outright never pays for a release.
+    std::uint32_t untouched = 0;
+    check(land_releasing_until_it_fits([]() { return true; },
+                                       [&]() {
+                                           ++untouched;
+                                           return true;
+                                       }),
+          "a landing that fits needs no release");
+    check(untouched == 0, "and the release step is never asked");
+}
+
+// §三 R1's second sentence, as a rule: "内存没有空间接收时，先执行 R2 腾地方，再执行 R1".
+// A demote that cannot LAND is not a refused demote - it is a Host pool that must be made to fit
+// first. This is the chain that was missing and that stalled production on 2026-09-30: a failed
+// landing returned false outright, the reserve walk read that as "this owner cannot move", and the
+// request parked on a verdict that could never change because the engine was idle (req#629/#650/
+// #652/#654, each 4m59.9s at `running 0 | waiting 1`, HTTP 499).
+void case_landing_failure_releases_room_and_retries() {
+    // The landing fails while Host is full; R2 frees one unit; the retry lands.
+    std::uint32_t land_calls = 0, release_calls = 0;
+    bool host_has_room = false;
+    const bool landed = land_after_releasing_for_room(
+        [&]() {
+            ++land_calls;
+            return host_has_room;   // R1 needs room to land in
+        },
+        [&]() {
+            ++release_calls;
+            if (host_has_room) { return false; }   // nothing left to free
+            host_has_room = true;                  // R2 freed the least-important cached unit
+            return true;
+        });
+    check(landed, "a landing that fails for room must succeed after R2 frees it (§三 R1)");
+    check(land_calls == 2, "the move is retried exactly once after the release");
+    check(release_calls == 1, "and R2 runs at most once per attempted move (constant cost per try)");
+
+    // A landing that succeeds outright never pays for a release.
+    std::uint32_t untouched_releases = 0;
+    check(land_after_releasing_for_room([]() { return true; },
+                                        [&]() {
+                                            ++untouched_releases;
+                                            return true;
+                                        }),
+          "a landing that fits needs no release");
+    check(untouched_releases == 0, "and the release step is never asked");
+
+    // Nothing left to free: the rule reports failure, which is the caller's honest R0 answer -
+    // and it does not spin trying to land again against the same full pool.
+    std::uint32_t hopeless_land = 0, hopeless_release = 0;
+    check(!land_after_releasing_for_room(
+              [&]() {
+                  ++hopeless_land;
+                  return false;
+              },
+              [&]() {
+                  ++hopeless_release;
+                  return false;   // nothing releasable
+              }),
+          "with nothing releasable the rule fails, which the caller turns into R0 waiting");
+    check(hopeless_land == 1 && hopeless_release == 1,
+          "and it does not retry a landing the release could not fund");
+}
+
 int main() {
     std::printf("physical_peak_fits_core: admission-gate Device/Host KV eviction relief\n");
     case_full_device_pool_infeasible_without_kv_relief();
@@ -469,6 +580,8 @@ int main() {
     std::printf("589 pipeline: pool snapshot -> kv_landing_relief -> gate -> tail feasible\n");
     case_589_pipeline_relief_makes_tail_feasible();
     std::printf("kv_landing_relief: Device->Host demote landing (main + backend pools)\n");
+    case_landing_releases_until_it_fits();
+    case_landing_failure_releases_room_and_retries();
     case_629_credit_is_bounded_by_movable_pages();
     case_host_full_credits_the_releasable_r2_unit();
     case_landing_bounded_by_host_then_device();

@@ -8300,16 +8300,22 @@ bool ProgramImplCore::spill_owner_device_kv_to_host(std::uint32_t index, bool sh
         // `spill declined ... stage=noruns` six times, then HTTP 503). Free the least-important
         // idle owner's Host side - by value, this module never names a victim itself - and let the
         // retry below land the move. Nested spills decline while that R2 runs.
-        if (!fund_once()) {
-            if (!release_idle_owner_host_side(/*require_host_state_slot=*/false)) {
-                std::fprintf(stderr,
-                             "[ladder] spill declined %s slot=%u stage=prepare fund_pages=%u"
-                             " fund_can=%d fund_ok=%d\n",
-                             shared ? "shared" : "", index, fund_pages, fund_can ? 1 : 0,
-                             fund_ok ? 1 : 0);
-                std::fflush(stderr);
-                return false;
-            }
+        // The rule itself lives in `detail::land_after_releasing_for_room` so it is decidable
+        // without a Program or a Device arena (tests/test_physical_peak_fit.cpp). `land` is the
+        // self-fund every path runs; `release` is the R2 half this module owns - freeing the
+        // least-important idle owner's Host side, by value, never naming a victim itself. The
+        // helper calls `release` AT MOST ONCE, so the per-move cost stays one R2 step.
+        const bool landed = detail::land_after_releasing_for_room(
+            fund_once,
+            [&]() { return release_idle_owner_host_side(/*require_host_state_slot=*/false); });
+        if (!landed) {
+            std::fprintf(stderr,
+                         "[ladder] spill declined %s slot=%u stage=prepare fund_pages=%u"
+                         " fund_can=%d fund_ok=%d\n",
+                         shared ? "shared" : "", index, fund_pages, fund_can ? 1 : 0,
+                         fund_ok ? 1 : 0);
+            std::fflush(stderr);
+            return false;
         }
         try {
             prepare_pressure_work(work, runtime::ContextResourceClass::MainKV);
@@ -8437,16 +8443,28 @@ void ProgramImplCore::prepare_victim_teardown(std::uint32_t index) {
         if (residency != StateReplicaResidency::DeviceOnly) { return; }
         std::optional<StateImageTransfer> transfer =
             state_store->begin_device_to_host(handle, device.transfer_stream);
-        if (!transfer && state_store->host_free() == 0 && degrade_idle_owner_host_state()) {
-            // The Host state pool is the wall this step exists for: free ONE slot the same way
-            // the ladder does (degrade the least-important idle owner's HostOnly checkpoint),
-            // then the demotion lands. Frees MORE Host room than planned, which only ever helps
-            // a sealed target - never under-delivers it.
-            std::optional<StateImageTransfer> second =
+        // 缓存模块v2.md §三 R1: 内存没有空间接收时，先执行 R2 腾地方，再执行 R1. A landing that
+        // cannot be received is not a move that cannot happen - it is a Host pool that must be made
+        // to fit first, and §一 guarantees one can be: everything in the pool except the requests
+        // being processed is deletable, so releasing keeps working until the landing fits. The old
+        // shape tested `host_free() == 0` (so a pool with one free slot and a two-slot need never
+        // released at all) and released exactly ONCE (so a need wider than one unit gave up and
+        // left the residue for the guard to refuse). Both are the "尽力而为" retreat §一 rules out:
+        // the guard then rejects the whole release and the plan is thrown away.
+        //
+        // The loop is bounded by PROGRESS, not by a count: `degrade_idle_owner_host_state` frees
+        // one Host slot and reports whether it freed any, so a call that frees nothing ends the
+        // walk (`reserve_with_release_attempts` uses the same rule at the KV site).
+        const auto land = [&]() -> bool {
+            std::optional<StateImageTransfer> attempt =
                 state_store->begin_device_to_host(handle, device.transfer_stream);
-            if (second) { transfer.emplace(std::move(*second)); }
-        }
-        if (!transfer) { return; } // leave it; the probe counts the residue
+            if (!attempt) { return false; }
+            transfer.emplace(std::move(*attempt));
+            return true;
+        };
+        const bool released_until_it_fits = detail::land_releasing_until_it_fits(
+            land, [&]() { return degrade_idle_owner_host_state(); });
+        if (!released_until_it_fits) { return; } // leave it; the probe counts the residue
         if (device.transfer_stream != nullptr) {
             (void)cudaStreamSynchronize(device.transfer_stream);
         }
@@ -8477,20 +8495,31 @@ void ProgramImplCore::prepare_shared_victim_teardown(std::uint32_t index) {
     if (residency != StateReplicaResidency::DeviceOnly) { return; }
     std::optional<StateImageTransfer> transfer =
         state_store->begin_device_to_host(handle, device.transfer_stream);
-    if (!transfer && state_store->host_free() == 0 && degrade_idle_owner_host_state()) {
-        // 缓存模块v2.md §三 R1: 内存没有空间接收时，先执行 R2 腾地方，再执行 R1.
-        // The private teardown has always done this; this path did not, and that asymmetry is what
-        // let a cheap shared prefix block the request that needed its room. With the Host state
-        // pool full the demotion failed, `shared_prefix_holds_device_data` still saw Device data,
-        // and the whole pressure step rolled back to R0 - so a request that was already paying for
-        // a reuse waited out its queue deadline while the pool never changed (2026-09-29 rig:
-        // `spill declined slot=0/1/2 stage=noruns` then `pressure step refused: shared victim
-        // slot=2 cannot be moved to Host (R1), rolling the step back ... (R0)`, repeated).
-        std::optional<StateImageTransfer> second =
+    // 缓存模块v2.md §三 R1: 内存没有空间接收时，先执行 R2 腾地方，再执行 R1.
+    // The private teardown has always done this; this path did not, and that asymmetry is what let
+    // a cheap shared prefix block the request that needed its room. With the Host state pool full
+    // the demotion failed, `shared_prefix_holds_device_data` still saw Device data, and the whole
+    // pressure step rolled back to R0 - so a request that was already paying for a reuse waited out
+    // its queue deadline while the pool never changed (2026-09-29 rig: `spill declined slot=0/1/2
+    // stage=noruns` then `pressure step refused: shared victim slot=2 cannot be moved to Host (R1),
+    // rolling the step back ... (R0)`, repeated).
+    //
+    // Same shape as the private teardown above, and the same two retreats removed: the release runs
+    // whenever the landing failed (not only when `host_free() == 0`, which missed a pool with one
+    // free slot and a wider need) and it repeats until the landing fits or nothing is releasable
+    // (§一: everything but the requests being processed is deletable, so "deletable but not enough"
+    // is not a state - only "nothing left" is).
+    const auto land = [&]() -> bool {
+        std::optional<StateImageTransfer> attempt =
             state_store->begin_device_to_host(handle, device.transfer_stream);
-        if (second) { transfer.emplace(std::move(*second)); }
+        if (!attempt) { return false; }
+        transfer.emplace(std::move(*attempt));
+        return true;
+    };
+    if (!detail::land_releasing_until_it_fits(land,
+                                              [&]() { return degrade_idle_owner_host_state(); })) {
+        return;
     }
-    if (!transfer) { return; }
     if (device.transfer_stream != nullptr) {
         (void)cudaStreamSynchronize(device.transfer_stream);
     }

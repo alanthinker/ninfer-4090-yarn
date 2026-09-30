@@ -206,6 +206,56 @@ struct KvLandingRelief {
 // This is the exact policy `LogicalKVPageStore::reserve_device_pages` runs - the loop was extracted
 // so its rule is decidable without a Program, a CUDA context, or a Device arena (the pool itself
 // needs one, which is why the store-level path is only covered by the rig).
+// "Memory has no room to receive it" is a state to LEAVE, not a reason to give up.
+//
+// 缓存模块v2.md §三 R1: "内存没有空间接收时，先执行 R2 腾地方，再执行 R1", and §一 guarantees the
+// release keeps working until it succeeds: everything in a pool except the requests being processed
+// is deletable, so "deletable but not enough yet" is not a terminal state - only "nothing left to
+// release" is. This runs the two halves in that order, repeatedly:
+//
+//   while the landing fails: release ONE unit (R2) and retry the landing (R1).
+//
+// Both retreats this replaces were real and both left a residue for a guard to refuse later:
+//   * testing "the pool is exactly full" instead of "the landing failed" missed a pool with one
+//     free slot and a two-slot need, so the release never ran at all;
+//   * releasing exactly once gave up on a need wider than one unit.
+// `release` must report whether it freed anything; a call that frees nothing ends the walk, which
+// is what keeps the loop bounded by PROGRESS rather than by an arbitrary retry count (§三 R0: no
+// "试了 N 次就报错"). Extracted so the rule is decidable without a Program or an arena.
+template <class Land, class Release>
+[[nodiscard]] inline bool land_releasing_until_it_fits(Land&& land, Release&& release) {
+    if (land()) { return true; }
+    while (true) {
+        if (!release()) { return false; }   // nothing left to free: the caller's honest R0 answer
+        if (land()) { return true; }
+    }
+}
+
+// 缓存模块v2.md §三 R1's second sentence, as a rule: "内存没有空间接收时，先执行 R2 腾地方，
+// 再执行 R1". A demote that cannot LAND is not a refused demote - it is a Host pool that has to be
+// made to fit first. This runs the two halves in that order for ONE attempted move:
+//
+//   1. `land()`  - try the move (R1). If it lands, done.
+//   2. `release()` - free ONE unit of the least-important cached data (R2) and retry `land()`.
+//
+// The retry is the whole point. Before this rule existed in both halves of the ladder, a failed
+// landing returned false outright, which read as "this owner cannot move" - so the reserve walk
+// concluded nothing was releasable and the request parked on a verdict that could never change
+// (the engine was idle, so no pool counter moved). Measured 2026-09-30 production: req#629/#650/
+// #652/#654 each waited exactly 4m59.9s at `running 0 | waiting 1` and died at HTTP 499 while an
+// identical request was served 2.9 s later at 99.2% reuse.
+//
+// Bounded to ONE retry per call, matching the ladder: the caller (`reserve_with_release_attempts`)
+// is itself the loop, so one R2 per attempted move is what keeps each call's cost constant and the
+// progress accounting honest. Extracted so the rule is decidable without a Program, a CUDA context,
+// or a Device arena.
+template <class Land, class Release>
+[[nodiscard]] inline bool land_after_releasing_for_room(Land&& land, Release&& release) {
+    if (land()) { return true; }
+    if (!release()) { return false; }   // nothing left to free: the caller's honest R0 answer
+    return land();                      // the freed room is what the landing was missing
+}
+
 template <class Fits, class Holdings, class Release>
 [[nodiscard]] inline std::uint32_t reserve_with_release_attempts(Fits&& fits, Holdings&& holdings,
                                                                 Release&& release) {
