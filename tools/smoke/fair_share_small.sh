@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
-# Small-parameter A/B for the fair-share escalation path, on a deliberately tight instance.
+# The small-parameter RIG: it STARTS the tight instance every rig-mode test needs, then runs one
+# smoke workload against it. Despite the name (historical - the fair-share escalation path was the
+# first thing it was written to reproduce), this is the entry point for the rig environment, not a
+# fair-share-only test:
+#
+#   * it owns the launcher env (48 host state slots, 32K context, 12 GiB host KV, 4 fair-share
+#     buckets) and calls ninfer_service_agent.sh start/stop around the run;
+#   * `full_battery.sh --rig` is a CLIENT only - it requires that this instance already owns
+#     :30000 - so without this script there is no one-step way to bring the rig up;
+#   * the workload doubles as a smoke test, and `FSL_KEEP=1` leaves the instance running for a
+#     following battery.
 #
 # The pools are small enough that a couple of short conversations fill them (dense anchors, so a
 # short conversation already publishes several checkpoints) but real enough to discriminate: the

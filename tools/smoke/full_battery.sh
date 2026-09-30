@@ -26,7 +26,7 @@
 # (peak >= TOTAL-2) is unchanged.
 #
 # Client-only: the target service must already own :30000 (one GPU, one service). The C++
-# suite (ci_smoke/ctest) is excluded on purpose: it needs the VRAM the service holds; run it
+# suite (ctest) is excluded on purpose: it needs the VRAM the service holds; run it
 # separately with the service stopped.
 #
 # Usage:
@@ -257,7 +257,8 @@ case "$MODE" in
 esac
 echo "(service max_model_len=$model_len matches mode $MODE)"
 # Entry-state settle. `kRecencyHorizonSeconds = 60` decides whether an instance's WARM-START
-# residue (fair_share_small's smoke requests) is still PROTECTED in the victim order, and
+# residue (whatever ran against this instance before the battery started) is still PROTECTED in
+# the victim order, and
 # protected is `2^62 + score` - it outranks every unprotected owner regardless of score. A pool
 # whose owners are ALL under 60 s old therefore ranks purely by score, and the cheapest record
 # there is the test's OWN freshly built conversation: state_index's 2 380-token conversations
@@ -418,12 +419,13 @@ step fork_hit         300 python3 tools/smoke/test_long_anchor_fork_hit.py \
 # scoring fix exists for (a 237k conversation died while fresh test sessions stayed, 2026-09-23).
 step important_session 900 python3 tools/smoke/test_important_session_survival.py --port "$PORT" \
     --turns 8 --turn-tokens 2500 --flood "$IMPORTANT_FLOOD" --flood-turns "$IMPORTANT_FLOOD_TURNS"
-# fair_share_sim retired from the battery (09-23): the branch it wants to
-# observe (fair-share bucket release) is covered at the decision level by
+# Fair-share bucket release is NOT a step here, and its smoke script has been removed: the
+# branch is covered at the decision level by
 #   ./build/tests/ninfer_resource_manager_test
 #   ::test_fair_share_releases_oldest_bucket_only_when_shared_pool_exhausted (green)
-# and its remaining A/B/compaction choreography can be run manually:
-#   REUSE_DIAG=1 rig + python3 tools/smoke/test_fair_share_sim.py --A-depth 16000 ...
+# which is strictly more precise than replaying the A/B/compaction choreography against a live
+# instance. The phase 3 steps above still exercise fair-share indirectly (the rig is sized to four
+# buckets, so its reuse tests fail if a protected owner is released early).
 
 echo "== phase 4: correctness/contract tests =="
 step serve_contract   600 python3 tools/smoke/serve_contract.py \

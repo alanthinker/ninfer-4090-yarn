@@ -90,6 +90,9 @@ prefix 命中 97,917（86.9%，`long anchor`），重算 14,706 tok，TTFT 18.5s
 - **小参数 rig**（`tools/smoke/fair_share_small.sh` + `tools/smoke/full_battery.sh --rig`，
   48 host state 槽 / 32K 上下文）：phase 3/4/5 全部 rc=0，窗口内错误行 0，显存数据销毁 0，
   守卫拒绝 0；fair-share 段 `allocate FAILED -> 0`。
+  （`fair_share_small.sh` 与其配套的 `test_fair_share_sim.py` 后来被删除：公平份额那条分支改由
+  `ninfer_resource_manager_test::test_fair_share_releases_oldest_bucket_only_when_shared_pool_exhausted`
+  在判定级覆盖，比对着活实例重放 A/B 编排更精确。此处保留的是当时那次运行的结果。）
 - **生产**（`tools/smoke/full_battery.sh`，320 槽 / 658,176 token / RTX 4080 SUPER）：
   灌池到 host 320/320 后，phase 3/4 全部 rc=0；HTTP 503 = 0、HTTP 500 = 0、engine fatal = 0、
   不变量违反 = 0、`device-not-closable` = 0；**400/400 请求全部完成**。
