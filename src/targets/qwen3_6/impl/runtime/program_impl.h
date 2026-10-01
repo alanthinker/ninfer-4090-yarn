@@ -7383,16 +7383,34 @@ bool ProgramImplCore::release_state_capacity_step(const char* site, bool allow_r
 bool ProgramImplCore::owner_holds_release_protected_state(std::uint32_t index) const {
     if (index >= continuation_capacity) { return false; }
     const SequenceState& sequence = continuation_states[index];
-    const auto holds = [&](StateImageHandle handle) {
-        return sequence.state.read == handle || sequence.state.write == handle ||
-               (sequence.reserved_state && *sequence.reserved_state == handle) ||
-               (sequence.rewrite_state && *sequence.rewrite_state == handle) ||
+    // OWNERSHIP: the handle is one this owner is actively built on. This is the owner the
+    // admission works on, and the one §2.1 keeps out of the victim domain. The rule itself lives in
+    // the pure `state_reclaim` policy so the unit harness decides it without a Program or an arena.
+    const auto holds_live = [&](StateImageHandle handle) {
+        return state_reclaim::state_is_live_owner_of(
+            sequence.state.read, sequence.state.write,
+            sequence.reserved_state ? &*sequence.reserved_state : nullptr,
+            sequence.rewrite_state ? &*sequence.rewrite_state : nullptr, handle);
+    };
+    // RETENTION as well: the owner merely CACHED the same allocation as one of its long anchors.
+    // A state allocation is aliased by private and shared checkpoints, so handle equality alone
+    // does not say who owns it.
+    const auto holds_any = [&](StateImageHandle handle) {
+        return holds_live(handle) ||
                std::any_of(sequence.long_anchors.begin(), sequence.long_anchors.end(),
                            [&](const LongAnchorCheckpoint& anchor) {
                                return anchor.state == handle;
                            });
     };
-    if (release_protected_state && holds(*release_protected_state)) { return true; }
+    // The admission's own source is protected as an OWNER, not as a handle: `retire_exclude_`
+    // (set by `set_retire_preference`, §2.1) already keeps that owner out of every walk, so this
+    // test only has to cover the owner the state is actually live for. Testing the anchor cache
+    // here instead made the protection bleed onto every owner that had cached the same aliased
+    // allocation, which pinned the whole pool: an idle Engine with 256 finished conversations
+    // could neither degrade nor spill anything, and the request was answered with nothing
+    // (2026-10-01 production req#407-#412: `[ladder] degrade declined ... protected=295 ...`,
+    // then `[cache] pressure step refused: victim slot=54 cannot be moved to Host (R1) ... (R0)`).
+    if (release_protected_state && holds_live(*release_protected_state)) { return true; }
     // An ACTIVE CAPTURE prices its effect against these owners (`capacity_preparation_removed`)
     // and publication re-derives `removed` from the same owners, so degrading one in between makes
     // the two disagree and latches the engine with "active capture replacement effect changed
@@ -7402,9 +7420,11 @@ bool ProgramImplCore::owner_holds_release_protected_state(std::uint32_t index) c
     // this protection from `release_protected_state`; the capture path never set that member
     // (2026-09-29 rig pool_soak: `degrade anchor slot=4` freed a checkpoint the capture had
     // already priced, then the publication threw; the same fatal reproduces on the build from
-    // before any of these changes).
+    // before any of these changes). The ANCHOR form stays for this branch: the priced thing here
+    // really can be a retained anchor, and the latch it guards is fatal - unlike the admission's
+    // own source above, which `retire_exclude_` already protects by owner.
     if (const auto* capture = std::get_if<ActiveCaptureTransaction>(&context_transaction_);
-        capture != nullptr && capture->source_state.valid() && holds(capture->source_state)) {
+        capture != nullptr && capture->source_state.valid() && holds_any(capture->source_state)) {
         return true;
     }
     return false;

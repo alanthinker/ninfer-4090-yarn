@@ -165,4 +165,28 @@ enum class StateReplicaLayout : std::uint8_t {
     return residency == StateReplicaLayout::Both;
 }
 
+// Does this owner's LIVE state - the handle it is built on - match `handle`?
+//
+// §2.1: the protection an in-flight reservation places on its own source is an OWNERSHIP fact, not
+// a retention one. A state allocation is aliased by private and shared checkpoints, so matching the
+// handle alone also protects every owner that merely CACHED that allocation as one of its long
+// anchors - and those owners are pure cache, which §三 R2 must be free to delete. Widening the
+// protection to them is what let an IDLE Engine whose pool held 256 finished conversations neither
+// degrade nor spill anything (2026-10-01 production req#407-#412: `[ladder] degrade declined ...
+// protected=295 ...`, then `[cache] pressure step refused: victim slot=54 cannot be moved to Host
+// (R1) ... (R0)`, and the request was answered with an empty completion).
+//
+// Deliberately a free function over the handles rather than a Program method: the rule is decidable
+// without a Program, a state store or a Device arena, so `test_resource_manager.cpp` drives it in
+// milliseconds instead of waiting on a rig or a production battery - the same reason this header
+// exists at all. The owner the reservation really works on is ALSO excluded by owner slot
+// (`set_retire_preference`'s `retire_exclude_`, §2.1), which is the authoritative half.
+template <class Handle>
+[[nodiscard]] constexpr bool state_is_live_owner_of(Handle read, Handle write, const Handle* reserved,
+                                                    const Handle* rewrite,
+                                                    Handle handle) noexcept {
+    return read == handle || write == handle || (reserved != nullptr && *reserved == handle) ||
+           (rewrite != nullptr && *rewrite == handle);
+}
+
 } // namespace ninfer::targets::qwen3_6::detail::state_reclaim

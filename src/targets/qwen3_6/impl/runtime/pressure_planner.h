@@ -1141,8 +1141,23 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         // below would wash it out after the first round - same function, same terms. The
         // preference term is re-stated because `demand.host_kv` may have grown: it must keep
         // naming the SAME absolute water line, never grow into a requirement.
-        const HostKvDemand want = host_kv_demand_with_water_line(
-            host_kv(residual), applied_landing_pages() * page_bytes, program->host_headroom_bytes);
+        //
+        // The BASE stays the candidate's ABSOLUTE Host peak, exactly like the initial assembly
+        // above - it must not become the residual. `cachep::plan` derives every gap with
+        // `shortfall(need, free)`, so handing it a figure that is already net of free subtracts
+        // free a SECOND time; here that also fed the loop's own growth, because this loop raises
+        // `demand.host_kv` monotonically (`if (want <= demand.host_kv) break;`) and re-plans from
+        // the result. On a saturated Host pool the residual is ~the peak and the landing then
+        // compounds on top of it, so a request that needs ~4 GiB of Host was judged against
+        // 12.4 GiB: the plan chased a Host gap five times its real size, could not close it, and
+        // the request was answered with an empty completion (2026-10-01 production req#407-#412:
+        // `[cache] gap ... hkv=13281918976 | free ... hkv=100933632 | cand=256 steps=163`, with
+        // `[search] target infeasible ... host.kv used=11498889216 cap=34359738368 resid=0`).
+        // The loop's purpose - account for the landing the APPLIED spills really take - is carried
+        // by `applied_landing_pages()`, which is the honest, measured term.
+        const HostKvDemand want =
+            host_kv_demand_with_water_line(host_kv(peak), applied_landing_pages() * page_bytes,
+                                           program->host_headroom_bytes);
         if (want.total <= demand.host_kv) { break; }
         demand.host_kv            = want.total;
         demand.host_kv_preference = want.preference;

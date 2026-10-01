@@ -444,6 +444,59 @@ void case_unplaceable_host_bytes_are_not_room() {
           "③ unplaceable Host bytes must not be credited as landing relief");
 }
 
+// The Host demand's BASE is the candidate's ABSOLUTE peak - never a residual, and never the pool's
+// occupancy. `cachep::plan` derives every gap as `shortfall(need, free)`, so a base that is already
+// net of free has free subtracted a SECOND time; in the re-plan loop that also compounded, because
+// the loop raises `demand.host_kv` monotonically and re-plans from the result.
+//
+// The bug this pins (production 2026-10-01 req#407-#412): the initial assembly used the absolute
+// peak, but the re-plan loop three hundred lines below fed `host_kv(residual)` into the same
+// helper. On a saturated Host pool the residual is ~the peak, the landing compounded on top, and a
+// request whose own Host need is ~4 GiB was judged against 12.4 GiB - so the plan chased a Host gap
+// five times its real size, could not close it, and the request was answered with nothing
+// (`[cache] gap ... hkv=13281918976 | free ... hkv=100933632 | cand=256 steps=163`, next to
+// `[search] target infeasible ... host.kv used=11498889216 cap=34359738368 resid=0`).
+void case_host_demand_base_is_the_absolute_peak_not_a_residual() {
+    const std::size_t mib = 1ULL << 20;
+    // A 117k-token request: ~1680 Device pages of its own KV, and the landing for the 2205-page
+    // Device gap it has to shed. Its own Host peak is that KV.
+    const std::size_t own_peak = 1680ULL * 1114112ULL;   // ~1.74 GiB
+    const std::size_t landing  = 2205ULL * 1114112ULL;   // ~2.28 GiB
+    const std::size_t headroom = 2ULL << 30;       // the ③ water line
+
+    const HostKvDemand absolute = host_kv_demand_with_water_line(own_peak, landing, headroom);
+    // The requirement is the request's own peak plus its landing, and NOTHING about the pool.
+    check(absolute.total - absolute.preference == own_peak + landing,
+          "the Host requirement is the request's own peak + landing");
+    check(absolute.total - absolute.preference < (5ULL << 30),
+          "a 117k-token request must not be judged against ~12 GiB of Host (b1)");
+
+    // The failing shape: the residual was used as the base instead. A saturated pool reports the
+    // residual as ~the peak, and the same helper then produces a requirement that grows with it -
+    // which is the double subtraction §三 R1 / the assembly comment forbid.
+    const std::size_t residual = own_peak;  // free ~0 on a saturated pool: residual == peak
+    const HostKvDemand from_residual = host_kv_demand_with_water_line(residual, landing, headroom);
+    check(from_residual.total - from_residual.preference == residual + landing,
+          "using the residual as the base is a different requirement (the forbidden shape)");
+
+    // And the pool's occupancy is not an input at all: the same request on a full or an empty pool
+    // owes exactly the same Host requirement. That is what keeps R2 the answer to "the pool is
+    // full" (§一) instead of an inflated demand that no amount of deletion can close.
+    ninfer::runtime::cache::TierOccupancy full{};
+    full.host_kv_capacity = 32ULL << 30;
+    full.host_kv_used     = (32ULL << 30) - (96ULL * mib);
+    ninfer::runtime::cache::TierOccupancy roomy{};
+    roomy.host_kv_capacity = 32ULL << 30;
+    roomy.host_kv_used     = 0;
+    const std::uint64_t gap_full =
+        ninfer::runtime::cache::shortfall(absolute.total - absolute.preference, full.host_kv_free());
+    const std::uint64_t gap_empty =
+        ninfer::runtime::cache::shortfall(absolute.total - absolute.preference, roomy.host_kv_free());
+    check(gap_full > gap_empty,
+          "a full pool leaves a bigger gap to release - R2 closes it, the demand does not grow");
+    check(gap_empty == 0, "a pool with room owes nothing for the same request");
+}
+
 // §三 R1 at reserve time: a Device-KV reservation that does not fit must first ask the release
 // step to move cold Device KV to Host. This is the loop `LogicalKVPageStore::reserve_device_pages`
 // runs, extracted so the rule is decidable without a Device arena.
@@ -663,6 +716,7 @@ int main() {
     case_headroom_does_not_overflow();
     case_water_line_preference_never_becomes_a_requirement();
     case_unplaceable_host_bytes_are_not_room();
+    case_host_demand_base_is_the_absolute_peak_not_a_residual();
     std::printf("reserve_with_release_attempts: Device-KV reservation releases until it fits\n");
     case_device_kv_reservation_releases_until_it_fits();
     if (g_failures != 0) {

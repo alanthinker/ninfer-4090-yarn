@@ -142,10 +142,23 @@ const char* finish_reason(ninfer::FinishReason reason) {
     case ninfer::FinishReason::OutputLimit:
     case ninfer::FinishReason::ContextCapacity:
         return "length";
+    // A CANCELLED generation is not a completed one, and the OpenAI chat wire has no value that
+    // says so. Rendering it as `stop` made "the server never produced anything" byte-identical to
+    // "the model finished and chose to say nothing", which is exactly how a request the Engine
+    // could not serve reached a client as a completed response with no content (2026-10-01
+    // production req#407-#412: HTTP 200, `finish_reason: "stop"`, `completion_tokens: 0` for a
+    // 117,614-token prompt, surfaced as EMPTY_RESPONSE). Every peer mapper already distinguishes
+    // it - `openai_responses_response.cpp` and the operational log say `cancelled`, and
+    // `anthropic_messages_response.cpp` refuses to serialize it at all. Refusing here too keeps
+    // the four in agreement and turns an undeliverable generation into a loud failure instead of
+    // a silent empty success (§三 R0: only the queue timeout and the request's own cancellation
+    // reject - and a rejection must be visible AS a rejection).
+    case ninfer::FinishReason::Cancelled:
+        throw std::logic_error(
+            "cancelled generation cannot be serialized as an OpenAI chat completion");
     case ninfer::FinishReason::None:
     case ninfer::FinishReason::StopToken:
     case ninfer::FinishReason::StopString:
-    case ninfer::FinishReason::Cancelled:
         return "stop";
     }
     return "stop";

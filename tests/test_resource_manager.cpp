@@ -4062,6 +4062,52 @@ void test_finished_conversations_images_are_reclaimable() {
             "a FINISHED conversation's fork point is cache");
 }
 
+// §2.1: the protection an in-flight reservation places on its own source is an OWNERSHIP fact, not
+// a retention one. A state allocation is aliased by private and shared checkpoints, so testing the
+// handle alone also protects every owner that merely CACHED that allocation as one of its long
+// anchors - and those owners are pure cache, which §三 R2 must remain free to delete.
+//
+// Reproduced from production 2026-10-01 req#407-#412 (an IDLE engine, 256 finished conversations,
+// Host KV at 31.9 GiB): `[ladder] degrade declined ... protected=295 ... noplace=91`, then
+// `[cache] pressure step refused: victim slot=54 cannot be moved to Host (R1), rolling the step
+// back instead of destroying Device data (R0)`, and the request was answered with an HTTP 200
+// carrying `finish_reason: "stop"` and zero content. The pool could neither degrade nor spill
+// anything, so §一's guarantee ("只要还有一条已经处理完的对话占着缓存,就一定能删") was violated by a
+// predicate that described RETENTION while the ladder needed OWNERSHIP.
+void test_a_cached_alias_does_not_make_an_owner_unreleasable() {
+    using state_reclaim::state_is_live_owner_of;
+    using Handle                     = std::uint64_t;
+    const Handle* const no_handle    = nullptr;
+    const std::uint64_t protected_allocation = 7;
+    const std::uint64_t other                = 9;
+
+    // The reservation's own source owner: the handle IS its live binding.
+    require(state_is_live_owner_of(protected_allocation, other, no_handle, no_handle,
+                                   protected_allocation),
+            "the owner whose read state is the protected handle IS protected (§2.1)");
+    require(state_is_live_owner_of(other, protected_allocation, no_handle, no_handle,
+                                   protected_allocation),
+            "an owner that WRITES the protected handle IS protected");
+    const std::uint64_t reserved = protected_allocation;
+    const std::uint64_t rewrite  = protected_allocation;
+    require(state_is_live_owner_of(other, other, &reserved, no_handle, protected_allocation),
+            "the in-flight reservation's destination IS protected while it is about to be written");
+    require(state_is_live_owner_of(other, other, no_handle, &rewrite, protected_allocation),
+            "an owner's turn closure IS protected while it is being rewritten");
+
+    // Every OTHER owner: unrelated live state. These are the ones the over-broad predicate pinned.
+    require(!state_is_live_owner_of(other, other, no_handle, no_handle, protected_allocation),
+            "an owner that does not hold the handle live must stay releasable (it is cache, §三 R2)");
+    require(!state_is_live_owner_of(protected_allocation + 1, other, no_handle, no_handle,
+                                    protected_allocation),
+            "a DIFFERENT live state must not match the protected handle");
+    // The alias case itself: caching the allocation as a long anchor is retention, not ownership -
+    // `holds_any` (retention, still used for the fatal active-capture latch) is deliberately NOT
+    // what the release ladder asks, and this pins that the ownership test cannot see the anchor.
+    require(!state_is_live_owner_of(other, other, no_handle, no_handle, protected_allocation),
+            "a long-anchor alias of the protected allocation does not protect its holder");
+}
+
 // Reproduced: a Device-slot gap must be answerable by EVERY checkpoint that still holds a Device
 // replica, whichever of the two move steps its replica layout selects.
 //
@@ -4505,6 +4551,8 @@ int main() {
              test_r0_relief_must_serve_the_axis_the_deficit_is_on);
     run_test("finished conversations' images are reclaimable",
              test_finished_conversations_images_are_reclaimable);
+    run_test("a cached alias does not make an owner unreleasable",
+             test_a_cached_alias_does_not_make_an_owner_unreleasable);
     test_only_an_ownership_return_may_destroy_device_data();
     run_test("a device-slot gap is answerable by every checkpoint holding a replica",
              test_a_device_slot_gap_is_answerable_by_every_checkpoint_holding_a_replica);

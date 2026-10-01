@@ -884,6 +884,33 @@ int test_common_objects() {
     return failures;
 }
 
+// A CANCELLED generation is not a completed one. The OpenAI chat wire has no value that says so,
+// so this path used to render it as `stop` - which made "the Engine never produced anything"
+// byte-identical to "the model finished and chose to say nothing", and let a request the Engine
+// could not serve reach a client as a completed response with no content (2026-10-01 production
+// req#407-#412: HTTP 200, `finish_reason: "stop"`, `completion_tokens: 0`, for a 117,614-token
+// prompt; the client reported EMPTY_RESPONSE). Every peer mapper already distinguishes it:
+// `openai_responses_response.cpp` and the operational log print `cancelled`, and
+// `anthropic_messages_response.cpp` refuses to serialize it. The chat mapper must not be the one
+// that silently promotes a cancellation into a success.
+int test_cancelled_is_not_a_successful_completion() {
+    int failures = 0;
+    GenerationOutcome outcome = sample_outcome();
+    outcome.completion_tokens = 0;
+    outcome.text.clear();
+    outcome.reasoning.clear();
+    outcome.finish_reason = ninfer::FinishReason::Cancelled;
+
+    bool threw = false;
+    try {
+        (void)make_chat_completion_response(identity(), outcome);
+    } catch (const std::logic_error&) {
+        threw = true;
+    }
+    failures += check(threw, "a cancelled generation is not serialized as a chat completion");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -898,6 +925,7 @@ int main() {
     failures += test_aggregate_response();
     failures += test_stream_response();
     failures += test_stream_observations();
+    failures += test_cancelled_is_not_a_successful_completion();
     failures += test_stream_generation_start_republication();
     failures += test_common_objects();
     if (failures == 0) { std::cout << "OpenAI Chat protocol tests passed\n"; }
