@@ -902,12 +902,21 @@ int test_cancelled_is_not_a_successful_completion() {
     outcome.finish_reason = ninfer::FinishReason::Cancelled;
 
     bool threw = false;
+    int  status = 0;
+    std::string code;
     try {
         (void)make_chat_completion_response(identity(), outcome);
-    } catch (const std::logic_error&) {
-        threw = true;
+    } catch (const ApiException& error) {
+        threw  = true;
+        status = error.error().status;
+        code   = error.error().code;
     }
     failures += check(threw, "a cancelled generation is not serialized as a chat completion");
+    // It must read as a cancellation (the same shape `request_error_to_api_error` gives one), not
+    // as a 500 `internal_error`: the client learns the generation was cancelled, and the wire never
+    // claims the model finished with nothing to say.
+    failures += check(status == 499, "a cancelled generation reports 499, not an internal fault");
+    failures += check(code == "client_disconnected", "a cancelled generation keeps its own code");
     return failures;
 }
 

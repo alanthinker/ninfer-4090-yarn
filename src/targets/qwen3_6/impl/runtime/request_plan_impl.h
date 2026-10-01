@@ -238,12 +238,38 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
         prompt.media_payloads.size() != prompt.vision_items.size()) {
         throw std::invalid_argument("prepared prompt media payload is incomplete");
     }
+    // The slot identity is what must hold: one payload slot per Vision item, in the same order.
+    // A NULL slot is a legitimate state, not a malformed prompt - `release_all_media_payloads`
+    // resets the pointers while KEEPING the slots one-to-one on purpose, and the admission path
+    // releases exactly the slots the Vision plan does not use plus every slot when the plan has no
+    // Vision at all. Requiring a non-null payload here made that documented state unrepresentable
+    // and turned the release into a false `prepared prompt media item payload has an invalid
+    // shape` for any prompt validated afterwards (2026-10-01 production req#530-#533: a
+    // 235k-token conversation whose images were covered by the reused prefix, so the Vision plan
+    // was empty and the payloads were released - the failure appeared and disappeared with the
+    // reuse state, which is what made it look random). The rule lives in the pure
+    // `prepared_vision_payload_slot_matches` so the unit harness decides it without a Program.
     for (std::size_t i = 0; i < prompt.media_payloads.size(); ++i) {
-        if (!prompt.media_payloads[i] ||
-            prompt.media_payloads[i]->patch_elements !=
-                prompt.vision_items[i].patch_count * kPreparedVisionPatchFeatures) {
-            throw std::invalid_argument("prepared prompt media item payload has an invalid shape");
+        const bool present = prompt.media_payloads[i] != nullptr;
+        if (prepared_vision_payload_slot_matches(present,
+                                                 present ? prompt.media_payloads[i]->patch_elements
+                                                         : 0U,
+                                                 prompt.vision_items[i].patch_count)) {
+            continue;
         }
+        // Name the numbers: a count mismatch means the two arrays were assembled from different
+        // media, and that wants the pairing rebuilt rather than this check relaxed
+        // (缓存模块v2.md §2.1: 一条对话永远是完整的).
+        std::fprintf(stderr,
+                     "[vision] media payload shape failed: item=%zu/%zu patch_elements=%zu"
+                     " patch_count=%u kFeatures=%u expected=%zu\n",
+                     i, prompt.media_payloads.size(), prompt.media_payloads[i]->patch_elements,
+                     prompt.vision_items[i].patch_count,
+                     static_cast<unsigned>(kPreparedVisionPatchFeatures),
+                     static_cast<std::size_t>(prompt.vision_items[i].patch_count) *
+                         kPreparedVisionPatchFeatures);
+        std::fflush(stderr);
+        throw std::invalid_argument("prepared prompt media item payload has an invalid shape");
     }
     if (prompt.has_media() && !vision_enabled) {
         throw std::invalid_argument("Vision is disabled for this Engine");

@@ -425,6 +425,41 @@ void test_rebuild_work_prompt_frontier_boundary() {
 
 } // namespace
 
+// A payload slot that was RELEASED is a legitimate state, not a malformed prompt.
+//
+// `PreparedPromptData::release_all_media_payloads` resets the payload pointers while keeping the
+// slots one-to-one with `vision_items` on purpose ("Releasing host storage must not destroy that
+// structural identity while a Vision prefill session can still revisit the same item in a later
+// Text chunk"), and the admission path releases exactly the slots the Vision plan does not use.
+// The request validator used to require a non-null payload, which turned that documented release
+// into a false `prepared prompt media item payload has an invalid shape` for any prompt validated
+// afterwards - the shape that made a 235k-token production conversation fail intermittently
+// (2026-10-01 req#530-#533), because whether the release had happened tracked the reuse state.
+void test_released_vision_payload_slot_is_legal() {
+    constexpr std::uint32_t patches = 8;
+    // The item's real shape: patch_count items of kPreparedVisionPatchFeatures features.
+    const std::size_t elements = static_cast<std::size_t>(patches) * q36::kPreparedVisionPatchFeatures;
+    expect(q36::prepared_vision_payload_slot_matches(/*present=*/true, elements, patches),
+           "a present payload matching its item's patch shape is accepted");
+    expect(q36::prepared_vision_payload_slot_matches(/*present=*/false, 0, patches),
+           "a RELEASED payload slot is accepted: the slot identity is what must hold");
+    // The check must still catch a genuinely mispaired payload.
+    expect(!q36::prepared_vision_payload_slot_matches(/*present=*/true, elements + 1, patches),
+           "a payload whose element count does not match its item is still rejected");
+    expect(!q36::prepared_vision_payload_slot_matches(/*present=*/true, elements, patches + 1U),
+           "a payload paired with a different item's patch count is still rejected");
+    expect(!q36::prepared_vision_payload_slot_matches(/*present=*/true, 0, patches),
+           "a present but empty payload is still rejected");
+    // Releasing keeps the slots: the identity survives, which is why the state is legal at all.
+    q36::PreparedPromptData prompt = identity_prompt();
+    prompt.media_payloads.push_back(std::make_shared<const q36::PreparedMediaPayload>());
+    const std::size_t slots = prompt.media_payloads.size();
+    prompt.release_all_media_payloads();
+    expect(prompt.media_payloads.size() == slots,
+           "release_all_media_payloads keeps one slot per Vision item");
+    expect(prompt.has_media(), "releasing payloads does not remove the prompt's Vision items");
+}
+
 int main() {
     test_topology();
     test_decoder_layout();
@@ -433,6 +468,7 @@ int main() {
     test_vision_control();
     test_prefix_identity();
     test_rebuild_work_prompt_frontier_boundary();
+    test_released_vision_payload_slot_is_legal();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

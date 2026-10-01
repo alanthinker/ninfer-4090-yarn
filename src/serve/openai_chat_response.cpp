@@ -143,19 +143,28 @@ const char* finish_reason(ninfer::FinishReason reason) {
     case ninfer::FinishReason::ContextCapacity:
         return "length";
     // A CANCELLED generation is not a completed one, and the OpenAI chat wire has no value that
-    // says so. Rendering it as `stop` made "the server never produced anything" byte-identical to
+    // says so. Rendering it as `stop` made "the Engine never produced anything" byte-identical to
     // "the model finished and chose to say nothing", which is exactly how a request the Engine
     // could not serve reached a client as a completed response with no content (2026-10-01
     // production req#407-#412: HTTP 200, `finish_reason: "stop"`, `completion_tokens: 0` for a
     // 117,614-token prompt, surfaced as EMPTY_RESPONSE). Every peer mapper already distinguishes
     // it - `openai_responses_response.cpp` and the operational log say `cancelled`, and
-    // `anthropic_messages_response.cpp` refuses to serialize it at all. Refusing here too keeps
-    // the four in agreement and turns an undeliverable generation into a loud failure instead of
-    // a silent empty success (§三 R0: only the queue timeout and the request's own cancellation
-    // reject - and a rejection must be visible AS a rejection).
+    // `anthropic_messages_response.cpp` refuses to serialize it at all.
+    //
+    // The rejection carries the SAME shape `request_error_to_api_error` gives a cancelled request
+    // (499 / `request_cancelled` / `client_disconnected`): a cancelled generation is a
+    // cancellation, not an internal fault, so it must not surface as a 500 `internal_error`
+    // carrying a C++ diagnostic either. A client that is still connected and receives this learns
+    // what actually happened instead of being handed an empty success (§三 R0: only the queue
+    // timeout and the request's own cancellation reject, and a rejection must be visible AS a
+    // rejection).
     case ninfer::FinishReason::Cancelled:
-        throw std::logic_error(
-            "cancelled generation cannot be serialized as an OpenAI chat completion");
+        throw ApiException(ApiError{
+            .status  = 499,
+            .type    = "request_cancelled",
+            .message = "the generation was cancelled before it produced any output",
+            .code    = "client_disconnected",
+        });
     case ninfer::FinishReason::None:
     case ninfer::FinishReason::StopToken:
     case ninfer::FinishReason::StopString:

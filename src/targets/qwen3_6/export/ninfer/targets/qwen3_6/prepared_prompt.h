@@ -198,6 +198,28 @@ struct PreparedPromptData {
     }
 };
 
+// Does one payload slot agree with its Vision item? The rule the release above depends on.
+//
+// The SLOT identity is what must hold: one payload slot per Vision item, in order. A NULL slot is
+// legitimate - `release_all_media_payloads` resets the pointers while keeping the slots one-to-one,
+// and the admission path releases exactly the slots the Vision plan does not use. Only a payload
+// that is still PRESENT must match the item's patch shape: `patch_elements` is the exact row-major
+// BF16 element count the Vision projection consumes, and `patch_count` items of
+// `kPreparedVisionPatchFeatures` features each.
+//
+// Demanding a non-null payload here made the documented released state unrepresentable and turned
+// the release itself into a false `prepared prompt media item payload has an invalid shape` for any
+// prompt validated afterwards (2026-10-01 production req#530-#533: a 235k-token conversation whose
+// images were covered by the reused prefix, so the Vision plan was empty, the payloads were
+// released, and the failure appeared and disappeared with the reuse state - which is what made it
+// look random). Free function so `test_runtime_mechanisms.cpp` decides it in milliseconds.
+[[nodiscard]] constexpr bool
+prepared_vision_payload_slot_matches(bool present, std::size_t patch_elements,
+                                     std::uint32_t patch_count) noexcept {
+    return !present || patch_elements == static_cast<std::size_t>(patch_count) *
+                                             kPreparedVisionPatchFeatures;
+}
+
 class PreparedPromptAccess {
 public:
     [[nodiscard]] static const PreparedPromptData& view(const PreparedPrompt& prompt);

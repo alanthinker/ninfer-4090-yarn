@@ -8451,7 +8451,25 @@ void ProgramImplCore::prepare_victim_teardown(std::uint32_t index) {
     // pre-screened (declines instead of latching); state images only lose a redundant Device
     // replica for free or demote when a Host slot allows - anything left is what the
     // [invariant1] probe inside the strict release records as residue.
-    (void)spill_owner_device_kv_to_host(index, /*shared=*/false, /*exclude_shared=*/true);
+    //
+    // The spill is called in a LOOP, which is the contract its own landing carries: it retries its
+    // landing through `detail::land_after_releasing_for_room`, documented as ONE R2 per call
+    // ("the caller is itself the loop, so one R2 per attempted move is what keeps each call's cost
+    // constant"). Calling it once and discarding the result - what this site did - made a single
+    // failed Host landing strand the victim's Device pages, so the invariant-1 preflight at the
+    // eviction site found residue and rolled the whole step back: `[cache] pressure step refused:
+    // victim slot=43 cannot be moved to Host (R1) ... (R0)` on an IDLE Engine whose pool held 256
+    // finished conversations, i.e. exactly the "删得动但还不够" state §一 rules out (only "nothing
+    // left to release" is terminal). Production 2026-10-01 22:06: req#530-#533, a 235k-token
+    // conversation whose prefix had missed, could not be served at all - every retry needed the
+    // same full prefill, was refused the same way, and never published the prefix that would have
+    // made the next retry cheap, so the conversation stayed stuck.
+    //
+    // Bounded by PROGRESS, not by a count: the call reports whether it moved anything, and the
+    // walk also stops as soon as the victim holds no Device data (nothing left to move).
+    while (continuation_holds_device_data(index) &&
+           spill_owner_device_kv_to_host(index, /*shared=*/false, /*exclude_shared=*/true)) {
+    }
     const auto move_state = [&](StateImageHandle handle) {
         if (!handle.valid() || !state_store->valid(handle)) { return; }
         if (release_protected_state && *release_protected_state == handle) { return; }
@@ -8503,7 +8521,13 @@ void ProgramImplCore::prepare_victim_teardown(std::uint32_t index) {
 void ProgramImplCore::prepare_shared_victim_teardown(std::uint32_t index) {
     if (index >= shared_prefix_capacity || !state_store) { return; }
     const SharedPrefixState& shared = shared_prefix_states[index];
-    (void)spill_owner_device_kv_to_host(index, /*shared=*/true, /*exclude_shared=*/true);
+    // The same LOOP contract as the private teardown above: the spill retries its landing through
+    // `land_after_releasing_for_room` (one R2 per call, "the caller is itself the loop"), so a
+    // single call with a discarded result strands Device pages and the invariant-1 preflight then
+    // refuses the whole step (R0).
+    while (shared_prefix_holds_device_data(index) &&
+           spill_owner_device_kv_to_host(index, /*shared=*/true, /*exclude_shared=*/true)) {
+    }
     const StateImageHandle handle = shared.state;
     if (!state_store->valid(handle)) { return; }
     if (release_protected_state && *release_protected_state == handle) { return; }
