@@ -136,6 +136,14 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         lifecycle->response_failure(make_internal_request_failure(
                             RequestFailurePhase::ResponseRender, exception.what()));
                         return false;
+                    } catch (const ApiException& exception) {
+                        // A decided ApiError (a cancelled generation, an unavailable route) is
+                        // classified from its OWN status and code, so a cancellation is recorded as
+                        // a client disconnect instead of a server-internal fault.
+                        lifecycle->response_failure(
+                            make_request_failure(RequestFailurePhase::ResponseRender,
+                                                 exception.error()));
+                        return false;
                     }
                 };
                 try {

@@ -68,9 +68,23 @@ void render_and_write(SseTransport& transport, Render&& render) {
     try {
         auto payload = std::forward<Render>(render)();
         transport.write(payload);
-    } catch (const ClientDisconnected&) { throw; } catch (const ResponseRenderFailure&) {
+    } catch (const ClientDisconnected&) {
         throw;
-    } catch (const std::exception& exception) { throw ResponseRenderFailure(exception.what()); }
+    } catch (const ResponseRenderFailure&) {
+        throw;
+    } catch (const ApiException&) {
+        // An ApiError is a DECIDED outcome, not a rendering fault: it already carries the status and
+        // the code the response must report. Rewrapping it as `ResponseRenderFailure` made the
+        // caller record `make_internal_request_failure` and answer "HTTP 500 | internal error"
+        // instead - which is how a cancelled generation (499 / request_cancelled /
+        // client_disconnected) came out of the logs as a server-internal fault, next to the
+        // truthful `HTTP 499 | client disconnected` line written moments later (2026-10-01
+        // production req#407). Let it through unchanged so the caller's own ApiException handler
+        // reports what actually happened.
+        throw;
+    } catch (const std::exception& exception) {
+        throw ResponseRenderFailure(exception.what());
+    }
 }
 
 RequestJson parse_json_body(const httplib::Request& request);

@@ -1,7 +1,9 @@
 #include "serve/http_server.h"
+#include "serve/http_transport.h"
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <iostream>
 #include <string>
 
@@ -138,6 +140,65 @@ int main() {
     failures += check(other_result == httplib::Server::HandlerResponse::Unhandled &&
                           other_response.body.empty(),
                       "non-413 response was changed by the payload-limit handler");
+
+    // A DECIDED ApiError raised while rendering must survive as itself, and a cancelled generation
+    // must be classified as a client disconnect rather than a server-internal fault.
+    //
+    // 2026-10-01 production req#407: the client timed out, the generation completed as CANCELLED,
+    // and the chat encoder refused to serialize it - correctly, but with an ApiException. The
+    // rendering helper rewrapped anything that was not one of its two known exception types as
+    // `ResponseRenderFailure`, so the caller recorded `make_internal_request_failure` and the log
+    // said `HTTP 500 | internal error`, moments before the truthful `HTTP 499 | client disconnected`
+    // from the transport. An operator reading that window sees a server fault where the client had
+    // simply gone away.
+    {
+        httplib::DataSink sink;
+        sink.write = [](const char*, std::size_t) { return true; };
+        std::atomic<bool> cancelled{false};
+        ninfer::serve::SseTransport transport(sink, cancelled);
+
+        bool saw_api_exception  = false;
+        bool saw_render_failure = false;
+        try {
+            ninfer::serve::render_and_write(transport, []() -> std::string {
+                throw ninfer::serve::ApiException(ninfer::serve::ApiError{
+                    .status  = 499,
+                    .type    = "request_cancelled",
+                    .message = "the generation was cancelled before it produced any output",
+                    .code    = "client_disconnected",
+                });
+            });
+        } catch (const ninfer::serve::ApiException&) {
+            saw_api_exception = true;
+        } catch (const ninfer::serve::ResponseRenderFailure&) {
+            saw_render_failure = true;
+        }
+        failures += check(saw_api_exception && !saw_render_failure,
+                          "a decided ApiError must not be rewrapped as a render failure");
+
+        // A genuine rendering fault still reports as one - the fix must not swallow it.
+        bool real_fault_is_render_failure = false;
+        try {
+            ninfer::serve::render_and_write(
+                transport, []() -> std::string { throw std::runtime_error("encoder exploded"); });
+        } catch (const ninfer::serve::ResponseRenderFailure&) {
+            real_fault_is_render_failure = true;
+        }
+        failures += check(real_fault_is_render_failure,
+                          "a genuine rendering fault must still be reported as one");
+
+        // And that ApiError classifies as what it says it is.
+        const auto cancelled_failure = ninfer::serve::make_request_failure(
+            ninfer::serve::RequestFailurePhase::ResponseRender,
+            ninfer::serve::ApiError{.status  = 499,
+                                    .type    = "request_cancelled",
+                                    .message = "the generation was cancelled before it produced"
+                                               " any output",
+                                    .code    = "client_disconnected"});
+        failures += check(cancelled_failure.classification ==
+                              ninfer::serve::RequestFailureClass::ClientDisconnected,
+                          "a cancelled generation must not be classified as a server fault");
+    }
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
