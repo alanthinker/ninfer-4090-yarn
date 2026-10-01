@@ -377,6 +377,73 @@ void case_headroom_does_not_overflow() {
           "a saturated demand against an empty Host is the full demand, no wrap");
 }
 
+// ③'s water line must never become a REQUIREMENT. `cachep::plan` derives the Host gap as
+// `total - preference`, so the preference has to be EXACTLY the water line: declare less than the
+// line and the remainder stays a gap the release loop will destroy cache to close.
+//
+// The bug this pins (production 2026-10-01 req#523): the demand builder clamped the preference
+// against `base` instead of against `total`, so whenever `headroom > base` - the normal shape for a
+// reuse request, whose own Host peak is small - the water line leaked into the requirement. On a
+// Host KV pool at 31.9/32 GiB that turned an 111-page Device main gap plus a 107-page backend gap
+// into a ~2 GiB Host requirement: the release loop walked 172 owners and destroyed ~10 GiB of Host
+// cache, the Device gap was still open, the plan failed its own simulation and was discarded whole,
+// and the request dropped its offered 73,230-token reuse and recomputed from root
+// (`cache 0 (0.0%)`, TTFT 69 s). The ③ cases above could not catch it: they exercise
+// `host_kv_demand` (the TOTAL) only, while the defect lived in the preference beside it.
+void case_water_line_preference_never_becomes_a_requirement() {
+    const std::size_t headroom = 2ULL << 30;   // the ③ water line, production's 2 GiB
+    const std::size_t landing  = 41ULL << 20;  // the spill landing this plan really owes
+    const std::size_t base     = 41ULL << 20;  // own Host peak BELOW the line: the failing shape
+    const HostKvDemand tight = host_kv_demand_with_water_line(base, landing, headroom);
+    check(tight.total - tight.preference == base + landing,
+          "③: the requirement is the request's own peak + landing, never the water line");
+    check(tight.preference == headroom,
+          "③: the declared preference is exactly the water line, not the (smaller) own peak");
+    // The line must not be reachable by paying it: the release loop's gap is the requirement only.
+    check(tight.total - tight.preference < headroom,
+          "③: no water-line byte is owed (the loop must never chase the 2 GiB margin)");
+    // From the other side: an own peak ABOVE the line keeps the same invariant.
+    const std::size_t big_base = 4ULL << 30;
+    const HostKvDemand roomy = host_kv_demand_with_water_line(big_base, landing, headroom);
+    check(roomy.total - roomy.preference == big_base + landing,
+          "③: a request whose own peak exceeds the line still owes peak + landing");
+    // No water line: nothing is a preference, so the whole demand is the requirement.
+    const HostKvDemand no_line = host_kv_demand_with_water_line(base, landing, 0);
+    check(no_line.preference == 0 && no_line.total == base + landing,
+          "③: with headroom=0 nothing is declared as preference");
+    // Saturation must keep the preference a real part of the total (never a negative requirement).
+    const std::size_t max_sz = std::numeric_limits<std::size_t>::max();
+    const HostKvDemand full = host_kv_demand_with_water_line(max_sz - 2, max_sz - 2, max_sz - 2);
+    check(full.preference <= full.total,
+          "③: a saturated demand still declares a preference inside the total");
+}
+
+// Free Host KV bytes are room only if a landing can be PLACED in them. §三 R1 keeps the gap in
+// bytes and splits the landing into runs, so fragmentation costs segments - but the arena still
+// allocates run by run, so free space with no run large enough for ONE page is refused by every
+// landing while `free_bytes()` reports it as free.
+//
+// The bug this pins (production 2026-10-01 req#411-#416, the EMPTY_RESPONSE incident):
+// `[host-alloc] arena refused: free=4214784 largest_run=0 pages first_request=1 pages (1114112
+// bytes)`. 4 MiB free, a ONE-page landing refused. The release loop's gap was byte-based, so it
+// saw no Host gap, dropped nothing, and the plan died as `blocked_host` -> Infeasible -> the
+// request was answered with an empty completion while an idle engine's Host pool sat full of
+// finished conversations' cache - the exact "空闲引擎等已完成对话" defect §一/§三 R0/R2 forbid.
+void case_unplaceable_host_bytes_are_not_room() {
+    const std::size_t free_bytes = 4214784;  // the production figure: 4.0 MiB free by bytes
+    check(placeable_host_kv_bytes(free_bytes, /*largest_free_run_pages=*/0) == 0,
+          "③ free bytes with no run large enough for one page are not room: R2 must make room");
+    check(placeable_host_kv_bytes(free_bytes, /*largest_free_run_pages=*/1) == free_bytes,
+          "③ once a single page fits, the byte rule stands and the bytes are room (no over-drop)");
+    check(placeable_host_kv_bytes(0, 16) == 0, "③ no free bytes is no room whatever the run says");
+    // The credit the gate spends and this predicate must be the SAME question: with no placeable
+    // room the landing relief is 0, so the gate cannot admit a landing the allocator will refuse.
+    const std::size_t stride = 1114112;  // one Host page, the production stride
+    check(kv_landing_relief(placeable_host_kv_bytes(free_bytes, 0), stride, stride, 4096, 4096)
+                  .main_kv_pages == 0,
+          "③ unplaceable Host bytes must not be credited as landing relief");
+}
+
 // §三 R1 at reserve time: a Device-KV reservation that does not fit must first ask the release
 // step to move cold Device KV to Host. This is the loop `LogicalKVPageStore::reserve_device_pages`
 // runs, extracted so the rule is decidable without a Device arena.
@@ -594,6 +661,8 @@ int main() {
     case_headroom_no_eviction_when_host_has_room();
     case_headroom_zero_reproduces_pre3_gap_only();
     case_headroom_does_not_overflow();
+    case_water_line_preference_never_becomes_a_requirement();
+    case_unplaceable_host_bytes_are_not_room();
     std::printf("reserve_with_release_attempts: Device-KV reservation releases until it fits\n");
     case_device_kv_reservation_releases_until_it_fits();
     if (g_failures != 0) {

@@ -764,6 +764,22 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         (rows_vacant == 0 && !(protection && protection->consumed_private_source)) ? 1 : 0;
     const detail::PhysicalResources occupancy  = program->physical_occupancy();
     const detail::PhysicalResources capacity   = program->admission_capacity();
+    // Host KV room is what a landing can be PLACED in, not what the pool has free by bytes.
+    //
+    // §三 R1's gap stays a byte gap (the landing is served in runs, so fragmentation costs
+    // segments). The one case where the two disagree is free space with no run large enough for a
+    // single page: the bytes are there, the allocator refuses every landing, and the release loop -
+    // reading "free bytes" - has no gap to close, so it drops nothing and the plan then dies in
+    // `can_allocate_after_page_releases` as `blocked_host`. The request is then unplannable on an
+    // IDLE engine whose Host pool is full of finished conversations' cache, which §一/§三 R2
+    // forbid: R2 must delete the least-important cached conversation until the landing fits.
+    // Feeding the policy the placeable figure is what lets that R2 gap exist (2026-10-01
+    // production req#411-#416: free=4.0 MiB, `largest_run=0 pages`, a 1-page landing refused).
+    const std::uint64_t host_kv_capacity    = host_kv(capacity);
+    const std::uint64_t host_kv_placeable =
+        static_cast<std::uint64_t>(program->placeable_host_kv_bytes());
+    const std::uint64_t host_kv_used =
+        host_kv_capacity > host_kv_placeable ? host_kv_capacity - host_kv_placeable : 0;
     const cachep::TierOccupancy tiers{
         .device_kv_used        = occupancy.device.main_kv_pages,
         .device_kv_capacity    = capacity.device.main_kv_pages,
@@ -771,8 +787,8 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         .device_backend_kv_capacity = capacity.device.backend_kv_pages,
         .device_state_used     = device_state(occupancy),
         .device_state_capacity = device_state(capacity),
-        .host_kv_used          = host_kv(occupancy),
-        .host_kv_capacity      = host_kv(capacity),
+        .host_kv_used          = host_kv_used,
+        .host_kv_capacity      = host_kv_capacity,
         .host_state_used       = host_state(occupancy),
         .host_state_capacity   = host_state(capacity),
         .catalog_rows_vacant   = rows_vacant,
@@ -796,6 +812,15 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         (peak.device.main_kv_pages + peak.device.backend_kv_pages) > device_free_total
             ? (peak.device.main_kv_pages + peak.device.backend_kv_pages) - device_free_total
             : 0;
+    // The Host demand and its ③ water line are ONE computation, in one place
+    // (`host_kv_demand_with_water_line`): `Demand::host_kv_preference` must be exactly the water
+    // line, so `cachep::plan`'s `total - preference` leaves the request's own peak plus its landing
+    // and the line itself stays a preference that cannot fail the plan. The two call sites that
+    // build this pair diverged once (the initial assembly clamped the preference to the peak
+    // instead of to the total, so a request whose own Host peak was below the 2 GiB line carried the
+    // line as a REQUIREMENT), and that divergence is what the shared helper now makes impossible.
+    const HostKvDemand host_kv_need = host_kv_demand_with_water_line(
+        peak.host.kv_bytes, shed_device_kv * page_bytes, program->host_headroom_bytes);
     cachep::Demand demand{
         .device_kv         = peak.device.main_kv_pages,
         .device_backend_kv = peak.device.backend_kv_pages,
@@ -806,8 +831,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         // ③'s water line rides in the same function: the demand is what the arena must be able to
         // hold, and the policy turns it into a gap with its own shortfall - it is never handed a
         // net figure (see host_kv_demand).
-        .host_kv           = host_kv_demand(peak.host.kv_bytes, shed_device_kv * page_bytes,
-                                            program->host_headroom_bytes),
+        .host_kv           = host_kv_need.total,
         .host_state        = peak.host.state_slots + shed_device_state,
         .catalog_rows      = need_rows,
         // ③'s water line is declared as a PREFERENCE: it must not be able to fail the plan.
@@ -816,8 +840,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         // the request actually needed went unanswered (2026-09-29 production: `hkv=2197618688`
         // against 19 MB free, 62 steps all `removed main=0`, a 4,136-token request parked for its
         // full 5-minute deadline).
-        .host_kv_preference = std::min<std::uint64_t>(program->host_headroom_bytes,
-                                                     host_kv_demand(peak.host.kv_bytes, 0, 0)),
+        .host_kv_preference = host_kv_need.preference,
     };
 
     // For every victim, ask what MOVING it can actually hand back to Device. This is NOT the same
@@ -1118,12 +1141,11 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::tier_policy_target(
         // below would wash it out after the first round - same function, same terms. The
         // preference term is re-stated because `demand.host_kv` may have grown: it must keep
         // naming the SAME absolute water line, never grow into a requirement.
-        const std::uint64_t want = host_kv_demand(
+        const HostKvDemand want = host_kv_demand_with_water_line(
             host_kv(residual), applied_landing_pages() * page_bytes, program->host_headroom_bytes);
-        if (want <= demand.host_kv) { break; }
-        demand.host_kv          = want;
-        demand.host_kv_preference =
-            std::min<std::uint64_t>(program->host_headroom_bytes, want);
+        if (want.total <= demand.host_kv) { break; }
+        demand.host_kv            = want.total;
+        demand.host_kv_preference = want.preference;
         plan = cachep::plan(demand, tiers, pool);
     }
     if (plan.enqueue) { apply_plan(); } // keep the diagnostic views consistent

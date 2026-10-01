@@ -194,6 +194,56 @@ struct KvLandingRelief {
     return add(add(base_bytes, landing_bytes), headroom_bytes);
 }
 
+// The (total, preference) pair `cachep::Demand` takes, computed in ONE place so the two call sites
+// that build it cannot diverge - they did, and that divergence was the bug.
+//
+// `total` is what `Demand::host_kv` gets: the request's own Host peak, plus the landing its spill
+// will place, plus ③'s water line. `preference` is what `Demand::host_kv_preference` gets, and it
+// is EXACTLY the water line: `cachep::plan` derives the gap as `total - preference`, so whatever is
+// declared here stops being a requirement.
+//
+// INVARIANT: `total - preference == base_bytes + landing_bytes` (saturating). The water line is a
+// PREFERENCE that "must not be able to fail the plan" (see `Demand::host_kv_preference`), so the
+// bytes above this line are the request's own peak plus its landing - never the headroom. Clamping
+// the preference against `base_bytes` instead of against `total` let the headroom leak into the
+// requirement whenever `headroom_bytes > base_bytes` (the normal case for a reuse request, whose own
+// Host peak is small): production 2026-10-01 req#523, on a Host KV pool at 31.9/32 GiB, turned an
+// 111-page Device gap (main) plus a 107-page gap (backend) into a ~2 GiB Host requirement, the
+// release loop walked 172 owners and destroyed ~10 GiB of Host cache, the Device gap was still
+// open, the plan failed its own simulation and was discarded whole, and the request dropped its
+// offered 73,230-token reuse and recomputed from root (`cache 0 (0.0%)`, TTFT 69 s).
+struct HostKvDemand {
+    std::size_t total      = 0;
+    std::size_t preference = 0;
+};
+
+// Is the Host pool's FREE SPACE room a landing can use?
+//
+// §三 R1 keeps the requirement in bytes ("只要空闲字节够,搬动就必须成功") and the landing is split
+// into runs, so fragmentation costs segments and never feasibility. The single case where bytes
+// stop being room is free space with no run large enough for ONE page: the arena allocates run by
+// run, so such bytes are refused by every landing while `free_bytes()` still reports them.
+//
+// Reported as 0 that space stops hiding the gap: the policy's release loop then has a real Host
+// gap to close, so R2 deletes the least-important cached conversation (§一/§三 R2 - on an idle
+// engine everything but the working set is deletable) instead of the plan dying as `blocked_host`
+// and the request being answered with nothing. Measured 2026-10-01 production req#411-#416:
+// `[host-alloc] arena refused ... free=4214784 largest_run=0 pages first_request=1 pages`.
+[[nodiscard]] inline std::size_t placeable_host_kv_bytes(std::size_t free_bytes,
+                                                         std::uint32_t largest_free_run_pages) noexcept {
+    return largest_free_run_pages == 0 ? 0 : free_bytes;
+}
+
+[[nodiscard]] inline HostKvDemand
+host_kv_demand_with_water_line(std::size_t base_bytes, std::size_t landing_bytes,
+                               std::size_t headroom_bytes) noexcept {
+    const std::size_t total = host_kv_demand(base_bytes, landing_bytes, headroom_bytes);
+    return HostKvDemand{
+        .total      = total,
+        .preference = headroom_bytes < total ? headroom_bytes : total,
+    };
+}
+
 // How many times a Device-KV reservation is retried after the release step freed nothing.
 //
 // 缓存模块v2.md §三 R1 at reserve time: `fits` is the pool's own capacity test and `release` is

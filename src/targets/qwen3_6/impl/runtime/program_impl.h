@@ -9538,6 +9538,22 @@ std::size_t ProgramImplCore::releasable_host_kv_bytes() const noexcept {
     return bytes;
 }
 
+std::size_t ProgramImplCore::placeable_host_kv_bytes() const noexcept {
+    // §三 R1 keeps the landing requirement in BYTES and splits the landing into runs, so
+    // fragmentation costs segments and never feasibility - up to the one case where the free bytes
+    // cannot serve a single page. The arena still allocates run by run, so free space cut below
+    // page granularity reads as free by bytes and refuses every landing; that is the asymmetry
+    // that produced `[host-alloc] arena refused ... free=4214784 largest_run=0 pages
+    // first_request=1 pages` and the silent empty answer behind it (2026-10-01 req#411-#416).
+    // Asking the SAME predicate the allocator asks makes those bytes read as 0, so the policy's
+    // gap is real and R2 releases a cold owner (§三 R2) instead of the plan failing.
+    if (host_kv_arena == nullptr || text_kv_pages == nullptr) { return 0; }
+    const HostKVPageLayout layout =
+        plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry());
+    return detail::placeable_host_kv_bytes(host_kv_arena->free_bytes(),
+                                           host_kv_arena->largest_free_run_pages(layout));
+}
+
 detail::PeakFitRelief ProgramImplCore::kv_relief() const noexcept {
     // The KV half of the release-ladder relief the State dimensions always credited (device-state
     // / host-state). A near-full KV pool is resolved by EVICTING the least-important cold owner's
@@ -9571,8 +9587,12 @@ detail::PeakFitRelief ProgramImplCore::kv_relief() const noexcept {
     // The landing allocation (main-KV demotes claim the free Host landing first, backend-KV demotes
     // claim the remainder, both bounded by the Device KV in use) lives in the pure, CPU-tested
     // kv_landing_relief; the Program only supplies its store/arena inputs here.
+    //
+    // The bound is the PLACEABLE figure, not the raw free bytes: this credit is exactly what the
+    // landing pre-check later spends, so crediting bytes the allocator cannot serve is what let a
+    // request be admitted and then die as `blocked_host` (see `placeable_host_kv_bytes`).
     const auto landing =
-        detail::kv_landing_relief(host_kv_arena->free_bytes(), text_host_kv_page_stride,
+        detail::kv_landing_relief(placeable_host_kv_bytes(), text_host_kv_page_stride,
                                   backend_host_kv_page_stride, device_main_used,
                                   device_backend_used);
     out.device_main_kv_pages    = landing.main_kv_pages;

@@ -1390,6 +1390,19 @@ private:
     // cold owner's Host KV was told "infeasible" and waited instead. Bounded to the single least
     // valuable releasable owner, the same way `host_slot_relief` bounds its state half.
     [[nodiscard]] std::size_t releasable_host_kv_bytes() const noexcept;
+    // Host KV bytes a landing can actually be PLACED in right now - the question the arena's
+    // allocator answers, not the raw `free_bytes()`.
+    //
+    // §三 R1 is a BYTE rule ("只要空闲字节够,搬动就必须成功") and the landing is split into runs
+    // (`max_run_pages`), so fragmentation costs segments, never feasibility. But free bytes that
+    // cannot serve even ONE page are not room at all: the arena still applies a per-page run test,
+    // so a Host pool whose free space has been cut below page granularity reads as free by bytes
+    // and refuses every landing. That asymmetry turned a whole request into a silent empty answer
+    // (2026-10-01 production req#411-#416: `[host-alloc] arena refused ... free=4214784
+    // largest_run=0 pages first_request=1 pages` -> `blocked_host` -> Infeasible -> no plan).
+    // Reporting those bytes as 0 makes the gate and the allocator answer the SAME question, so R2
+    // releases a cold owner (§三 R2) and the landing has a run to go in.
+    [[nodiscard]] std::size_t placeable_host_kv_bytes() const noexcept;
     // Pages of ONE owner's KV the spill step could move right now (Device-resident and past every
     // per-page gate that step re-checks). The building block of the relief above.
     [[nodiscard]] std::uint32_t movable_device_kv_pages(const KVAddressSpaceStore& addresses,
