@@ -817,6 +817,63 @@ void case_unreachable_host_water_line_does_not_swallow_the_device_gap() {
           "the Device gap is closed by moving the idle owners' Device KV to Host");
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// b2 (production 2026-10-01 req#407-#412, the EMPTY_RESPONSE recurrence): an IDLE engine whose
+// pool holds 256 finished conversations cannot serve a request that needs a large Device gap plus
+// the Host landing for it.
+//
+// Logged: `[cache] pool sums cand=256 ev_main=7274 ev_bkv=7277 host_kv=32854884352 host_st=312
+// mv_main=5701 ... rows=240` then `[cache] gap dkv=2205 dbkv=2205 hkv=13281918976 | free dkv=540
+// hkv=100933632 | cand=256 steps=163 | gaps dkv=1665 dbkv=1663 hkv=13180985344`, and finally
+// `[cache] search produced no incumbent stop=1 ...`. The plan left the Device gap exactly at
+// `2205 - 540`, i.e. it moved/released NOTHING, while the pool advertised thousands of evictable
+// and movable pages.
+//
+// §一: everything in a pool except the requests being processed is deletable, so "deletable but
+// not enough yet" is NOT a terminal state - only "nothing left to release" is. §三 R2: delete the
+// least important conversation until the gap closes. This case asserts the policy closes a Device
+// gap AND the Host landing it needs, from a pool that has plenty of both.
+void case_idle_pool_closes_a_large_device_gap_with_its_landing() {
+    std::printf("case_idle_pool_closes_a_large_device_gap_with_its_landing\n");
+    constexpr std::uint64_t mib = 1ULL << 20;
+    // 20 idle owners, each holding Host KV (already spilled) and Device pages still resident.
+    std::vector<Datum> pool;
+    for (std::uint64_t id = 0; id < 20; ++id) {
+        pool.push_back(Datum{
+            .id       = id,
+            .device_kv = 300,                       // 6000 Device pages across the pool
+            .device_backend_kv = 300,               // the Backend pool is a peer, same figures
+            .host_kv   = 600 * mib,                 // 12 GiB of Host KV across the pool
+            .importance = 100 + id,
+            .age_key    = static_cast<std::int64_t>(id),
+        });
+    }
+    // Device: cap 10284, free 540 -> the request needs 2205 pages. Host: 32 GiB cap, 96 MiB free.
+    TierOccupancy occ = occupancy(/*device_kv_cap=*/10284, /*device_kv_used=*/10284 - 540,
+                                  /*host_kv_cap=*/32ULL << 30,
+                                  /*host_kv_used=*/(32ULL << 30) - (96ULL * mib));
+    occ.device_backend_kv_capacity = 10284;
+    occ.device_backend_kv_used     = 10284 - 542;
+    occ.host_state_capacity        = 320;
+    occ.host_state_used            = 320;
+    occ.catalog_rows_vacant        = 271;
+
+    // The request: 2205 Device pages, and the Host landing those pages need (2205 x ~1 MiB).
+    const Demand need{
+        .device_kv         = 2205 + 540,
+        .device_backend_kv = 2205 + 542,
+        .host_kv           = 2205 * mib + (2ULL << 30),
+        .host_kv_preference = 2ULL << 30,
+    };
+    const Plan outcome = decide(need, occ, pool);
+    std::printf("  steps=%zu enqueue=%d reason=%d\n", outcome.steps.size(),
+                outcome.enqueue ? 1 : 0, static_cast<int>(outcome.reason));
+    std::printf("%s\n", ninfer::runtime::cache::describe(outcome, need, occ, pool.size()).c_str());
+    check(!outcome.enqueue,
+          "§一/§三 R2: an idle pool with 20 evictable owners must close the gap, not enqueue");
+}
+
 }  // namespace
 
 int main() {
@@ -844,6 +901,7 @@ int main() {
     case_nothing_is_dropped_for_a_gap_it_cannot_close();
     case_deletions_stop_at_the_gap();
     case_release_never_gets_a_second_step();
+    case_idle_pool_closes_a_large_device_gap_with_its_landing();
     case_equal_importance_ranks_by_age_then_id();
     if (g_failures != 0) {
         std::printf("cache tier policy FAILED: %d check(s)\n", g_failures);
