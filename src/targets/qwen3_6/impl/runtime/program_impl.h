@@ -7969,26 +7969,78 @@ bool ProgramImplCore::release_idle_owner_host_side(bool require_host_state_slot)
         if (!device_free(footprint)) {
             // #12 先搬后释 (spill-then-release): the owner's Device KV moves to Host first (R1,
             // never destroyed in place) and only then may the owner disappear from Host (R2).
-            // The Device-STATE shape does not qualify here - relocating state is the demote
-            // step's job, one slot at a time.
             const std::uint32_t device_pages =
                 footprint.device.main_kv_pages + footprint.device.backend_kv_pages;
-            if (footprint.device.state_slots != 0) { ++skip_devstate; return false; }
-            if (device_pages == 0) { ++skip_nodevicekv; return false; }
-            if (!spill_owner_device_kv_to_host(index)) { ++skip_spill; return false; }
-            footprint = owner_exclusive_resources(sequence);
-            if (!device_free(footprint)) { ++skip_postcheck; return false; }
+            if (device_pages != 0) {
+                if (!spill_owner_device_kv_to_host(index)) { ++skip_spill; return false; }
+                footprint = owner_exclusive_resources(sequence);
+            }
+            // 缓存模块v2.md §一: "只要还有一条已经处理完的对话占着缓存，就一定能删". What a Device
+            // state slot left behind costs is the question, and the old answer - refuse the whole
+            // owner ("relocating state is the demote step's job") - is what made 319 finished
+            // conversations undeletable. Its companion walk, `degrade_idle_owner_host_state`, is
+            // gated on the candidate HOLDING a Host state slot, so an owner whose Device KV was
+            // already spilled (the normal end state under a full Host KV pool) is refused by both
+            // walks and can never be deleted. Measured 2026-10-02 production req#427:
+            // `[ladder] degrade declined ... nohoststate=4 protected=306 ... noplace=94`, then
+            // `[cache] pressure step refused: victim slot=55 cannot be moved to Host (R1) ... (R0)`,
+            // and the request was refused outright in 415 ms with `device.state used=8 cap=8`.
+            //
+            // The leftover state is releasable when it cannot serve a reuse on its own: §三 R3
+            // restores a hit from KV, so state whose KV is gone is residue, not cache. That is what
+            // `idle_owner_is_releasable` decides, and it is the only shape this step newly accepts -
+            // an owner still holding Device pages was spilled above and is re-measured, and an owner
+            // holding BOTH is still refused because its state can still be restored with its KV.
+            if (footprint.device.state_slots != 0) {
+                // Measure the KV that is still on Device AFTER the spill above, not before it: the
+                // spill is what turns "holding both" into "residue", so the pre-spill count would
+                // refuse exactly the owners this step exists to release.
+                const std::uint32_t kv_left =
+                    footprint.device.main_kv_pages + footprint.device.backend_kv_pages;
+                const detail::IdleOwnerReleaseShape shape{
+                    .device_kv_pages    = kv_left,
+                    .device_state_slots = footprint.device.state_slots,
+                    .host_kv_bytes      = footprint.host.kv_bytes,
+                };
+                if (!detail::idle_owner_is_releasable(
+                        shape, require_host_state_slot, footprint.host.state_slots)) {
+                    ++skip_devstate;
+                    return false;
+                }
+            }
+            if (!device_free(footprint)) {
+                // Residue accepted above: the strict release destroys it, so the owner must be
+                // Device-free for invariant 1. Prove the spill left nothing it cannot take.
+                const bool only_relinquished_state =
+                    footprint.device.main_kv_pages == 0 && footprint.device.backend_kv_pages == 0 &&
+                    footprint.device.active_lanes == 0 && footprint.device.state_slots != 0;
+                if (!only_relinquished_state) { ++skip_postcheck; return false; }
+            }
         }
         if (!can_release_continuation_slot_strict(index)) { ++skip_canrelease; return false; }
+        // The intent names what this release is allowed to destroy. An owner whose KV is gone and
+        // whose only Device footprint is a state image left behind is released under the one cache
+        // intent that may take that residue (§三 R3 restores from KV, so it serves nothing); every
+        // other shape stays on the Host-only intent, which refuses the moment any Device data
+        // remains. Naming it here rather than widening `PolicyLadderHostOnly` is what keeps the
+        // invariant checkable: the strict release decides with the intent it is handed, so a caller
+        // that never proved the KV was gone cannot destroy Device data by accident.
+        const detail::PhysicalResources final_footprint = owner_exclusive_resources(sequence);
+        const bool relinquished_only = final_footprint.device.state_slots != 0 &&
+                                       final_footprint.device.main_kv_pages == 0 &&
+                                       final_footprint.device.backend_kv_pages == 0 &&
+                                       final_footprint.device.active_lanes == 0;
         std::fprintf(stderr,
                      "[ladder] release host-only idle continuation slot=%u (R2: Device already"
-                     " zero; Host KV + Host state + catalog row go together)\n",
-                     index);
+                     " zero; Host KV + Host state + catalog row go together)%s\n",
+                     index, relinquished_only ? " [relinquished state: KV gone, image is residue]" : "");
         std::fflush(stderr);
-        // §四 invariant 1: this step proved Device-free above, so the release may proceed; if the
-        // proof and the release ever disagree the guard refuses and the step reports failure.
+        // §四 invariant 1: this step proved the owner Device-free, or proved the only Device data
+        // left is the residue named above; if the proof and the release ever disagree the guard
+        // refuses and the step reports failure.
         return release_continuation_slot_strict(
-            index, state_reclaim::ReleaseIntent::PolicyLadderHostOnly);
+            index, relinquished_only ? state_reclaim::ReleaseIntent::PolicyLadderRelinquishedState
+                                     : state_reclaim::ReleaseIntent::PolicyLadderHostOnly);
     };
     const auto release_shared = [&](std::uint32_t index) -> bool {
         const SharedPrefixSlotRole role = shared_prefix_slots[index].role;
@@ -8697,7 +8749,8 @@ bool ProgramImplCore::release_continuation_slot_strict(
         const std::uint32_t device_kv =
             footprint.device.main_kv_pages + footprint.device.backend_kv_pages;
         const bool holds_device = device_kv != 0 || footprint.device.state_slots != 0;
-        if (!state_reclaim::release_admits_device_destruction(intent, holds_device)) {
+        if (!state_reclaim::release_admits_device_destruction(intent, holds_device,
+                                                              /*holds_device_kv=*/device_kv != 0)) {
             std::fprintf(stderr,
                          "[invariant1-guard] refused %s slot=%u: it still holds Device data"
                          " (kv=%u pages state=%u slots) - R1 says move it, R2 may only delete Host;"

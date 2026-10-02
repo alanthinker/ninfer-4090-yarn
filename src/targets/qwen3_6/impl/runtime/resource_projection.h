@@ -113,6 +113,51 @@ struct PeakFitRelief {
     return added <= capacity && used <= capacity - added;
 }
 
+// §一: "只要还有一条已经处理完的对话占着缓存，就一定能删". The step that deletes one idle owner so
+// its Host side can be reused (`release_idle_owner_host_side`) reaches the strict release only once
+// the owner is Device-free, because §四 invariant 1 forbids destroying Device data in place. Two
+// retreats in that walk let an idle pool answer "nothing to release" while hundreds of finished
+// conversations still held it:
+//
+//   * `device.state_slots != 0` declined the WHOLE owner ("relocating state is the demote step's
+//     job"). The demote step answers a STATE-SLOT deficit and is itself gated on
+//     `host.state_slots != 0`, so an owner whose Device KV was already spilled to Host - the normal
+//     end state under a full Host KV pool - is refused by both walks and can never be deleted.
+//     Measured 2026-10-02 production req#427: `[ladder] degrade declined ... nohoststate=4
+//     protected=306 ... noplace=94` plus `[cache] pressure step refused: victim slot=55 cannot be
+//     moved to Host (R1) ... (R0)`, then the request was refused outright in 415 ms. slot=55's
+//     Device KV had ALREADY moved (`spill continuation slot=55 kv pages=42`); only its state slot
+//     was left, and that alone made 319 finished conversations undeletable.
+//
+// The size of what deletion destroys is what the rule actually turns on, so it is stated as one:
+// deleting the owner destroys its Host-resident cache (the bytes the deficit wants) plus whatever
+// Device residue is left after the spill. The residue is legitimate to destroy only when it cannot
+// serve a reuse on its own - §三 R3 restores a hit from KV, so state with no KV beside it is not a
+// usable cache entry.
+struct IdleOwnerReleaseShape {
+    // Device KV pages this owner still holds; the walk spills these first (#12 先搬后释).
+    std::uint32_t device_kv_pages = 0;
+    // Device state slots this owner still holds AFTER that spill would run.
+    std::uint32_t device_state_slots = 0;
+    // Host KV bytes the owner holds, i.e. what deleting it returns to the pool.
+    std::size_t host_kv_bytes = 0;
+};
+
+// Whether deleting this idle owner is a legal §一 release, and how much Host KV it returns.
+// `require_host_state_slot` is invariant 3: a state-slot deficit is not repaid by deleting an owner
+// with no Host state slot to give back.
+[[nodiscard]] inline bool idle_owner_is_releasable(const IdleOwnerReleaseShape& shape,
+                                                   bool require_host_state_slot,
+                                                   std::uint32_t host_state_slots) noexcept {
+    if (require_host_state_slot && host_state_slots == 0) { return false; }
+    // The spill this walk runs first can clear Device KV, so pages alone never block the release.
+    // A Device state slot is the one piece the spill does not take - and it is exactly the piece
+    // that must already be unusable for the delete to be legal. It is usable only while KV for the
+    // same conversation is still resident somewhere this owner can restore from; with nothing on
+    // Device and the Host side being deleted in the same step, it is residue.
+    return shape.device_state_slots == 0 || shape.device_kv_pages == 0;
+}
+
 [[nodiscard]] inline bool fits_size(std::size_t used, std::size_t added,
                                     std::size_t capacity) noexcept {
     return added <= capacity && used <= capacity - added;

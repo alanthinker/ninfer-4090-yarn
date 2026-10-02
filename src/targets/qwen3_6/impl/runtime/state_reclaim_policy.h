@@ -66,6 +66,7 @@ enum class ReleaseIntent : std::uint8_t {
     PolicyCaptureSharedPressureVictim,
     PolicyCaptureReplacement,      // a capture published over a catalogued shared prefix
     PolicyLadderHostOnly,          // the capacity ladder's Host-side steps
+    PolicyLadderRelinquishedState, // ...including an owner whose KV is gone and only state is left
     OwnershipHandleRelease,        // the client consumed the handle: the conversation is over
     ShutdownTeardown,              // the Program is going away
 };
@@ -79,13 +80,25 @@ enum class ReleaseIntent : std::uint8_t {
     case ReleaseIntent::PolicyCaptureSharedPressureVictim: return "capture-shared-pressure-victim";
     case ReleaseIntent::PolicyCaptureReplacement: return "capture-replacement";
     case ReleaseIntent::PolicyLadderHostOnly: return "ladder-host-only";
+    case ReleaseIntent::PolicyLadderRelinquishedState: return "ladder-relinquished-state";
     case ReleaseIntent::OwnershipHandleRelease: return "handle-release";
     case ReleaseIntent::ShutdownTeardown: return "shutdown";
     }
     return "?";
 }
 
-// A cache-policy release may never destroy Device data; the two non-cache releases may.
+// A cache-policy release may never destroy Device data; the releases that carry an explicit right
+// to it may.
+//
+// `PolicyLadderRelinquishedState` is the one cache release that carries that right, and it is
+// narrow on purpose: it admits exactly the owner whose Device KV is GONE and whose only Device
+// footprint is a state image left behind. §三 R3 restores a reuse hit from KV, so that image cannot
+// serve anything by itself - destroying it destroys no reachable cache, and refusing it is what
+// made 319 finished conversations undeletable on an idle engine (2026-10-02 production req#427:
+// `device.state used=8 cap=8`, `degrade declined ... nohoststate=4 protected=306`, then
+// `pressure step refused: victim slot=55 cannot be moved to Host (R1) ... (R0)` and a refusal in
+// 415 ms). Callers must prove the KV is gone before they may use it, so the right can never be
+// stretched to an owner that still holds reusable data.
 [[nodiscard]] constexpr bool release_may_destroy_device(ReleaseIntent intent) noexcept {
     switch (intent) {
     case ReleaseIntent::PolicyMaterializationVictim:
@@ -95,6 +108,7 @@ enum class ReleaseIntent : std::uint8_t {
     case ReleaseIntent::PolicyCaptureReplacement:
     case ReleaseIntent::PolicyLadderHostOnly:
         return false;
+    case ReleaseIntent::PolicyLadderRelinquishedState:
     case ReleaseIntent::OwnershipHandleRelease:
     case ReleaseIntent::ShutdownTeardown:
         return true;
@@ -103,9 +117,30 @@ enum class ReleaseIntent : std::uint8_t {
 }
 
 // The one question every strict release asks before it destroys anything.
+//
+// `PolicyLadderRelinquishedState` is the one cache intent allowed through with Device data still
+// present, and it is admitted ONLY for the residue it names: a state image whose KV is gone. The
+// check is repeated here from the shape rather than trusted from the caller, so mislabelling an
+// intent can never destroy reusable data - an owner still holding Device KV pages is refused no
+// matter which intent it arrives under, exactly as the two non-cache releases are the only ones
+// that may take Device KV.
+[[nodiscard]] constexpr bool release_admits_device_destruction(ReleaseIntent intent,
+                                                               bool holds_device_data,
+                                                               bool holds_device_kv) noexcept {
+    if (!holds_device_data) { return true; }
+    if (intent == ReleaseIntent::PolicyLadderRelinquishedState) {
+        // Residue only: the state image is what is left after the KV went (§三 R3 restores a hit
+        // from KV, so an image with no KV beside it serves nothing).
+        return !holds_device_kv;
+    }
+    return release_may_destroy_device(intent);
+}
+
+// The two-argument form every existing caller uses: a release that has not stated whether KV is
+// still present is treated as holding it, which is the conservative reading.
 [[nodiscard]] constexpr bool release_admits_device_destruction(ReleaseIntent intent,
                                                                bool holds_device_data) noexcept {
-    return !holds_device_data || release_may_destroy_device(intent);
+    return release_admits_device_destruction(intent, holds_device_data, /*holds_device_kv=*/true);
 }
 
 // ---------------------------------------------------------------------------------------------

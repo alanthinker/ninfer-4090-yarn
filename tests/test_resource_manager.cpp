@@ -1,4 +1,5 @@
 #include "core/site_bad_alloc.h"
+#include "targets/qwen3_6/impl/runtime/resource_projection.h"
 #include "targets/qwen3_6/impl/runtime/state_reclaim_policy.h"
 #include "runtime/cache/cache_tier_policy.h"
 #include "runtime/engine/resource_manager.h"
@@ -24,6 +25,7 @@ namespace {
 using ninfer::PrefixReusePath;
 using ninfer::RuntimeStats;
 namespace state_reclaim = ninfer::targets::qwen3_6::detail::state_reclaim;
+namespace projection    = ninfer::targets::qwen3_6::detail;
 using ninfer::runtime::CancellationFlagView;
 using ninfer::runtime::CheckpointKind;
 using ninfer::runtime::CheckpointRecoveryAlternativeWork;
@@ -4260,8 +4262,49 @@ void test_only_an_ownership_return_may_destroy_device_data() {
     require(state_reclaim::release_admits_device_destruction(
                 ReleaseIntent::OwnershipHandleRelease, true),
             "the ownership return is admitted with Device data");
+
+    // The ONE cache intent that may take Device data, and the residue it may take. 缓存模块v2.md
+    // §一: "只要还有一条已经处理完的对话占着缓存，就一定能删" - and an owner whose Device KV is gone
+    // while a state image is left behind is exactly such a record, because §三 R3 restores a reuse
+    // hit from KV and an image with no KV beside it serves nothing. Refusing it is what made 319
+    // finished conversations undeletable on an idle engine (2026-10-02 production req#427:
+    // `device.state used=8 cap=8`, `degrade declined ... nohoststate=4 protected=306 ... noplace=94`,
+    // `pressure step refused: victim slot=55 cannot be moved to Host (R1) ... (R0)`, refusal in
+    // 415 ms).
+    require(state_reclaim::release_may_destroy_device(
+                ReleaseIntent::PolicyLadderRelinquishedState),
+            "the relinquished-state ladder step carries an explicit right to take its residue");
+    require(state_reclaim::release_admits_device_destruction(
+                ReleaseIntent::PolicyLadderRelinquishedState, true, /*holds_device_kv=*/false),
+            "a state image whose KV is gone is residue and may be released (§一: it is deletable)");
+    // The right is bounded to that shape, and the bound is enforced by the GUARD from the shape
+    // itself - not trusted from the caller's intent - so a mislabelled intent can never destroy
+    // reusable data.
+    require(!state_reclaim::release_admits_device_destruction(
+                ReleaseIntent::PolicyLadderRelinquishedState, true, /*holds_device_kv=*/true),
+            "an owner still holding Device KV pages must be REFUSED even under the residue intent: "
+            "its state can still be restored with that KV, so it is cache, not residue");
+    require(state_reclaim::release_admits_device_destruction(
+                ReleaseIntent::PolicyLadderRelinquishedState, false, /*holds_device_kv=*/false),
+            "a Device-free owner is releasable on this path as on every other");
+    // A caller that does not state whether KV is present gets the conservative reading.
+    require(!state_reclaim::release_admits_device_destruction(
+                ReleaseIntent::PolicyLadderRelinquishedState, true),
+            "without the KV fact stated, the residue intent must not admit Device data");
+
     // Every intent has a name (the batteries grep these strings).
-    for (const ReleaseIntent intent : policy_intents) {
+    const ReleaseIntent named[] = {
+        ReleaseIntent::PolicyMaterializationVictim,
+        ReleaseIntent::PolicyCaptureVictim,
+        ReleaseIntent::PolicySharedPressureVictim,
+        ReleaseIntent::PolicyCaptureSharedPressureVictim,
+        ReleaseIntent::PolicyCaptureReplacement,
+        ReleaseIntent::PolicyLadderHostOnly,
+        ReleaseIntent::PolicyLadderRelinquishedState,
+        ReleaseIntent::OwnershipHandleRelease,
+        ReleaseIntent::ShutdownTeardown,
+    };
+    for (const ReleaseIntent intent : named) {
         const std::string name = state_reclaim::release_intent_name(intent);
         require(!name.empty() && name != "?", "every release intent must have a log name");
     }
@@ -4275,6 +4318,52 @@ void test_only_an_ownership_return_may_destroy_device_data() {
 // spends the pool, evidence does not (measured 2026-09-27: the switch-back case's conversation was
 // deleted at 3 011 tokens, at 16 525 and still at 20 553, and the 20.5K version cost 82K of the rig's
 // 131K-token KV pool and starved the next step into an HTTP 503).
+// 缓存模块v2.md §一: an idle owner is deletable unless something about it is still in use. The step
+// that deletes one so its Host side can be reused (`release_idle_owner_host_side`) reaches the
+// strict release only for a Device-free owner, so it must first deal with whatever Device footprint
+// remains - and the old answer for a Device STATE slot was to refuse the whole owner, which left
+// hundreds of finished conversations undeletable (2026-10-02 production req#427).
+void test_idle_owner_release_shape_keeps_the_rule_and_its_bound() {
+    using projection::IdleOwnerReleaseShape;
+    using projection::idle_owner_is_releasable;
+
+    // Already Device-free: the ordinary R2 release.
+    require(idle_owner_is_releasable(IdleOwnerReleaseShape{.host_kv_bytes = 4096},
+                                     /*require_host_state_slot=*/false, /*host_state_slots=*/0),
+            "a Device-free idle owner is releasable (§一)");
+
+    // Device KV present: the walk spills it first (#12 先搬后释), so the release may proceed.
+    require(idle_owner_is_releasable(
+                IdleOwnerReleaseShape{.device_kv_pages = 42, .host_kv_bytes = 4096},
+                /*require_host_state_slot=*/false, /*host_state_slots=*/0),
+            "Device KV is moved by the spill that runs before the release, not a reason to refuse");
+
+    // THE CASE: KV gone, only a Device state image left. It cannot serve a reuse (§三 R3 restores
+    // from KV), so it is residue and the owner stays deletable.
+    require(idle_owner_is_releasable(
+                IdleOwnerReleaseShape{.device_state_slots = 1, .host_kv_bytes = 4096},
+                /*require_host_state_slot=*/false, /*host_state_slots=*/0),
+            "an owner whose KV is gone and whose only Device footprint is a state image is "
+            "releasable - refusing it stranded signed-off conversations (req#427)");
+
+    // The BOUND: an owner holding BOTH its Device KV and a state slot is NOT residue - its state can
+    // still be restored with its KV - so this step must not take it.
+    require(!idle_owner_is_releasable(
+                IdleOwnerReleaseShape{.device_kv_pages = 42, .device_state_slots = 1},
+                /*require_host_state_slot=*/false, /*host_state_slots=*/0),
+            "an owner holding Device KV beside its state is still usable cache, not residue");
+
+    // Invariant 3 unchanged: a STATE-slot deficit is not repaid by deleting an owner with no Host
+    // state slot to give back.
+    require(!idle_owner_is_releasable(IdleOwnerReleaseShape{.host_kv_bytes = 4096},
+                                      /*require_host_state_slot=*/true, /*host_state_slots=*/0),
+            "a state-slot deficit is not repaid by a Host-KV-only owner (invariant 3)");
+    require(idle_owner_is_releasable(
+                IdleOwnerReleaseShape{.host_kv_bytes = 4096},
+                /*require_host_state_slot=*/true, /*host_state_slots=*/1),
+            "with a Host state slot to return, the same owner does repay the deficit");
+}
+
 void test_reuse_evidence_outranks_size_among_never_reused_owners() {
     const auto private_min_score = [](const FakeProgram& program) -> std::uint64_t {
         std::uint64_t best = std::numeric_limits<std::uint64_t>::max();
@@ -4632,6 +4721,8 @@ int main() {
     run_test("a cached alias does not make an owner unreleasable",
              test_a_cached_alias_does_not_make_an_owner_unreleasable);
     test_only_an_ownership_return_may_destroy_device_data();
+    run_test("an idle owner's release shape keeps §一 and its residue bound",
+             test_idle_owner_release_shape_keeps_the_rule_and_its_bound);
     run_test("a device-slot gap is answerable by every checkpoint holding a replica",
              test_a_device_slot_gap_is_answerable_by_every_checkpoint_holding_a_replica);
     run_test("shared replacement skips a device-holding victim",
