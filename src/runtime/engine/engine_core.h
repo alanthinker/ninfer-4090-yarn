@@ -1883,6 +1883,35 @@ private:
         // kMaximumAdmissionReplans bounded that loop by rejecting after N attempts; §三 R0
         // forbids rejecting on a count, so the memo plus the queue deadline bound it instead -
         // observed as 24k allocate retries inside one request's queue wait, 2026-09-26).
+        //
+        // 缓存模块v2.md §三 R0: the memo is only a "wait" while it still describes the pool. It is
+        // keyed on `physical_usage()`, so it stops matching the moment a counter moves - and on an
+        // IDLE engine nothing moves, which is exactly the wait the rule names as the defect
+        // ("空闲引擎等满整个准入期限"). Before that verdict is allowed to stand, the request is owed the
+        // same unit of R2 every other relief site takes: the release moves the pool, so the memo
+        // below is written against a NEW usage snapshot and the next admission re-plans against what
+        // the release produced instead of parking on the state that just refused it. 2026-10-02
+        // production, req#563: this path logged `materialization: re-admit after progress capacity
+        // miss site=paged_kv_cache: DeviceKVPagePool resize_reservation` and then reported
+        // `running 0 | waiting 1` for 60 consecutive 5 s samples (host 0.0%) until HTTP 499 at
+        // 4m59.9s, while the identical conversation (same `[echo] spec` digest) was served normally
+        // 0.5 s after the client gave up.
+        //
+        // The memo is written on BOTH branches, and that is deliberate: it is what bounds the retry
+        // loop. Taking the relief and skipping the memo would spin instead of parking whenever the
+        // release succeeds but does not resolve the deficit - measured as 3,343 re-admits inside one
+        // request's 60 s queue wait on the tight rig. Writing it is not a give-up: a successful
+        // release has already moved `physical_usage()`, so this snapshot differs from the one that
+        // refused the request and the very next admission is free to re-plan. Only when the release
+        // finds nothing to give does the snapshot equal the refusing state, and then the memo is the
+        // honest §三 R0 answer - the wait is for work in progress, not for cache that could be freed.
+        const bool relief_taken = instance_.program->release_one_cached_unit();
+        if (relief_taken) {
+            std::fprintf(stderr,
+                         "[cache] R0 relief: capacity miss during materialization, released one unit "
+                         "of the least valuable cached data (缓存模块v2.md §三 R0/§2.1)\n");
+            std::fflush(stderr);
+        }
         request->admission_negative_memo.active = true;
         request->admission_negative_memo.usage  = instance_.program->physical_usage();
         request_admission_check();

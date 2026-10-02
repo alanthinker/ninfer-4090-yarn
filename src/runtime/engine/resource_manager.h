@@ -733,6 +733,37 @@ public:
             choice.plan_.reset();
             rollback_logical_materialization(open);
             transaction_.template emplace<std::monostate>();
+            // 缓存模块v2.md §三 R0: a capacity miss is not a proof that the pool cannot serve this
+            // request - it is the planner's ladder-credit and the ladder disagreeing, and the ladder
+            // owes one unit of R2 before the request is told "not now". This is the same obligation
+            // `plan_materialization` already discharges for the no-plan branch (`[cache] R0 relief`),
+            // and leaving it out here is what stranded requests:
+            // 2026-10-02 production, req#563 - the reserve failed on
+            // `paged_kv_cache: DeviceKVPagePool resize_reservation`, the engine re-admitted the
+            // request with a negative memo, and it then sat at `running 0 | waiting 1` for 60
+            // consecutive 5 s reports (host 0.0%) until its queue deadline at 4m59.9s (HTTP 499).
+            // The memo is only cleared when a pool counter or the resource revision moves, and on an
+            // idle engine nothing moves - so the wait it parked on could never end. The identical
+            // conversation had died the same way minutes earlier (req#542) and was served normally
+            // 0.5 s after the client gave up, which is §三 R0's named defect: an idle engine waiting
+            // out the whole admission deadline while the pool holds nothing but finished
+            // conversations.
+            //
+            // Taking the unit here is safe in the §2.1 sense: the order pushed above leaves this
+            // plan's own private source out of every R2 walk, so the unit comes from another owner
+            // or not at all, and a request that cannot be funded by any release is exactly the case
+            // that should wait. The release is what makes the re-plan mean something: the caller
+            // re-seals against the pool the release produced instead of against the one that just
+            // refused it, and the resource revision has moved, so a caller holding a memoized
+            // "cannot be served" verdict for this pool state discards it. When nothing was
+            // releasable the pool stands unchanged and the caller's memo is the honest answer.
+            if (!program.release_one_cached_unit()) {
+                return MaterializationReserveResult::Stale;
+            }
+            std::fprintf(stderr,
+                         "[cache] R0 relief: capacity miss at reserve, released one unit of the "
+                         "least valuable cached data (缓存模块v2.md §三 R0/§2.1)\n");
+            std::fflush(stderr);
             return MaterializationReserveResult::Stale;
         }
         choice.plan_.reset();

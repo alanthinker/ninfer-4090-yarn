@@ -2593,6 +2593,80 @@ void test_capacity_miss_is_retryable() {
     manager.adopt(program, std::move(activation));
 }
 
+// 缓存模块v2.md §三 R0: "排队等的是那个请求把工作集让出来，不是在等缓存被销毁" and "空闲引擎
+// 等满整个准入期限" is named as the defect. A capacity miss at reserve is NOT a proof that the pool
+// cannot serve the request: the planner's ladder-credit and the ladder disagreed, and the ladder owes
+// one unit of R2 before the request is told "not now" - the same obligation `inspect_admission`
+// already discharges for the no-plan branch (`[cache] R0 relief`, resource_manager.h). The reserve
+// path did not, so the engine handed the request a verdict that no pool counter would ever
+// invalidate.
+//
+// Production 2026-10-02: req#563 arrived at 10:18:32, the reserve failed on
+// `paged_kv_cache: DeviceKVPagePool resize_reservation`, the request was re-admitted with a negative
+// memo and then sat at `running 0 | waiting 1` for 60 consecutive 5 s reports (host 0.0%) until its
+// queue deadline at 4m59.9s (HTTP 499). The identical conversation (same `[echo] spec` digest
+// prefix=5bd0874f block=e1eecf9b) had already died the same way as req#542, and was served normally
+// 0.5 s after the client gave up - the pool never changed because the engine was idle.
+void test_capacity_miss_takes_the_r0_relief_before_it_parks() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+
+    // A finished conversation holds the capacity, and one unit of its cache is releasable.
+    const ActiveRequest seed = start_active(manager, program, 71, make_base(71), 1);
+    (void)finish_active(manager, program, seed);
+    program.cached_relief_available = true;
+    program.relief_axis             = FakeProgram::CachedReliefAxis::DeviceKv;
+    program.deficit_is_state_slot   = false;
+    program.deficit_is_device_kv    = true;
+
+    auto inspection = manager.inspect(program, FakePreparedPrompt{72}, make_base(72), 2);
+    require(inspection.choice.has_value(), "reuse choice was not produced");
+
+    const std::uint64_t relief_before = program.cached_relief_requests;
+    program.capacity_miss_on_start    = true;
+    const auto status = manager.reserve_materialization(program, std::move(*inspection.choice),
+                                                        FakePreparedPrompt{72}, {});
+    require(status == FakeManager::MaterializationReserveResult::Stale,
+            "capacity miss was not reported as retryable work");
+    // The R0 obligation: before answering "not now", the engine owes the request one unit of R2.
+    // Without this the caller has no pool change to re-inspect against and parks for the full queue
+    // deadline (§三 R0 forbids exactly that wait).
+    require(program.cached_relief_requests > relief_before,
+            "a capacity miss at reserve must take one unit of R0 relief before the request is "
+            "parked (§三 R0: an idle engine waiting on an unchanged pool is the named defect)");
+
+    // The relief moved the pool, so the retry is planned against it and served - not parked.
+    program.capacity_miss_on_start = false;
+    auto retry = manager.inspect(program, FakePreparedPrompt{72}, make_base(72), 3);
+    require(retry.choice.has_value(), "retry produced no plan");
+    const auto retried = manager.reserve_materialization(program, std::move(*retry.choice),
+                                                         FakePreparedPrompt{72}, {});
+    require(retried == FakeManager::MaterializationReserveResult::Reserved,
+            "after the R0 relief the request must be reservable, not parked again");
+}
+
+// The other half of the same rule: when the ladder really has nothing left to give, waiting IS the
+// honest §三 R0 answer, and the relief must report that instead of inventing progress. A relief that
+// always claimed progress would spin the admission loop instead of parking it.
+void test_capacity_miss_relief_reports_when_nothing_is_releasable() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest seed = start_active(manager, program, 73, make_base(73), 1);
+    (void)finish_active(manager, program, seed);
+
+    program.cached_relief_available = false;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{74}, make_base(74), 2);
+    require(inspection.choice.has_value(), "reuse choice was not produced");
+
+    program.capacity_miss_on_start = true;
+    const auto status = manager.reserve_materialization(program, std::move(*inspection.choice),
+                                                        FakePreparedPrompt{74}, {});
+    require(status == FakeManager::MaterializationReserveResult::Stale,
+            "capacity miss with nothing releasable must still be retryable work");
+    require(!program.cached_relief_available,
+            "an exhausted relief must not report a unit it did not free");
+}
+
 void test_stale_revision_is_retryable() {
     FakeManager manager = make_manager();
     FakeProgram program;
@@ -4476,6 +4550,10 @@ int main() {
     run_test("root lifecycle and prefix reuse", test_root_lifecycle_and_prefix_reuse);
     run_test("retired owner catalog repair", test_retired_owner_is_not_offered_as_reuse_source);
     run_test("capacity miss is retryable", test_capacity_miss_is_retryable);
+    run_test("a capacity miss takes the R0 relief before it parks",
+             test_capacity_miss_takes_the_r0_relief_before_it_parks);
+    run_test("a capacity miss with nothing releasable still waits honestly",
+             test_capacity_miss_relief_reports_when_nothing_is_releasable);
     run_test("stale revision is retryable", test_stale_revision_is_retryable);
     run_test("materialization abort preserves source", test_materialization_abort_preserves_source);
     run_test("committed victim survives abort", test_committed_victim_survives_transaction_abort);
